@@ -8,15 +8,15 @@ Taiwan Stock Exchange Crawler is a crawler which directly crawl the data from [T
 
 The crawled csv file inculde daily information: 'Stock Number', 'Stock Name', 'Stock Opening Price', 'Stock Price High', 'Stock Price Low' of individual securities in past few days.
 
-![image](https://github.com/s311354/Twse-stock-crawler/demo/data_description.jpg)
+![image](https://github.com/s311354/Twse-stock-crawler/blob/main/demo/data_description.jpg)
 
 We can review the trend of performance indicators involves understanding how well the company's stock has performed over the past few days by looking at the trend of maximum profit we can achieve by completing as many transactions as we like, but we need to pay the transaction fee for each transaction.
 
-![image](https://github.com/s311354/Twse-stock-crawler/demo/trend_performance.jpg)
+![image](https://github.com/s311354/Twse-stock-crawler/blob/main/demo/trend_performance.png)
 
 We also can review the table of maximum profit that describes the past performance and financial health of the stock.
 
-![image](https://github.com/s311354/Twse-stock-crawler/demo/max_profit_analysis_chart.jpg)
+![image](https://github.com/s311354/Twse-stock-crawler/blob/main/demo/max_profit_analysis_chart.png)
 
 ### Files ###
 
@@ -103,7 +103,7 @@ optional arguments:
 $ ./stockanalysis.sh
 ```
 
-![image](https://github.com/s311354/Twse-stock-crawler/demo/output.gif)
+![image](https://github.com/s311354/Twse-stock-crawler/blob/main/demo/output.gif)
 
 ### Potential Defect ###
 

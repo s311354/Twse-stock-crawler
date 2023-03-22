@@ -47,6 +47,12 @@ class Stocktype(enum.Enum):
     def __str__(self):
         return self.name
 
+class QUERY(enum.Enum):
+    _order_ = 'NEOGENE PALEOGENE CRETACEOUS'
+    NEOGENE = 12
+    PALEOGENE = 15
+    CRETACEOUS = 30
+
 def create_parser():
     parser = argparse.ArgumentParser()
 
@@ -356,7 +362,7 @@ if __name__ == '__main__':
                     twsecrawler.smtp_img_email(subject = args.subject, ccreceiver = args.ccreceiver, stocktype = args.type, backtrack = backtrack)
                 continue
 
-            time.sleep(12)
+            time.sleep(QUERY.NEOGENE.value)
         logging.info('The trend of performance indicators for TWSE stock market: ', maxprofitratios)
     else:
         twsecrawler = TwseCrawker(len(stocklist))

@@ -2,7 +2,7 @@
 
 ### Introduction ###
 
-Taiwan Stock Exchange Crawler is a crawler which directly crawl the data from [TWSE](https://www.twse.com.tw/exchangeReport/MI_INDE). The historical trading information of individual securities will be download in .csv format in [`twse`](twse/). The data can be used to analyze the trend of performance indicators and calculate the maximum profit we can achieve by choosing a single day to buy one stock and choosing a different day in the future to sell that stock, choosing on the same day immediately to sell that stock, completing at most three transactions, or completing as many transactions as we like, but we need to pay the transaction fee for each transaction. 
+Taiwan Stock Exchange Crawler is a crawler which directly crawl the data from [TWSE](https://www.twse.com.tw/exchangeReport/MI_INDE). The historical trading information of individual securities will be download in .csv format in [`twse`](twse/). The data can be used to analyze the trend of performance indicators and calculate the maximum profit we can achieve by choosing a single day to buy one stock and choosing a different day in the future to sell that stock, choosing on the same day immediately to sell that stock, completing at most three transactions, or completing as many transactions as we like, but we need to pay the transaction fee for each transaction. We could increase our probability of earning at taiwan stock market, leading us to earn passive profits.
 
 ### Data Description and The Trend of Performance Indicators ###
 

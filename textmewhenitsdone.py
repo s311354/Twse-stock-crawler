@@ -1,5 +1,6 @@
 #!/usr/local/bin/python
 # -*- coding: utf-8 -*-
+import os
 import smtplib
 from typing import List
 from email.mime.text import MIMEText
@@ -64,7 +65,18 @@ class TextMeWhenItsDone(object):
     """
 
     def __init__(self, email: str):
+        self.server = None
+        smtp_host = os.getenv("TWSE_SMTP_HOST")
+        smtp_port = os.getenv("TWSE_SMTP_PORT")
+
         # Connect to the SMTP server
+        if smtp_host and smtp_port:
+            self.server = smtplib.SMTP(smtp_host, int(smtp_port))
+            return
+
+        if "@" not in email:
+            return
+
         if email[email.index("@")+1:] == GMAIL:
             self.server = smtplib.SMTP("smtp.gmail.com", 587)
         elif email[email.index("@")+1:] == HMAIL:
@@ -73,10 +85,13 @@ class TextMeWhenItsDone(object):
 
     def __del__(self):
         # Disconnect from the SMTP server
-        self.server.quit()
+        if self.server:
+            self.server.quit()
 
 
     def login(self, email: str, password: str) -> None:
+        if not self.server:
+            raise RuntimeError("SMTP server is not configured for email '{}'".format(email))
         # Log in to the email account
         self.server.starttls()
         self.server.login(email, password)

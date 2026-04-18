@@ -29,8 +29,6 @@
 :   -m, --mail            the owner you want to send the email to recipients from your mail address.
 #
 
-python stockanalysis.py -t ELEC -o shirong -e 40 -b 0 -p 7 -l -m \
+python3 stockanalysis.py -t ELEC -o shirong -e 10 -b 0 -p 7 -l -m \
 			-s I \
-			./stocklist_elec_candidates ./holidays_2023
-
-
+			./stocklist_elec ./holidays_2026

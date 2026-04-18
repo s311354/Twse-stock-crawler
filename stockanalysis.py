@@ -1,6 +1,6 @@
 #!/usr/local/bin/python
 # -*- coding: utf-8 -*-
-"""
+r"""
 TWSE Real-time Stock Price Analysis
 
 This script is designed to help streamline models, by taking the Taiwan Stock Exchange dataset. This will be used by an application and figuring out the maximum profit that are required to run for those arguments. The resulting is then sending to private email sandbox.
@@ -120,6 +120,8 @@ def create_parser():
 
 
 class TwseCrawker():
+    _logged_missing_price_warnings = set()
+
     def __init__(self, stocklistsize):
         self.stocklistsize = len(stocklist)
         self.daily_stocks = [[] for _ in range(self.stocklistsize)]
@@ -141,6 +143,17 @@ class TwseCrawker():
         for index, content in enumerate(row):
             row[index] = re.sub(",", "", content.strip())
         return row
+
+
+    def parse_price(self, price: str):
+        normalized_price = str(price).replace(",", "").strip()
+        if normalized_price in ("", "--"):
+            return None
+
+        try:
+            return float(normalized_price)
+        except ValueError:
+            return None
 
 
     def get_date_times(self, start_date: int, backtrack_days: int, holidays: List[str]) -> None:
@@ -198,7 +211,20 @@ class TwseCrawker():
             for item in range(self.stocklistsize):
                 # Transfer to NTD Price
                 # sign = '-' if row[stocks[item][9]].find('green') > 0 else ''
-                self.daily_stocks[item].append(float(row[stocks[item]][5]) * 1000)
+                opening_price = self.parse_price(row[stocks[item]][5])
+                if opening_price is None:
+                    warning_key = (row[stocks[item]][0], scheduled_time, row[stocks[item]][5])
+                    if warning_key not in TwseCrawker._logged_missing_price_warnings:
+                        logging.warning(
+                            "Skipping stock %s at %s because opening price is unavailable: %s",
+                            row[stocks[item]][0],
+                            scheduled_time,
+                            row[stocks[item]][5],
+                        )
+                        TwseCrawker._logged_missing_price_warnings.add(warning_key)
+                    continue
+
+                self.daily_stocks[item].append(opening_price * 1000)
                 self.stocknumbers[item] = row[stocks[item]][0]
                 self.stocknames[item] = row[stocks[item]][1]
                 row_data[item] = self.clean_data([

@@ -1,0 +1,6 @@
+# Pinned runtime dependencies for Twse-stock-crawler.
+matplotlib==3.10.8
+pandas==3.0.2
+requests==2.33.1
+tabulate==0.10.0
+XlsxWriter==3.2.9

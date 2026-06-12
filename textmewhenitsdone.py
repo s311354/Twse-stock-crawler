@@ -1,8 +1,10 @@
 #!/usr/local/bin/python
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 import os
 import smtplib
-from typing import List
+from smtplib import SMTP
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
@@ -27,6 +29,9 @@ StockhtmlMessage = """\
 
         ## Here is the estimated max profit: ($NTD)<br>
         {stocktable} <br>
+        <br>
+
+        {entryanalysis} <br>
         <br>
         </p>
 
@@ -64,8 +69,8 @@ class TextMeWhenItsDone(object):
     The smtplib module defines an SMTP client session object that can be used to send mail to any internet machine with an SMTP or ESMTP listener daemon
     """
 
-    def __init__(self, email: str):
-        self.server = None
+    def __init__(self, email: str) -> None:
+        self.server: SMTP | None = None
         smtp_host = os.getenv("TWSE_SMTP_HOST")
         smtp_port = os.getenv("TWSE_SMTP_PORT")
 
@@ -83,7 +88,7 @@ class TextMeWhenItsDone(object):
             self.server = smtplib.SMTP("smtp.live.com", 587)
 
 
-    def __del__(self):
+    def __del__(self) -> None:
         # Disconnect from the SMTP server
         if self.server:
             self.server.quit()
@@ -97,7 +102,16 @@ class TextMeWhenItsDone(object):
         self.server.login(email, password)
 
 
-    def imgstockprofittableme(self, subject: str, email: str, password: str, backtrack: str, stocktype: int, receiver= "YO", ccreceiver = "") -> None:
+    def imgstockprofittableme(
+        self,
+        subject: str,
+        email: str,
+        password: str,
+        backtrack: str,
+        stocktype: object,
+        receiver: str | list[str] = "YO",
+        ccreceiver: str = "",
+    ) -> None:
         # Create the email message
         msg = MIMEMultipart()
         msg['Subject'] = "[TWSE Stock {}] [{}]: The Trend of Performance Indicators (back track until {})".format(subject, stocktype, backtrack)
@@ -120,7 +134,19 @@ class TextMeWhenItsDone(object):
         self.server.sendmail(from_addr = email, to_addrs = receiver, msg = msg.as_string())
 
 
-    def textstockprofittableme(self, subject: str, email: str, password: str, iso_scheduled_times: List[str], transactiondays: int, stocktype: int, stockprofittable, receiver="YO", ccreceiver = "") -> None:
+    def textstockprofittableme(
+        self,
+        subject: str,
+        email: str,
+        password: str,
+        iso_scheduled_times: list[str],
+        transactiondays: int,
+        stocktype: object,
+        stockprofittable: str,
+        entryanalysis: str = "",
+        receiver: str | list[str] = "YO",
+        ccreceiver: str = "",
+    ) -> None:
         # Create the email message
         msg = MIMEMultipart('alternative')
         msg['Subject'] = "[TWSE Stock {}] [{}]: Estimated Max Profit ({} ~ {})".format(subject, stocktype, iso_scheduled_times[0], iso_scheduled_times[-1])
@@ -133,7 +159,8 @@ class TextMeWhenItsDone(object):
         part2 = MIMEText(StockhtmlMessage.format(begin = iso_scheduled_times[0],
                                                  end   = iso_scheduled_times[-1],
                                                  days  = transactiondays,
-                                                 stocktable = stockprofittable), 'html')
+                                                 stocktable = stockprofittable,
+                                                 entryanalysis = entryanalysis), 'html')
 
         # The HTML message, is best and preferred
         msg.attach(part2)

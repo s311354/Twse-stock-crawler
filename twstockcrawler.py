@@ -1,34 +1,40 @@
 #!/usr/local/bin/python
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 import os
 import requests
-import pandas as pd
 import datetime
 import json
 import time
 import logging
-from typing import List, NamedTuple
+from typing import Any, NamedTuple, TypeAlias
 from requests import Response
 from requests import exceptions as requests_exceptions
 from textmewhenitsdone import TextMeWhenItsDone
+
+StockRow: TypeAlias = list[str]
+StockRows: TypeAlias = list[StockRow]
+JsonPayload: TypeAlias = dict[str, Any]
+
 
 class AuthenticationServer(NamedTuple):
     subject: str
     email: str
     password: str
-    receiver: str
+    receiver: list[str]
     ccreceiver: str
 
 
 class SMTPEmail(object):
 
-    def __init__(self, subject = None, ccreceiver = None):
-        self.authentication = None
+    def __init__(self, subject: str | None = None, ccreceiver: str | None = None) -> None:
+        self.authentication: AuthenticationServer | None = None
         self.subject = subject
         self.email = os.getenv("TWSE_SMTP_EMAIL", "your-email-account@gmail")
         self.password = os.getenv("TWSE_SMTP_PASSWORD", "your-password")
         receivers = os.getenv("TWSE_SMTP_RECEIVERS", "receiver1,receiver2")
-        self.receiver = [receiver.strip() for receiver in receivers.split(",") if receiver.strip()]
+        self.receiver: list[str] = [receiver.strip() for receiver in receivers.split(",") if receiver.strip()]
         self.ccreceiver = ccreceiver or os.getenv("TWSE_SMTP_CC", "ccreceiver")
 
 
@@ -68,7 +74,7 @@ class SMTPEmail(object):
                                                        ccreceiver = self.ccreceiver)
 
 
-    def imgstockprofittable(self, backtrack: str, stocktype: int) -> None:
+    def imgstockprofittable(self, backtrack: str, stocktype: object) -> None:
         if not self.is_configured():
             logging.warning("Skipping email send because SMTP credentials are not configured.")
             return
@@ -88,7 +94,14 @@ class SMTPEmail(object):
         print(f"Sending Email at {datetime.datetime.now()}")
 
 
-    def textstockprofittable(self, iso_scheduled_times: List[int], transactiondays: int, stocktype: int, stockprofittable) -> None:
+    def textstockprofittable(
+        self,
+        iso_scheduled_times: list[str],
+        transactiondays: int,
+        stocktype: object,
+        stockprofittable: str,
+        entryanalysis: str = "",
+    ) -> None:
         if not self.is_configured():
             logging.warning("Skipping email send because SMTP credentials are not configured.")
             return
@@ -105,7 +118,8 @@ class SMTPEmail(object):
                                                  receiver = self.authentication.receiver,
                                                  ccreceiver = self.authentication.ccreceiver,
                                                  transactiondays = transactiondays,
-                                                 iso_scheduled_times = iso_scheduled_times)
+                                                 iso_scheduled_times = iso_scheduled_times,
+                                                 entryanalysis = entryanalysis)
 
         print(f"Sending Email at {datetime.datetime.now()}")
 
@@ -113,18 +127,18 @@ class SMTPEmail(object):
 class TwStockCrawler(object):
     _logged_insecure_ssl_fallback = False
 
-    def __init__(self):
-        self.url = 'https://www.twse.com.tw/exchangeReport/MI_INDEX'
-        self.timeout = 30
-        self.max_attempts = 2
-        self.allow_insecure_twse_fallback = os.getenv("TWSE_ALLOW_INSECURE_SSL_FALLBACK", "1") != "0"
+    def __init__(self) -> None:
+        self.url: str = 'https://www.twse.com.tw/exchangeReport/MI_INDEX'
+        self.timeout: int = 30
+        self.max_attempts: int = 2
+        self.allow_insecure_twse_fallback: bool = os.getenv("TWSE_ALLOW_INSECURE_SSL_FALLBACK", "1") != "0"
 
 
     def _should_retry_without_ssl_verification(self, error: requests_exceptions.SSLError) -> bool:
         return self.allow_insecure_twse_fallback and "Missing Subject Key Identifier" in str(error)
 
 
-    def _request_stocktype_data(self, query_params: dict, date_time: str) -> Response:
+    def _request_stocktype_data(self, query_params: dict[str, str | int], date_time: str) -> Response:
         try:
             return requests.get(self.url, params = query_params, timeout = self.timeout)
         except requests_exceptions.SSLError as error:
@@ -146,7 +160,7 @@ class TwStockCrawler(object):
             raise RuntimeError("Unable to fetch TWSE stock data at {}: {}".format(date_time, error)) from error
 
 
-    def _extract_stock_rows(self, content: dict, date_time: str) -> List[List[str]]:
+    def _extract_stock_rows(self, content: JsonPayload, date_time: str) -> StockRows:
         if 'data1' in content and content['data1']:
             return content['data1']
 
@@ -162,12 +176,12 @@ class TwStockCrawler(object):
         raise RuntimeError("TWSE response at {} does not contain stock data".format(date_time))
 
 
-    def _get_content_keys(self, content: dict) -> List[str]:
+    def _get_content_keys(self, content: object) -> list[str]:
         return sorted(content.keys()) if isinstance(content, dict) else []
 
 
-    def get_stocktype_data(self, date_time: str, stocktype: int) -> List[List[str]]:
-        row = list()
+    def get_stocktype_data(self, date_time: str, stocktype: int) -> StockRows:
+        row: StockRows = list()
 
         query_params = {
             'date': date_time,
@@ -209,21 +223,22 @@ class TwStockCrawler(object):
                 if attempt < self.max_attempts:
                     time.sleep(1)
                     continue
-                raise RuntimeError(
-                    "TWSE response at {} does not contain stock data after {} attempts".format(
-                        date_time,
-                        self.max_attempts,
-                    )
-                ) from last_error
+                logging.warning(
+                    "Skipping TWSE date %s because no stock rows were available after %s attempts.",
+                    date_time,
+                    self.max_attempts,
+                )
+                return []
 
         if not row:
-            raise RuntimeError("TWSE returned an empty stock dataset at {}".format(date_time))
+            logging.warning("Skipping TWSE date %s because the stock dataset was empty.", date_time)
+            return []
     
         logging.info('Date: {}, Stock number: {}, Stock price: {}'.format(date_time, row[0][0], row[0][5]))
         return row
 
 
-    def maxProfit(self, prices: List[int]) -> int:
+    def maxProfit(self, prices: list[int]) -> int:
         dp_hold, dp_not_hold = -float('inf'), 0
         
         for stock_price in prices:
@@ -233,7 +248,7 @@ class TwStockCrawler(object):
         return dp_not_hold
 
 
-    def maxProfitII(self, prices: List[int]) -> int:
+    def maxProfitII(self, prices: list[int]) -> int:
         total = 0
 
         for i in range(1, len(prices)):
@@ -244,7 +259,7 @@ class TwStockCrawler(object):
         return total
 
 
-    def maxProfitIV(self, k: int, prices: List[int]) -> int:
+    def maxProfitIV(self, k: int, prices: list[int]) -> int:
         n = len(prices)
 
         if n == 0:
@@ -261,7 +276,7 @@ class TwStockCrawler(object):
         return dp[k][n-1]
 
 
-    def maxProfitwithfee(self, prices: List[int], fee: int) -> int:
+    def maxProfitwithfee(self, prices: list[int], fee: int) -> int:
         dp_hold, dp_not_hold = -float('inf'), 0
 
         for stock_price in prices:
@@ -271,7 +286,7 @@ class TwStockCrawler(object):
         return dp_not_hold if prices else 0
 
 
-    def minimumUpLines(self, stockPrices: List[List[int]]) -> int:
+    def minimumUpLines(self, stockPrices: list[list[int]]) -> int:
         if len(stockPrices) == 1:
             return 0
         if len(stockPrices) == 2:

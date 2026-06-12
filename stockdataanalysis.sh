@@ -39,6 +39,21 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
 
+if [ -f "$SCRIPT_DIR/.env" ]; then
+  ENV_FILE="$SCRIPT_DIR/.env"
+elif [ -f "$SCRIPT_DIR/.env.example" ]; then
+  ENV_FILE="$SCRIPT_DIR/.env.example"
+else
+  ENV_FILE=""
+fi
+
+if [ -n "$ENV_FILE" ]; then
+  set -a
+  . "$ENV_FILE"
+  set +a
+  echo "Loaded environment variables from $ENV_FILE"
+fi
+
 if [ -x "$VENV_PYTHON" ]; then
   PYTHON_BIN="$VENV_PYTHON"
 else
@@ -57,8 +72,8 @@ if ! "$PYTHON_BIN" -c "import requests, pandas, tabulate, xlsxwriter, matplotlib
   exit 1
 fi
 
-"$PYTHON_BIN" "$SCRIPT_DIR/stockanalysis.py" -o shirong  \
-                                             -e 7 \
+"$PYTHON_BIN" "$SCRIPT_DIR/main.py" -o shirong  \
+                                             -e 35 \
                                              -b 0 \
                                              -t ELEC \
                                              -m \

@@ -31,4 +31,4 @@
 
 python3 stockanalysis.py -t ELEC -o shirong -e 10 -b 0 -p 7 -l -m \
 			-s I \
-			./stocklist_elec ./holidays_2026
+			./stocklist_elec_list ./holidays_2026

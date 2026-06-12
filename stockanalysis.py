@@ -2,24 +2,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from interface.cli import create_parser
+
 r"""
 TWSE Real-time Stock Price Analysis
 
 This script is designed to help streamline models, by taking the Taiwan Stock Exchange dataset. This will be used by an application and figuring out the maximum profit that are required to run for those arguments. The resulting is then sending to private email sandbox.
-
-An example of command-line usage to analyze max profit table is:
-python stockanalysis.py -t ELEC -s I \ 
-                        -o shirong \
-                        -e 7 -b 0 \
-                        -m \
-                        ./stocklist_elec ./holidays_2023
-
-An example of command-line usage to analyze max profit ratio is:
-python stockanalysis.py -t ELEC  -s I \
-                        -o shirong \
-                        -e 35 -b 0 -p 7 \
-                        -l -m  \
-                        ./stocklist_elec ./holidays_2023
 """
 
 import argparse
@@ -56,72 +44,6 @@ class QUERY(enum.Enum):
     NEOGENE = 12
     PALEOGENE = 15
     CRETACEOUS = 30
-
-def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        'stocklist',
-        metavar = 'stocklist',
-        type = str,
-        nargs = '+',
-        help = 'If a single file format is passed in, then we assume it contains a'
-        'semicolon-separated list of stock that we expect this script to stock list. '
-        'If multiple stocks formats are passed in, then we assume stocks are listed directly as arguments.')
-    parser.add_argument(
-        'holidays',
-        metavar = 'holidays',
-        type = str,
-        nargs = '+',
-        help = 'Public holidays in Taiwan, comma separated.')
-    parser.add_argument(
-        '-t', '--type',
-        default = 'ELEC',
-        type = lambda stocktype: Stocktype[stocktype],
-        choices = list(Stocktype),
-        help = 'The stock market you want to choose.')
-    parser.add_argument(
-        '-o', '--output_file_names',
-        default = 'SHIRONG',
-        type = str,
-        choices = ['SHIRONG', 'shirong'],
-        help = 'The owner you want to choose output file name.')
-    parser.add_argument(
-        '-e', '--endbacktrack',
-        default = '10',
-        type = int,
-        help = 'The owner you want to choose the end of backtrack days.')
-    parser.add_argument(
-        '-b', '--beginbacktrack',
-        default = '0',
-        type = int,
-        help = 'The owner you want to choose the begin of backtrack days.')
-    parser.add_argument(
-        '-s', '--subject',
-        default = 'None',
-        type = str,
-        help = 'The owner you want to set the email Subject.')
-    parser.add_argument(
-        '-cc', '--ccreceiver',
-        default = None,
-        type = str,
-        help = 'The owner you want to cc the email to someone apart from the recipient.')
-    parser.add_argument(
-        '-l', '--linechart',
-        action = 'store_true',
-        help = 'The owner you want to show a trend of stock profit ratio over time.')
-    parser.add_argument(
-        '-p', '--period',
-        default = 7,
-        type = int,
-        help = 'the owner you want to show the period of time on the line chart of stocks profit ratio.')
-    parser.add_argument(
-        '-m', '--mail',
-        action = 'store_true',
-        help = 'the owner you want to send the email to recipients from your mail address.')
-
-    return parser
-
 
 class TwseCrawker():
     _logged_missing_price_warnings: set[tuple[str, str, str, str, str, str]] = set()
@@ -538,61 +460,3 @@ class TwseCrawker():
 
     def record(self, file_name: str, scheduled_time: str, row_data: StockRows) -> None:
         self.csv_repository.write_daily_rows(file_name, scheduled_time, row_data)
-
-
-def main(argv: list[str] | None = None) -> None:
-    # Get arguments
-    parser = create_parser()
-    args = parser.parse_args(argv)
-
-    if len(args.stocklist) == 1:
-        # if we only get a single argument, then it must be a file containing list of outputs
-        with open(args.stocklist[0]) as output_list_file:
-            stocklist = [int(line.strip()) for line in output_list_file.read().split(';')]
-    else:
-        stocklist = [int(stock) for stock in args.stocklist]
-
-    if len(args.holidays) == 1:
-        # if we only get a single argument, then it must be a file containing list of outputs
-        with open(args.holidays[0]) as output_list_file:
-            holidays = [line.strip() for line in output_list_file.read().split(',')]
-    else:
-        holidays = args.holidays
-
-    if args.linechart:
-        startofbacktrack = args.endbacktrack - args.period
-        now_date_time = datetime.datetime.now()
-        backtrack = iso_date_time = (now_date_time + datetime.timedelta(days=-args.endbacktrack)).strftime("%Y-%m-%d")
-
-        maxprofitratios = [[] for _ in range(len(stocklist))]
-
-        for back in range(startofbacktrack): 
-            twsecrawler = TwseCrawker(len(stocklist))
-            print('Back {}'.format(back))
-            twsecrawler.get_date_times(start_date = startofbacktrack - back, backtrack_days = args.endbacktrack - back, holidays = holidays)
-            twsecrawler.get_twse_daily_stocks(file_name = args.output_file_names, stocktype = args.type, stocks = stocklist)
-
-            for item, maxprofitratiodata in zip(range(len(stocklist)), twsecrawler.cal_max_profit_ratio_data()):
-                maxprofitratios[item].append(maxprofitratiodata)
-
-            if back == startofbacktrack - 1:
-                twsecrawler.draw_linechart(duration = startofbacktrack, maxprofitratios = maxprofitratios)
-                if args.mail:
-                    twsecrawler.smtp_img_email(subject = args.subject, ccreceiver = args.ccreceiver, stocktype = args.type, backtrack = backtrack)
-                continue
-
-            time.sleep(QUERY.NEOGENE.value)
-        logging.info('The trend of performance indicators for TWSE stock market: ', maxprofitratios)
-    else:
-        twsecrawler = TwseCrawker(len(stocklist))
-        twsecrawler.get_date_times(start_date = args.beginbacktrack, backtrack_days = args.endbacktrack, holidays = holidays)
-        twsecrawler.get_twse_daily_stocks(file_name = args.output_file_names, stocktype = args.type, stocks = stocklist)
-        maxprofits = twsecrawler.cal_max_profit()
-        twsecrawler.record_analysis_dataset(file_name = args.output_file_names, maxprofits = maxprofits)
-
-        if args.mail:
-            twsecrawler.smtp_email(subject = args.subject, ccreceiver = args.ccreceiver, stocktype = args.type, maxprofits = maxprofits)
-
-
-if __name__ == '__main__':
-    main()

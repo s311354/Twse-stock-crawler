@@ -1,34 +1,47 @@
 #!/bin/sh
-#
-: $  python3 stockanalysis.py -h
-: usage: stockanalysis.py [-h] [-t {VEH,ELEC,SEMI,AIR,BIO,COMM}] [-o {SHIRONG,shirong}] [-e ENDBACKTRACK] [-b BEGINBACKTRACK] [-s SUBJECT] [-cc CCRECEIVER] [-l] [-p PERIOD] [-m]
-:                         stocklist [stocklist ...] holidays [holidays ...]
-: 
-: positional arguments:
-:   stocklist             If a single file format is passed in, then we assume it contains asemicolon-separated list of stock that we expect this script to stock list. If multiple stocks formats are
-:                         passed in, then we assume stocks are listed directly as arguments.
-:   holidays              Public holidays in Taiwan, comma separated.
-: 
-: optional arguments:
-:   -h, --help            show this help message and exit
-:   -t {VEH,ELEC,SEMI,AIR,BIO,COMM}, --type {VEH,ELEC,SEMI,AIR,BIO,COMM}
-:                         The stock market you want to choose.
-:   -o {SHIRONG,shirong}, --output_file_names {SHIRONG,shirong}
-:                         The owner you want to choose output file name.
-:   -e ENDBACKTRACK, --endbacktrack ENDBACKTRACK
-:                         The owner you want to choose the end of backtrack days.
-:   -b BEGINBACKTRACK, --beginbacktrack BEGINBACKTRACK
-:                         The owner you want to choose the begin of backtrack days.
-:   -s SUBJECT, --subject SUBJECT
-:                         The owner you want to set the email Subject.
-:   -cc CCRECEIVER, --ccreceiver CCRECEIVER
-:                         The owner you want to cc the email to someone apart from the recipient.
-:   -l, --linechart       The owner you want to show a trend of stock profit ratio over time.
-:   -p PERIOD, --period PERIOD
-:                         the owner you want to show the period of time on the line chart of stocks profit ratio.
-:   -m, --mail            the owner you want to send the email to recipients from your mail address.
-#
+set -eu
 
-python3 stockanalysis.py -t ELEC -o shirong -e 10 -b 0 -p 7 -l -m \
-			-s I \
-			./stocklist_elec_list ./holidays_2026
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
+
+if [ -f "$SCRIPT_DIR/.env" ]; then
+  ENV_FILE="$SCRIPT_DIR/.env"
+elif [ -f "$SCRIPT_DIR/.env.example" ]; then
+  ENV_FILE="$SCRIPT_DIR/.env.example"
+else
+  ENV_FILE=""
+fi
+
+if [ -n "$ENV_FILE" ]; then
+  set -a
+  . "$ENV_FILE"
+  set +a
+  echo "Loaded environment variables from $ENV_FILE"
+fi
+
+if [ -x "$VENV_PYTHON" ]; then
+  PYTHON_BIN="$VENV_PYTHON"
+else
+  PYTHON_BIN="${PYTHON:-python3}"
+fi
+
+if ! "$PYTHON_BIN" -c "import requests, pandas, tabulate, xlsxwriter, matplotlib" >/dev/null 2>&1; then
+  echo "Missing Python dependencies for stockanalysis.sh." >&2
+  if [ -x "$VENV_PYTHON" ]; then
+    echo "Install them with: $VENV_PYTHON -m pip install -r \"$SCRIPT_DIR/requirements.txt\"" >&2
+  else
+    echo "Create a local virtualenv and install requirements:" >&2
+    echo "  python3 -m venv \"$SCRIPT_DIR/.venv\"" >&2
+    echo "  \"$SCRIPT_DIR/.venv/bin/python\" -m pip install -r \"$SCRIPT_DIR/requirements.txt\"" >&2
+  fi
+  exit 1
+fi
+
+"$PYTHON_BIN" "$SCRIPT_DIR/main.py" -t ELEC -o shirong \
+														-e 10 \
+														-b 0 \
+														-p 7 \
+														-l \
+														-m \
+														-s I \
+                                             			"$SCRIPT_DIR/stocklist_elec_list" "$SCRIPT_DIR/holidays_2026"

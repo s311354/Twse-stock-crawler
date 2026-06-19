@@ -74,6 +74,7 @@ def compute_signal_features(
     if close_series.empty:
         return SignalFeatures(None, None, None, None, None)
 
+    # Use the last ma_window prices when calculating a moving average.
     ma = close_series.rolling(window=ma_window, min_periods=ma_window).mean().iloc[-1]
     current_close = close_series.iloc[-1]
     trend_score = int(pd.notna(ma) and current_close > ma)
@@ -81,8 +82,9 @@ def compute_signal_features(
     previous_close = close_series.shift(mom_lag).iloc[-1]
     mom = (current_close - previous_close) / previous_close if pd.notna(previous_close) and previous_close != 0 else None
 
-    cs_denominator = high_series.iloc[-1] - low_series.iloc[-1]
-    cs = (current_close - low_series.iloc[-1]) / cs_denominator if cs_denominator != 0 else None
+    current_low = low_series.iloc[-1]
+    cs_denominator = high_series.iloc[-1] - current_low
+    cs = (current_close - current_low) / cs_denominator if cs_denominator != 0 else None
 
     stop_loss_by_price = current_close * 0.97
     stop_loss = max(stop_loss_by_price, ma) if pd.notna(ma) else stop_loss_by_price

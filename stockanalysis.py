@@ -115,10 +115,20 @@ class TwseCrawker():
         return self.clean_data([
                 stock_row[0], # Stock number
                 stock_row[1], # Stock name
+                stock_row[2], # Trade volume
+                stock_row[3], # Trade count
+                stock_row[4], # Trade value
                 stock_row[5], # Stock opening price
                 stock_row[6], # Stock price high
                 stock_row[7], # Stock price low
                 stock_row[8], # Stock close price
+                stock_row[9], # Change sign
+                stock_row[10], # Price change
+                stock_row[11], # Bid price
+                stock_row[12], # Bid volume
+                stock_row[13], # Ask price
+                stock_row[14], # Ask volume
+                stock_row[15], # Pe ratio
                 ])
 
 
@@ -252,7 +262,7 @@ class TwseCrawker():
     def smtp_email(self, subject: str, ccreceiver: str | None, stocktype: Stocktype, maxprofits: list[ProfitRow]) -> None:
 
         analysis_dataset = self.build_analysis_dataset(maxprofits)
-        stockprofittable = self.record_to_html_tablefmt(maxprofits)
+        stockprofittable = self.record_to_html_tablefmt(analysis_dataset)
         entryanalysis = self.build_entry_signal_analysis(analysis_dataset)
 
         smtpemail = SMTPEmail(subject, ccreceiver)
@@ -382,9 +392,8 @@ class TwseCrawker():
         return maxprofitratios
 
 
-    def record_to_html_tablefmt(self, maxprofits: list[ProfitRow]) -> str:
-        df_analysis = self.build_analysis_dataset(maxprofits)
-        stockprofittable = tabulate(df_analysis, headers = 'keys', tablefmt = 'html', showindex = False)
+    def record_to_html_tablefmt(self, analysis_dataset: pd.DataFrame) -> str:
+        stockprofittable = tabulate(analysis_dataset, headers = 'keys', tablefmt = 'html', showindex = False)
 
         return stockprofittable
 

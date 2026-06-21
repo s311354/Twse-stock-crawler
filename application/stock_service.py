@@ -10,11 +10,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from config.settings import QUERY_WAIT_SECONDS
+from domain.models import StockSelector
 
 
 @dataclass(frozen=True)
 class StockAnalysisRequest:
-    stocklist: list[int]
+    stocklist: list[StockSelector]
     holidays: list[str]
     stocktype: Any
     output_file_names: str

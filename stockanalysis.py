@@ -23,14 +23,20 @@ from domain.models import Stocktype
 from domain.models import Ohlc
 from domain.models import ProfitRow
 from domain.models import SignalRow
+from domain.models import StockSelector
 from domain.models import StockRow
 from domain.models import StockRows
+from domain.models import TWSEStock
+from domain.models import TwseColumns
 from domain.services import compute_signal_features
 from domain.services import max_profit
 from domain.services import max_profit_k_transactions
 from domain.services import max_profit_unlimited
 from domain.services import max_profit_with_fee
-from domain.strategy import evaluate_low_entry
+from domain.strategy import get_strategy
+from domain.strategies.low_entry_score_v3 import LOW_ENTRY_OUTPUT_COLUMNS
+from domain.strategies.low_entry_score_v3 import LOW_ENTRY_STRATEGY_NAME
+from infrastructure.report.html_renderer import RendererFactory
 from infrastructure.crawler.twse_client import TwseClient
 from infrastructure.notification.mail import SMTPEmail
 from infrastructure.storage.chart_repository import save_profit_ratio_chart
@@ -60,10 +66,13 @@ class TwseCrawker():
         self.daily_stocks: list[list[float]] = [[] for _ in range(self.stocklistsize)]
         self.stocknumbers: list[str] = ['' for _ in range(self.stocklistsize)]
         self.stocknames: list[str] = ['' for _ in range(self.stocklistsize)]
+        self.tracked_stock_numbers: list[str | None] = [None for _ in range(self.stocklistsize)]
         self.stocksprice: list[float | None] = list()
         self.daily_highs: list[list[float]] = [[] for _ in range(self.stocklistsize)]
         self.daily_lows: list[list[float]] = [[] for _ in range(self.stocklistsize)]
         self.daily_closes: list[list[float]] = [[] for _ in range(self.stocklistsize)]
+        self.daily_volumes: list[list[float]] = [[] for _ in range(self.stocklistsize)]
+        self.daily_pe_ratios: list[list[float | None]] = [[] for _ in range(self.stocklistsize)]
         self.iso_scheduled_times: list[str] = list()
         self.transactiondays: int = 0
 
@@ -73,9 +82,12 @@ class TwseCrawker():
         self.iso_scheduled_times = list()
         self.transactiondays = 0
         self.stocksprice = list()
+        self.tracked_stock_numbers = [None for _ in range(self.stocklistsize)]
         self.daily_highs = [[] for _ in range(self.stocklistsize)]
         self.daily_lows = [[] for _ in range(self.stocklistsize)]
         self.daily_closes = [[] for _ in range(self.stocklistsize)]
+        self.daily_volumes = [[] for _ in range(self.stocklistsize)]
+        self.daily_pe_ratios = [[] for _ in range(self.stocklistsize)]
 
 
     def clean_data(self, row: StockRow) -> StockRow:
@@ -86,6 +98,42 @@ class TwseCrawker():
 
     def parse_price(self, price: object) -> float | None:
         return parse_price(price)
+
+
+    def validate_twse_row_schema(self, stock_row: object, scheduled_time: str, source: str) -> bool:
+        if not isinstance(stock_row, list):
+            logging.warning(
+                "Skipping TWSE row from %s at %s because row is not a list: %s",
+                source,
+                scheduled_time,
+                stock_row,
+            )
+            return False
+
+        if len(stock_row) < TwseColumns.REQUIRED_WIDTH:
+            logging.warning(
+                "Skipping TWSE row from %s at %s because row shape is invalid: expected at least %s columns, got %s: %s",
+                source,
+                scheduled_time,
+                TwseColumns.REQUIRED_WIDTH,
+                len(stock_row),
+                stock_row,
+            )
+            return False
+
+        stock_no = clean_cell(stock_row[TwseColumns.STOCK_NO])
+        stock_name = clean_cell(stock_row[TwseColumns.NAME])
+        if not stock_no or not stock_name:
+            logging.warning(
+                "Skipping TWSE row from %s at %s because stock identity is missing: stock_no=%s stock_name=%s",
+                source,
+                scheduled_time,
+                stock_no,
+                stock_name,
+            )
+            return False
+
+        return True
 
 
     def get_stock_row(self, row: StockRows, stock_index: int, scheduled_time: str) -> StockRow | None:
@@ -99,61 +147,225 @@ class TwseCrawker():
             return None
 
         stock_row = row[stock_index]
-        if not isinstance(stock_row, list) or len(stock_row) <= 8:
-            logging.warning(
-                "Skipping stock index %s at %s because TWSE row shape is invalid: %s",
-                stock_index,
-                scheduled_time,
-                stock_row,
-            )
+        if not self.validate_twse_row_schema(stock_row, scheduled_time, "index {}".format(stock_index)):
             return None
 
         return stock_row
 
 
+    def build_stock_lookup(self, rows: StockRows, scheduled_time: str) -> dict[str, StockRow]:
+        stock_lookup: dict[str, StockRow] = {}
+
+        for row_index, stock_row in enumerate(rows):
+            if not self.validate_twse_row_schema(stock_row, scheduled_time, "index {}".format(row_index)):
+                continue
+
+            stock_no = clean_cell(stock_row[TwseColumns.STOCK_NO])
+            if stock_no in stock_lookup:
+                logging.warning(
+                    "Duplicate TWSE stock number %s at %s; keeping the first row and skipping duplicate index %s.",
+                    stock_no,
+                    scheduled_time,
+                    row_index,
+                )
+                continue
+
+            stock_lookup[stock_no] = stock_row
+
+        return stock_lookup
+
+
+    def parse_selector_as_index(self, selector: StockSelector) -> int | None:
+        selector_text = str(selector).strip()
+        if not selector_text.isdigit():
+            return None
+        return int(selector_text)
+
+
+    def resolve_stock_row(
+        self,
+        rows: StockRows,
+        stock_lookup: dict[str, StockRow],
+        selector: StockSelector,
+        item: int,
+        scheduled_time: str,
+    ) -> StockRow | None:
+        tracked_stock_no = self.tracked_stock_numbers[item]
+        if tracked_stock_no:
+            stock_row = stock_lookup.get(tracked_stock_no)
+            if stock_row is None:
+                logging.warning(
+                    "Skipping tracked stock %s at %s because it is missing from the TWSE response.",
+                    tracked_stock_no,
+                    scheduled_time,
+                )
+            return stock_row
+
+        selector_text = str(selector).strip()
+        stock_row = stock_lookup.get(selector_text)
+        if stock_row is not None:
+            self.tracked_stock_numbers[item] = selector_text
+            logging.info("Tracking stock %s from stock-number selector at %s.", selector_text, scheduled_time)
+            return stock_row
+
+        if selector_text.isdigit() and selector_text != str(int(selector_text)):
+            logging.warning(
+                "Skipping stock-number selector %s at %s because it is missing from the TWSE response.",
+                selector_text,
+                scheduled_time,
+            )
+            return None
+
+        stock_index = self.parse_selector_as_index(selector)
+        if stock_index is None:
+            logging.warning(
+                "Skipping selector %s at %s because it is neither a TWSE stock number nor a legacy row index.",
+                selector,
+                scheduled_time,
+            )
+            return None
+
+        stock_row = self.get_stock_row(rows, stock_index, scheduled_time)
+        if stock_row is None:
+            return None
+
+        resolved_stock_no = clean_cell(stock_row[TwseColumns.STOCK_NO])
+        self.tracked_stock_numbers[item] = resolved_stock_no
+        logging.info(
+            "Resolved legacy row index %s to stock %s at %s; future dates will use stock-number lookup.",
+            stock_index,
+            resolved_stock_no,
+            scheduled_time,
+        )
+        return stock_row
+
+
     def build_record_row(self, stock_row: StockRow) -> StockRow:
+        normalized_row = list(stock_row[:TwseColumns.REQUIRED_WIDTH]) + [""] * max(0, TwseColumns.REQUIRED_WIDTH - len(stock_row))
         return self.clean_data([
-                stock_row[0], # Stock number
-                stock_row[1], # Stock name
-                stock_row[2], # Trade volume
-                stock_row[3], # Trade count
-                stock_row[4], # Trade value
-                stock_row[5], # Stock opening price
-                stock_row[6], # Stock price high
-                stock_row[7], # Stock price low
-                stock_row[8], # Stock close price
-                stock_row[9], # Change sign
-                stock_row[10], # Price change
-                stock_row[11], # Bid price
-                stock_row[12], # Bid volume
-                stock_row[13], # Ask price
-                stock_row[14], # Ask volume
-                stock_row[15], # Pe ratio
+                normalized_row[TwseColumns.STOCK_NO], # Stock number
+                normalized_row[TwseColumns.NAME], # Stock name
+                normalized_row[TwseColumns.VOLUME], # Trade volume
+                normalized_row[TwseColumns.TRADE_COUNT], # Trade count
+                normalized_row[TwseColumns.TRADE_VALUE], # Trade value
+                normalized_row[TwseColumns.OPEN], # Stock opening price
+                normalized_row[TwseColumns.HIGH], # Stock price high
+                normalized_row[TwseColumns.LOW], # Stock price low
+                normalized_row[TwseColumns.CLOSE], # Stock close price
+                normalized_row[TwseColumns.CHANGE_SIGN], # Change sign
+                normalized_row[TwseColumns.PRICE_CHANGE], # Price change
+                normalized_row[TwseColumns.BID_PRICE], # Bid price
+                normalized_row[TwseColumns.BID_VOLUME], # Bid volume
+                normalized_row[TwseColumns.ASK_PRICE], # Ask price
+                normalized_row[TwseColumns.ASK_VOLUME], # Ask volume
+                normalized_row[TwseColumns.PE], # Pe ratio
                 ])
 
 
-    def parse_stock_row_ohlc(self, stock_row: StockRow, scheduled_time: str) -> Ohlc | None:
-        open_price = self.parse_price(stock_row[5])
-        high_price = self.parse_price(stock_row[6])
-        low_price = self.parse_price(stock_row[7])
-        close_price = self.parse_price(stock_row[8])
+    def parse_twse_stock(self, stock_row: StockRow, scheduled_time: str) -> TWSEStock | None:
+        if not self.validate_twse_row_schema(stock_row, scheduled_time, "stock row"):
+            return None
+
+        stock_no = clean_cell(stock_row[TwseColumns.STOCK_NO])
+        stock_name = clean_cell(stock_row[TwseColumns.NAME])
+        open_price = self.parse_price(stock_row[TwseColumns.OPEN])
+        high_price = self.parse_price(stock_row[TwseColumns.HIGH])
+        low_price = self.parse_price(stock_row[TwseColumns.LOW])
+        close_price = self.parse_price(stock_row[TwseColumns.CLOSE])
+        volume = self.parse_price(stock_row[TwseColumns.VOLUME])
+        pe_ratio = self.parse_price(stock_row[TwseColumns.PE])
 
         if None in (open_price, high_price, low_price, close_price):
-            warning_key = (stock_row[0], scheduled_time, stock_row[5], stock_row[6], stock_row[7], stock_row[8])
+            warning_key = (
+                stock_no,
+                scheduled_time,
+                stock_row[TwseColumns.OPEN],
+                stock_row[TwseColumns.HIGH],
+                stock_row[TwseColumns.LOW],
+                stock_row[TwseColumns.CLOSE],
+            )
             if warning_key not in TwseCrawker._logged_missing_price_warnings:
                 logging.warning(
                     "Skipping stock %s at %s because OHLC data is unavailable: open=%s high=%s low=%s close=%s",
-                    stock_row[0],
+                    stock_no,
                     scheduled_time,
-                    stock_row[5],
-                    stock_row[6],
-                    stock_row[7],
-                    stock_row[8],
+                    stock_row[TwseColumns.OPEN],
+                    stock_row[TwseColumns.HIGH],
+                    stock_row[TwseColumns.LOW],
+                    stock_row[TwseColumns.CLOSE],
                 )
                 TwseCrawker._logged_missing_price_warnings.add(warning_key)
             return None
 
-        return open_price, high_price, low_price, close_price
+        return TWSEStock(
+            stock_no=stock_no,
+            stock_name=stock_name,
+            open=open_price,
+            high=high_price,
+            low=low_price,
+            close=close_price,
+            volume=int(volume) if volume is not None else 0,
+            pe=pe_ratio,
+        )
+
+
+    def parse_stock_row_ohlc(self, stock_row: StockRow, scheduled_time: str) -> Ohlc | None:
+        twse_stock = self.parse_twse_stock(stock_row, scheduled_time)
+        if twse_stock is None:
+            return None
+
+        return twse_stock.open, twse_stock.high, twse_stock.low, twse_stock.close
+
+
+    def parse_stock_row_volume(self, stock_row: StockRow) -> float:
+        volume = self.parse_price(stock_row[TwseColumns.VOLUME]) if len(stock_row) > TwseColumns.VOLUME else None
+        return volume if volume is not None else 0.0
+
+
+    def parse_stock_row_pe_ratio(self, stock_row: StockRow) -> float | None:
+        if len(stock_row) <= TwseColumns.PE:
+            return None
+        return self.parse_price(stock_row[TwseColumns.PE])
+
+
+    def update_tracked_stock_identity(self, item: int, twse_stock: TWSEStock, scheduled_time: str) -> bool:
+        expected_stock_no = self.tracked_stock_numbers[item]
+        if expected_stock_no and twse_stock.stock_no != expected_stock_no:
+            logging.warning(
+                "Skipping stock identity mismatch at %s for slot %s: expected %s but got %s %s.",
+                scheduled_time,
+                item,
+                expected_stock_no,
+                twse_stock.stock_no,
+                twse_stock.stock_name,
+            )
+            return False
+
+        if expected_stock_no is None:
+            self.tracked_stock_numbers[item] = twse_stock.stock_no
+
+        if self.stocknumbers[item] and self.stocknumbers[item] != twse_stock.stock_no:
+            logging.warning(
+                "Skipping stock slot %s at %s because historical stock number %s would be replaced by %s.",
+                item,
+                scheduled_time,
+                self.stocknumbers[item],
+                twse_stock.stock_no,
+            )
+            return False
+
+        if self.stocknames[item] and self.stocknames[item] != twse_stock.stock_name:
+            logging.warning(
+                "Stock %s name changed at %s from %s to %s; continuing by stock number.",
+                twse_stock.stock_no,
+                scheduled_time,
+                self.stocknames[item],
+                twse_stock.stock_name,
+            )
+
+        self.stocknumbers[item] = twse_stock.stock_no
+        self.stocknames[item] = twse_stock.stock_name
+        return True
 
 
     def parse_ohlc(self, row: StockRows, stock_index: int, scheduled_time: str) -> Ohlc | None:
@@ -202,7 +414,7 @@ class TwseCrawker():
         return abs(get_days(date1) - get_days(date2)) + 1
 
 
-    def get_twse_daily_stocks(self, file_name: str, stocktype: Stocktype, stocks: list[int]) -> None:
+    def get_twse_daily_stocks(self, file_name: str, stocktype: Stocktype, stocks: list[StockSelector]) -> None:
         valid_iso_scheduled_times: list[str] = []
     
         # Crawing daily TWSE Stock data
@@ -215,42 +427,49 @@ class TwseCrawker():
                 logging.warning("Skipping %s because TWSE returned no stock rows.", scheduled_time)
                 continue
 
-            valid_iso_scheduled_times.append(iso_scheduled_time)
+            stock_lookup = self.build_stock_lookup(row, scheduled_time)
+            if not stock_lookup:
+                logging.warning("Skipping %s because no TWSE rows passed schema validation.", scheduled_time)
+                continue
+
             row_data: StockRows = [[] for _ in range(self.stocklistsize)]
-            missing_index_count = sum(1 for stock_index in stocks if stock_index >= len(row))
-            if missing_index_count:
-                logging.warning(
-                    "TWSE returned %s rows at %s; skipping %s requested stock indexes outside the response.",
-                    len(row),
-                    scheduled_time,
-                    missing_index_count,
-                )
     
             # Store stock data structure
             for item in range(self.stocklistsize):
-                # Transfer to NTD Price
-                # sign = '-' if row[stocks[item][9]].find('green') > 0 else ''
-                if stocks[item] >= len(row):
-                    continue
-
-                stock_row = self.get_stock_row(row, stocks[item], scheduled_time)
+                stock_row = self.resolve_stock_row(
+                    rows = row,
+                    stock_lookup = stock_lookup,
+                    selector = stocks[item],
+                    item = item,
+                    scheduled_time = scheduled_time,
+                )
                 if stock_row is None:
                     continue
+                
+                twse_stock = self.parse_twse_stock(stock_row, scheduled_time)
+                if twse_stock is None:
+                    continue
 
-                self.stocknumbers[item] = stock_row[0]
-                self.stocknames[item] = stock_row[1]
+                if not self.update_tracked_stock_identity(item, twse_stock, scheduled_time):
+                    continue
+
                 row_data[item] = self.build_record_row(stock_row)
-
-                ohlc = self.parse_stock_row_ohlc(stock_row, scheduled_time)
-                if ohlc is not None:
-                    opening_price, high_price, low_price, close_price = ohlc
-                    self.daily_stocks[item].append(opening_price * 1000)
-                    self.daily_highs[item].append(high_price * 1000)
-                    self.daily_lows[item].append(low_price * 1000)
-                    self.daily_closes[item].append(close_price * 1000)
+                self.daily_stocks[item].append(twse_stock.open * 1000)
+                self.daily_highs[item].append(twse_stock.high * 1000)
+                self.daily_lows[item].append(twse_stock.low * 1000)
+                self.daily_closes[item].append(twse_stock.close * 1000)
+                self.daily_volumes[item].append(twse_stock.volume)
+                self.daily_pe_ratios[item].append(twse_stock.pe)
             
             # Record TWSE information of stock price
-            self.record(file_name = file_name, scheduled_time = scheduled_time, row_data = row_data)
+            if any(row_data):
+                valid_iso_scheduled_times.append(iso_scheduled_time)
+                self.record(file_name = file_name, scheduled_time = scheduled_time, row_data = row_data)
+            else:
+                logging.warning(
+                    "Skipping CSV write for %s because none of the requested stocks had valid TWSE rows.",
+                    scheduled_time,
+                )
 
         if not valid_iso_scheduled_times:
             raise RuntimeError("No valid TWSE daily stock rows were collected for the requested date range.")
@@ -339,6 +558,31 @@ class TwseCrawker():
         return signal_features
 
 
+    def build_strategy_history(self, item: int) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "Open": self.daily_stocks[item],
+                "High": self.daily_highs[item],
+                "Low": self.daily_lows[item],
+                "Close": self.daily_closes[item],
+                "Volume": self.daily_volumes[item],
+                "PE": self.daily_pe_ratios[item],
+            }
+        )
+
+
+    def cal_low_entry_strategy(self) -> pd.DataFrame:
+        strategy = get_strategy(LOW_ENTRY_STRATEGY_NAME)
+        strategy_rows: list[dict[str, object]] = []
+
+        for item in range(self.stocklistsize):
+            result = strategy.run(self.build_strategy_history(item))
+            latest = result.iloc[-1].to_dict() if not result.empty else {}
+            strategy_rows.append({column: latest.get(column) for column in LOW_ENTRY_OUTPUT_COLUMNS})
+
+        return pd.DataFrame(strategy_rows, columns = LOW_ENTRY_OUTPUT_COLUMNS)
+
+
     def build_analysis_dataset(self, maxprofits: list[ProfitRow]) -> pd.DataFrame:
         df_analysis = pd.DataFrame(maxprofits)
         df_analysis.columns = ["無限次交易", "交易一次", "至多五次交易", "無限次交易(手續費$NTD300)", "利潤比"]
@@ -346,7 +590,8 @@ class TwseCrawker():
             self.cal_signal_features(),
             columns = ["Trend Score", "MOM", "CS", "Stop_Loss", "Take_Profit"],
         )
-        df_analysis = pd.concat([df_analysis, df_signal_features], axis = 1)
+        df_low_entry = self.cal_low_entry_strategy()
+        df_analysis = pd.concat([df_analysis, df_signal_features, df_low_entry], axis = 1)
         df_analysis["日期"] = self.iso_scheduled_times[-1]
         df_analysis["證券代號"] = self.stocknumbers
         df_analysis["證券名稱"] = self.stocknames
@@ -355,24 +600,24 @@ class TwseCrawker():
         df_analysis["最低"] = [lows[-1] if lows else None for lows in self.daily_lows]
         df_analysis["收盤"] = [closes[-1] if closes else None for closes in self.daily_closes]
 
-        return df_analysis[
-            [
-                "日期",
-                "證券代號",
-                "證券名稱",
-                "開盤",
-                "最高",
-                "最低",
-                "收盤",
-                "無限次交易(手續費$NTD300)",
-                "利潤比",
-                "Trend Score",
-                "MOM",
-                "CS",
-                "Stop_Loss",
-                "Take_Profit",
-            ]
+        base_columns = [
+            "日期",
+            "證券代號",
+            "證券名稱",
+            "開盤",
+            "最高",
+            "最低",
+            "收盤",
+            "無限次交易(手續費$NTD300)",
+            "利潤比",
+            "Trend Score",
+            "MOM",
+            "CS",
+            "Stop_Loss",
+            "Take_Profit",
         ]
+
+        return df_analysis[base_columns + LOW_ENTRY_OUTPUT_COLUMNS]
 
 
     def cal_max_profit_ratio_data(self) -> list[list[float]]:
@@ -393,7 +638,21 @@ class TwseCrawker():
 
 
     def record_to_html_tablefmt(self, analysis_dataset: pd.DataFrame) -> str:
-        stockprofittable = tabulate(analysis_dataset, headers = 'keys', tablefmt = 'html', showindex = False)
+        max_profit_columns = [
+            "日期",
+            "證券代號",
+            "證券名稱",
+            "開盤",
+            "收盤",
+            "無限次交易(手續費$NTD300)",
+            "利潤比",
+        ]
+        stockprofittable = tabulate(
+            analysis_dataset[max_profit_columns],
+            headers = 'keys',
+            tablefmt = 'html',
+            showindex = False,
+        )
 
         return stockprofittable
 
@@ -407,60 +666,8 @@ class TwseCrawker():
 
 
     def build_entry_signal_analysis(self, analysis_dataset: pd.DataFrame) -> str:
-        rows = []
-
-        for _, stock in analysis_dataset.iterrows():
-            stock_no = html.escape(str(stock["證券代號"]))
-            stock_name = html.escape(str(stock["證券名稱"]))
-            current_price = stock["收盤"]
-            stop_loss = stock["Stop_Loss"]
-            take_profit = stock["Take_Profit"]
-            high_price = stock["最高"]
-            low_price = stock["最低"]
-            mom = stock["MOM"]
-            cs = stock["CS"]
-
-            low_entry = evaluate_low_entry(
-                current_price = current_price if pd.notna(current_price) else None,
-                high_price = high_price if pd.notna(high_price) else None,
-                low_price = low_price if pd.notna(low_price) else None,
-                stop_loss = stop_loss if pd.notna(stop_loss) else None,
-                take_profit = take_profit if pd.notna(take_profit) else None,
-                mom = mom if pd.notna(mom) else None,
-                cs = cs if pd.notna(cs) else None,
-            )
-
-            rows.append([
-                "{} {}".format(stock_no, stock_name),
-                self.format_signal_value(current_price, 2),
-                self.format_signal_value(low_entry.position_score, 2),
-                self.format_signal_value(low_entry.rr, 2),
-                self.format_signal_value(mom, 2),
-                self.format_signal_value(cs, 2),
-                low_entry.decision,
-                low_entry.reason,
-            ])
-
-        df_entry = pd.DataFrame(
-            rows,
-            columns = [
-                "股票",
-                "現價",
-                "Position Score",
-                "RR",
-                "MOM",
-                "CS",
-                "決策",
-                "理由",
-            ],
-        )
-
-        return """
-        <h3>低點進場判斷（Low-Entry Model）</h3>
-        <p><strong>BUY 條件</strong>：Position Score &lt;= 0.3、MOM &gt; 0、CS &gt;= 0.2、RR &gt;= 1.5。</p>
-        <p><strong>Position Score</strong> = (收盤 - 最低) / (最高 - 最低)；<strong>RR</strong> = (Take_Profit - 收盤) / (收盤 - Stop_Loss)。若風險分母接近 0，標記為無效計算並自動 NO BUY。</p>
-        {}
-        """.format(tabulate(df_entry, headers = 'keys', tablefmt = 'html', showindex = False))
+        renderer = RendererFactory.get_renderer(LOW_ENTRY_STRATEGY_NAME)
+        return renderer.render(analysis_dataset)
 
 
     def record_analysis_dataset(self, file_name: str, maxprofits: list[ProfitRow]) -> None:
@@ -468,4 +675,7 @@ class TwseCrawker():
 
 
     def record(self, file_name: str, scheduled_time: str, row_data: StockRows) -> None:
+        if not any(row_data):
+            logging.warning("Skipping CSV write for %s because row_data is empty.", scheduled_time)
+            return
         self.csv_repository.write_daily_rows(file_name, scheduled_time, row_data)

@@ -14,7 +14,7 @@ class FakeCrawler:
     def get_date_times(self, start_date: int, backtrack_days: int, holidays: list[str]) -> None:
         self.called.append("get_date_times")
 
-    def get_twse_daily_stocks(self, file_name: str, stocktype: DummyStockType, stocks: list[int]) -> None:
+    def get_twse_daily_stocks(self, file_name: str, stocktype: DummyStockType, stocks: list[str]) -> None:
         self.called.append("get_twse_daily_stocks")
 
     def cal_max_profit(self) -> list[list[int]]:
@@ -44,7 +44,7 @@ def test_interface_builds_stock_analysis_request(tmp_path) -> None:
         str(holidays),
     ])
 
-    assert request.stocklist == [0, 1, 2]
+    assert request.stocklist == ["0", "1", "2"]
     assert request.holidays == ["20260101", "20260216"]
     assert request.output_file_names == "shirong"
     assert request.endbacktrack == 3

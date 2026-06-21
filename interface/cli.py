@@ -18,7 +18,7 @@ def create_parser() -> argparse.ArgumentParser:
         metavar="stocklist",
         type=str,
         nargs="+",
-        help="Stock indexes directly, or a semicolon-separated stocklist file.",
+        help="Stock numbers directly, or legacy row indexes in a semicolon-separated stocklist file.",
     )
     parser.add_argument(
         "holidays",
@@ -94,12 +94,12 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def load_stocklist(values: list[str]) -> list[int]:
+def load_stocklist(values: list[str]) -> list[str]:
     if len(values) == 1 and Path(values[0]).exists():
         with open(values[0]) as output_list_file:
-            return [int(line.strip()) for line in output_list_file.read().split(";")]
+            return [line.strip() for line in output_list_file.read().split(";") if line.strip()]
 
-    return [int(stock) for stock in values]
+    return [stock.strip() for stock in values if stock.strip()]
 
 
 def load_holidays(values: list[str]) -> list[str]:

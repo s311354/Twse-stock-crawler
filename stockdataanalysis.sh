@@ -19,10 +19,14 @@ if [ -n "$ENV_FILE" ]; then
   echo "Loaded environment variables from $ENV_FILE"
 fi
 
-if [ -x "$VENV_PYTHON" ]; then
+if [ -n "${PYTHON:-}" ]; then
+  PYTHON_BIN="${PYTHON:-python3}"
+elif python3 -c "import requests, pandas, tabulate, xlsxwriter, matplotlib" >/dev/null 2>&1; then
+  PYTHON_BIN="python3"
+elif [ -x "$VENV_PYTHON" ]; then
   PYTHON_BIN="$VENV_PYTHON"
 else
-  PYTHON_BIN="${PYTHON:-python3}"
+  PYTHON_BIN="python3"
 fi
 
 if ! "$PYTHON_BIN" -c "import requests, pandas, tabulate, xlsxwriter, matplotlib" >/dev/null 2>&1; then
@@ -42,4 +46,4 @@ fi
                                              -b 0 \
                                              -t ELEC \
                                              -m \
-                                             "$SCRIPT_DIR/stocklist_elec_list" "$SCRIPT_DIR/holidays_2026"
+                                             "$SCRIPT_DIR/stocklist_elec" "$SCRIPT_DIR/holidays_2026"

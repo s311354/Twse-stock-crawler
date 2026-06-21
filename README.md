@@ -2,21 +2,19 @@
 
 ### Introduction ###
 
-Taiwan Stock Exchange Crawler is a crawler which directly crawl the data from [TWSE](https://www.twse.com.tw/exchangeReport/MI_INDE). The historical trading information of individual securities will be download in .csv format in [`twse`](twse/). The data can be used to analyze the trend of performance indicators and calculate the maximum profit we can achieve by choosing a single day to buy one stock and choosing a different day in the future to sell that stock, choosing on the same day immediately to sell that stock, completing at most three transactions, or completing as many transactions as we like, but we need to pay the transaction fee for each transaction. We could increase our probability of earning at taiwan stock market, leading us to earn passive profits.
+Taiwan Stock Exchange (TWSE) Crawler is a Python-based stock data collection and analysis tool.
 
-### Data Description and The Trend of Performance Indicators ###
+The project automatically retrieves daily stock trading data from the Taiwan Stock Exchange (TWSE), including price, volume, transaction statistics, and valuation metrics such as PE ratio.
 
-The crawled csv file inculde daily information: 'Stock Number', 'Stock Name', 'Stock Opening Price', 'Stock Price High', 'Stock Price Low' of individual securities in past few days.
+The collected data can be used for:
+- Historical OHLCV analysis
+- Technical indicator calculation
+- Trading signal generation
+- Strategy backtesting
+- Performance evaluation
+- Quantitative investment research
 
-![image](https://github.com/s311354/Twse-stock-crawler/blob/main/demo/data_description.jpg)
-
-We can review the trend of performance indicators involves understanding how well the company's stock has performed over the past few days by looking at the trend of maximum profit we can achieve by completing as many transactions as we like, but we need to pay the transaction fee for each transaction.
-
-![image](https://github.com/s311354/Twse-stock-crawler/blob/main/demo/trend_performance.png)
-
-We also can review the table of maximum profit that describes the past performance and financial health of the stock.
-
-![image](https://github.com/s311354/Twse-stock-crawler/blob/main/demo/max_profit_analysis_chart.png)
+Historical data is stored as CSV files in the [data](./data) directory and can be further processed for technical analysis, strategy backtesting, and quantitative research.
 
 ### Python Architecture ###
 
@@ -32,9 +30,14 @@ The crawler keeps the legacy scripts compatible while introducing a cleaner, low
 |-- domain/
 |   |-- models.py                   # domain aliases/models
 |   |-- services.py                 # pure profit/indicator services
-|   `-- strategy.py                 # entry strategy decisions
+|   |-- strategy.py                 # strategy abstraction/plugin registry
+|   `-- strategies/
+|       |-- low_entry_score.py      # built-in Low Entry Score v1 strategy
+|       |-- low_entry_score_v2.py   # refined Low Entry Score v2 strategy
+|       `-- low_entry_score_v3.py   # advanced Low Entry Score v3 strategy
 |-- infrastructure/
 |   |-- crawler/twse_client.py      # TWSE HTTP boundary
+|   |-- report/html_renderer.py     # strategy HTML renderer factory
 |   |-- storage/csv_repository.py   # CSV output boundary
 |   |-- storage/chart_repository.py # chart output boundary
 |   `-- notification/mail.py        # SMTP boundary
@@ -44,6 +47,38 @@ The crawler keeps the legacy scripts compatible while introducing a cleaner, low
 ```
 
 Use [`main.py`](main.py) for the clean architecture entrypoint. [`stockanalysis.py`](stockanalysis.py) remains as a legacy-compatible module while the new CLI delegates orchestration to [`application/stock_service.py`](application/stock_service.py).
+
+### Strategy Plugin System ###
+
+Strategies implement the [`Strategy`](domain/strategy.py) abstraction:
+
+```python
+class Strategy(ABC):
+    name: str
+
+    def run(self, data: pandas.DataFrame) -> pandas.DataFrame:
+        ...
+```
+
+Built-in strategies are lazily registered through [`domain/strategy.py`](domain/strategy.py). External strategies can register themselves with `register_strategy(MyStrategy())`.
+
+The default built-in plugin used by the report is `low_entry_score_v3` in [`domain/strategies/low_entry_score_v3.py`](domain/strategies/low_entry_score_v3.py).
+
+Low Entry Score v3 consumes TWSE daily OHLCV data and calculates:
+- Trend score: `EMA20 > EMA50 > EMA200`, plus price above `EMA20`
+- Momentum score: RSI14 neutral/rebound zone, plus MACD line above signal
+- Volatility score: price near lower Bollinger band, plus ATR14 contraction below ATR20MA
+- Volume score: volume above volume MA20, plus OBV rising
+- Structure score: recent support holding, plus higher-low formation
+- ATR14 risk control: `策略停損 = Close - 2*ATR14`, `策略停利 = Close + 3*ATR14`
+
+Decision mapping:
+
+- `BUY`: score >= 75
+- `WATCH`: 60 <= score < 75
+- `WAIT`: score < 60
+
+HTML report rendering uses [`RendererFactory`](infrastructure/report/html_renderer.py), with separate renderers for `low_entry_score`, `low_entry_score_v2`, and `low_entry_score_v3`.
 
 ### To Authenticate Email  ###
 
@@ -58,7 +93,7 @@ usage: main.py [-h] [-t {VEH,ELEC,SEMI,AIR,BIO,COMM}] [-o {SHIRONG,shirong}] [-e
                stocklist [stocklist ...] holidays [holidays ...]
 
 positional arguments:
-  stocklist             Stock indexes directly, or a semicolon-separated stocklist file.
+  stocklist             Stock numbers directly, or legacy row indexes in a semicolon-separated stocklist file.
   holidays              Public holidays in Taiwan, comma separated or a holidays file.
 
 options:
@@ -80,14 +115,6 @@ options:
   -m, --mail            Send email to recipients.
 ```
 
-### Quick Start  ###
-
-```
-$ ./stockanalysis.sh
-```
-
-![image](https://github.com/s311354/Twse-stock-crawler/blob/main/demo/output.gif)
-
 ### Local Run Instructions ###
 
 Create or refresh the local environment:
@@ -103,13 +130,30 @@ Run the stock data analysis workflow:
 ./stockdataanalysis.sh
 ```
 
+The script uses `$PYTHON` when provided, otherwise it tries a dependency-ready `python3`, then falls back to `.venv/bin/python`.
+
+If you want the shell to load the sample SMTP/runtime variables first:
+
+```
+set -a
+. ./.env.example
+set +a
+./stockdataanalysis.sh
+```
+
+To force a specific interpreter:
+
+```
+PYTHON=python3 ./stockdataanalysis.sh
+```
+
 Or call the clean entrypoint directly:
 
 ```
 .venv/bin/python main.py -o shirong -e 35 -b 0 -t ELEC -m ./stocklist_elec ./holidays_2026
 ```
 
-The shell script automatically loads SMTP and runtime variables from `.env` when present, or `.env.example` as a fallback.
+The shell script automatically loads SMTP and runtime variables from `.env` when present, or `.env.example` as a fallback. Real email sending still requires real `TWSE_SMTP_*` values.
 
 Outputs are written under [`data`](data/), including daily TWSE CSV files and `shirong_analysis_dataset.csv`.
 
@@ -135,14 +179,10 @@ docker run -it  -v $(pwd)/${MOUNT}:/mnt user/twsestockcrawler:0.01  bash
 
 ### Potential Defect ###
 
-There's a potential risk of max profit happening in the order of TWSE data between different dates. This probably causes imprecise max profit and profit ratio.
+The crawler now locks each tracked slot to a TWSE stock number before appending OHLC history. If a tracked stock is missing on a date, the row is skipped. Max-profit calculations still depend on the selected backtrack window and available valid trading days.
 
 ### Contacts Me ###
 
 If you catch bugs, please <a href="mailto:s041978@hotmail.com">email</a> to me.
 
 Happy Investing! :)
-
-## Reference ##
-
-+ [TWSE](https://www.twse.com.tw/zh/index.html)

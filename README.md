@@ -29,9 +29,13 @@ The crawler keeps the legacy scripts compatible while introducing a cleaner, low
 |   `-- stock_service.py            # workflow orchestration
 |-- domain/
 |   |-- models.py                   # domain aliases/models
+|   |-- pipeline.py                 # pandas pipeline stages
+|   |-- repositories.py             # stock repository interface
 |   |-- services.py                 # pure profit/indicator services
 |   |-- strategy.py                 # strategy abstraction/plugin registry
 |   `-- strategies/
+|       |-- expected_return_exit.py # Expected Return Exit Model v1 strategy
+|       |-- expected_return_exit_v2.py # Expected Return Exit Model v2 strategy
 |       |-- low_entry_score.py      # built-in Low Entry Score v1 strategy
 |       |-- low_entry_score_v2.py   # refined Low Entry Score v2 strategy
 |       `-- low_entry_score_v3.py   # advanced Low Entry Score v3 strategy
@@ -39,6 +43,7 @@ The crawler keeps the legacy scripts compatible while introducing a cleaner, low
 |   |-- crawler/twse_client.py      # TWSE HTTP boundary
 |   |-- report/html_renderer.py     # strategy HTML renderer factory
 |   |-- storage/csv_repository.py   # CSV output boundary
+|   |-- storage/stock_repository.py # CSV/SQLite/DuckDB stock repositories
 |   |-- storage/chart_repository.py # chart output boundary
 |   `-- notification/mail.py        # SMTP boundary
 |-- config/
@@ -62,7 +67,7 @@ class Strategy(ABC):
 
 Built-in strategies are lazily registered through [`domain/strategy.py`](domain/strategy.py). External strategies can register themselves with `register_strategy(MyStrategy())`.
 
-The default built-in plugin used by the report is `low_entry_score_v3` in [`domain/strategies/low_entry_score_v3.py`](domain/strategies/low_entry_score_v3.py).
+The report combines `low_entry_score_v3` from [`domain/strategies/low_entry_score_v3.py`](domain/strategies/low_entry_score_v3.py) with `expected_return_exit_v2` from [`domain/strategies/expected_return_exit_v2.py`](domain/strategies/expected_return_exit_v2.py). The original `expected_return_exit` plugin remains registered for compatibility.
 
 Low Entry Score v3 consumes TWSE daily OHLCV data and calculates:
 - Trend score: `EMA20 > EMA50 > EMA200`, plus price above `EMA20`
@@ -79,6 +84,23 @@ Decision mapping:
 - `WAIT`: score < 60
 
 HTML report rendering uses [`RendererFactory`](infrastructure/report/html_renderer.py), with separate renderers for `low_entry_score`, `low_entry_score_v2`, and `low_entry_score_v3`.
+
+Expected Return Exit Model v2 (EREM v2) consumes the same OHLCV history and calculates:
+- Trend continuation score: EMA alignment and price above/below EMA20.
+- Momentum score: RSI14, MACD confirmation, rising/falling histogram, and bearish divergence.
+- Volatility score: upper Bollinger-band state and ATR14 versus ATR20MA.
+- Distribution score: OBV direction, volume confirmation, and volume-spike/flat-price penalty.
+- Remaining expected return score: `RewardRisk = (Highest120 - Close) / (Close - Lowest120)` and `ExpectedReturn = (UpperBound - Close) / Close`, where `UpperBound = Mean120 + 2*StdDev120`.
+
+EREM decision mapping:
+
+- `Strong Hold`: score >= 85
+- `Hold`: 70 <= score < 85
+- `Reduce Position`: 55 <= score < 70
+- `Take Profit`: 40 <= score < 55
+- `Exit`: score < 40
+
+The email section title is `低點進場判斷（Low-Entry Model v3）+ 預期報酬出場判斷`; the table includes `EREM 分數`, `EREM 決策訊號`, and `EREM Highest120`.
 
 ### To Authenticate Email  ###
 
@@ -155,12 +177,12 @@ Or call the clean entrypoint directly:
 
 The shell script automatically loads SMTP and runtime variables from `.env` when present, or `.env.example` as a fallback. Real email sending still requires real `TWSE_SMTP_*` values.
 
-Outputs are written under [`data`](data/), including daily TWSE CSV files and `shirong_analysis_dataset.csv`.
+Outputs are written under [`data`](data/), including daily TWSE CSV files and `shirong_analysis_dataset.csv`. The analysis dataset includes Low Entry v3 columns plus EREM v2 columns such as `EREM 分數`, `EREM 決策訊號`, `EREM RewardRisk`, `EREM ExpectedReturn`, `EREM Highest120`, and `EREM MACD Histogram Rising`.
 
 Run tests:
 
 ```
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/ -q
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/ -q --assert=plain
 ```
 
 ### To Build the image with python package dependencies ###

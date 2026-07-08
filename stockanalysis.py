@@ -34,6 +34,8 @@ from domain.services import max_profit_k_transactions
 from domain.services import max_profit_unlimited
 from domain.services import max_profit_with_fee
 from domain.strategy import get_strategy
+from domain.strategies.expected_return_exit_v2 import EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS
+from domain.strategies.expected_return_exit_v2 import EXPECTED_RETURN_EXIT_STRATEGY_NAME
 from domain.strategies.low_entry_score_v3 import LOW_ENTRY_OUTPUT_COLUMNS
 from domain.strategies.low_entry_score_v3 import LOW_ENTRY_STRATEGY_NAME
 from infrastructure.report.html_renderer import RendererFactory
@@ -583,6 +585,18 @@ class TwseCrawker():
         return pd.DataFrame(strategy_rows, columns = LOW_ENTRY_OUTPUT_COLUMNS)
 
 
+    def cal_expected_return_exit_strategy(self) -> pd.DataFrame:
+        strategy = get_strategy(EXPECTED_RETURN_EXIT_STRATEGY_NAME)
+        strategy_rows: list[dict[str, object]] = []
+
+        for item in range(self.stocklistsize):
+            result = strategy.run(self.build_strategy_history(item))
+            latest = result.iloc[-1].to_dict() if not result.empty else {}
+            strategy_rows.append({column: latest.get(column) for column in EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS})
+
+        return pd.DataFrame(strategy_rows, columns = EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS)
+
+
     def build_analysis_dataset(self, maxprofits: list[ProfitRow]) -> pd.DataFrame:
         df_analysis = pd.DataFrame(maxprofits)
         df_analysis.columns = ["無限次交易", "交易一次", "至多五次交易", "無限次交易(手續費$NTD300)", "利潤比"]
@@ -591,7 +605,8 @@ class TwseCrawker():
             columns = ["Trend Score", "MOM", "CS", "Stop_Loss", "Take_Profit"],
         )
         df_low_entry = self.cal_low_entry_strategy()
-        df_analysis = pd.concat([df_analysis, df_signal_features, df_low_entry], axis = 1)
+        df_expected_return_exit = self.cal_expected_return_exit_strategy()
+        df_analysis = pd.concat([df_analysis, df_signal_features, df_low_entry, df_expected_return_exit], axis = 1)
         df_analysis["日期"] = self.iso_scheduled_times[-1]
         df_analysis["證券代號"] = self.stocknumbers
         df_analysis["證券名稱"] = self.stocknames
@@ -617,7 +632,7 @@ class TwseCrawker():
             "Take_Profit",
         ]
 
-        return df_analysis[base_columns + LOW_ENTRY_OUTPUT_COLUMNS]
+        return df_analysis[base_columns + LOW_ENTRY_OUTPUT_COLUMNS + EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS]
 
 
     def cal_max_profit_ratio_data(self) -> list[list[float]]:

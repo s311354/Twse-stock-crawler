@@ -26,10 +26,20 @@ class HtmlRenderer(ABC):
 
 
 class LowEntryHtmlRenderer(HtmlRenderer):
-    def __init__(self, title: str, description: str, metrics: list[MetricColumn]) -> None:
+    def __init__(
+        self,
+        title: str,
+        description: str,
+        metrics: list[MetricColumn],
+        decision_note: str | None = None,
+    ) -> None:
         self.title = title
         self.description = description
         self.metrics = metrics
+        self.decision_note = decision_note or (
+            "<strong>低點進場判斷決策</strong>：BUY &gt;= 75；WATCH = 60-74；WAIT &lt; 60。"
+            "風控採 ATR14：策略停損 = 收盤 - 2*ATR14；策略停利 = 收盤 + 3*ATR14。"
+        )
 
     def render(self, result: pd.DataFrame) -> str:
         rows = []
@@ -42,23 +52,31 @@ class LowEntryHtmlRenderer(HtmlRenderer):
             row.extend(self._format_value(stock.get(metric.column), metric.precision) for metric in self.metrics)
             row.extend([
                 html.escape(str(stock.get("低點決策", "N/A"))),
+                html.escape(str(stock.get("EREM 決策訊號", "N/A"))),
                 html.escape(str(stock.get("低點理由", "N/A"))),
+                html.escape(str(stock.get("EREM 理由", "N/A"))),
             ])
             rows.append(row)
 
         df_entry = pd.DataFrame(
             rows,
-            columns=["股票", "現價"] + [metric.label for metric in self.metrics] + ["決策", "理由"],
+            columns=["股票", "現價"] + [metric.label for metric in self.metrics] + [
+                "低點進場判斷決策",
+                "預期報酬出場判斷決策",
+                "低點理由",
+                "EREM理由",
+            ],
         )
 
         return """
         <h3>{}</h3>
         <p>{}</p>
-        <p><strong>決策</strong>：BUY &gt;= 75；WATCH = 60-74；WAIT &lt; 60。風控採 ATR14：策略停損 = 收盤 - 2*ATR14；策略停利 = 收盤 + 3*ATR14。</p>
+        <p>{}</p>
         {}
         """.format(
             html.escape(self.title),
             self.description,
+            self.decision_note,
             tabulate(df_entry, headers="keys", tablefmt="html", showindex=False),
         )
 
@@ -117,23 +135,39 @@ class LowEntryV2Renderer(LowEntryHtmlRenderer):
 class LowEntryV3Renderer(LowEntryHtmlRenderer):
     def __init__(self) -> None:
         super().__init__(
-            title="低點進場判斷（Low-Entry Model v3）",
-            description="<strong>Score 規則 v3</strong>：趨勢 25 分、動能 20 分、波動 20 分、量能 20 分、結構 15 分，合計 0-100 分。",
+            title="低點進場判斷（Low-Entry Model v3）+ 預期報酬出場判斷",
+            description=(
+                "<strong>Score 規則 v3</strong>：趨勢 25 分、動能 20 分、波動 20 分、量能 20 分、結構 15 分，合計 0-100 分。"
+                "<br><strong>Score 規則 EREM v2</strong>：趨勢延續 25 分、動能 20 分、波動 15 分、籌碼 20 分、120 日剩餘報酬 20 分，合計 0-100 分。"
+            ),
             metrics=[
                 MetricColumn("低點分數", "低點分數"),
-                MetricColumn("EMA多頭排列", "EMA Alignment", 0),
-                MetricColumn("站上EMA20", "Price Above EMA20", 0),
-                MetricColumn("RSI14", "RSI14"),
-                MetricColumn("MACD翻正", "MACD Bullish", 0),
-                MetricColumn("近布林下緣", "Near Lower Band", 0),
-                MetricColumn("ATR收斂", "ATR Contraction", 0),
-                MetricColumn("量大於MA20", "Volume Above MA20", 0),
-                MetricColumn("OBV上升", "OBV Rising", 0),
-                MetricColumn("支撐未破", "Support Holding", 0),
-                MetricColumn("Higher Low", "Higher Low", 0),
+                MetricColumn("EREM分數", "EREM 分數"),
+                #MetricColumn("EREM決策訊號", "EREM 決策訊號", 0),
+                #MetricColumn("EREM RR", "EREM RewardRisk"),
+                #MetricColumn("EREM預期報酬", "EREM ExpectedReturn", 4),
+                #MetricColumn("EREM柱狀上升", "EREM MACD Histogram Rising", 0),
+                MetricColumn("EREM最高120日", "EREM Highest120"),
+                MetricColumn("EREM上界", "EREM UpperBound"),
+                #MetricColumn("EMA多頭排列", "EMA Alignment", 0),
+                #MetricColumn("站上EMA20", "Price Above EMA20", 0),
+                #MetricColumn("RSI14", "RSI14"),
+                #MetricColumn("MACD翻正", "MACD Bullish", 0),
+                #MetricColumn("近布林下緣", "Near Lower Band", 0),
+                #MetricColumn("ATR收斂", "ATR Contraction", 0),
+                #MetricColumn("量大於MA20", "Volume Above MA20", 0),
+                #MetricColumn("OBV上升", "OBV Rising", 0),
+                #MetricColumn("支撐未破", "Support Holding", 0),
+                #MetricColumn("Higher Low", "Higher Low", 0),
                 MetricColumn("策略停損", "策略停損"),
                 MetricColumn("策略停利", "策略停利"),
             ],
+            decision_note=(
+                "<strong>低點進場判斷決策</strong>：BUY &gt;= 75；WATCH = 60-74；WAIT &lt; 60。"
+                "<br><strong>預期報酬出場判斷決策</strong>：Strong Hold &gt;= 85；Hold = 70-84；"
+                "Reduce Position = 55-69；Take Profit = 40-54；Exit &lt; 40。"
+                "<br>風控採 ATR14：策略停損 = 收盤 - 2*ATR14；策略停利 = 收盤 + 3*ATR14。"
+            ),
         )
 
 

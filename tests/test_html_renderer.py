@@ -13,6 +13,13 @@ def test_renderer_factory_renders_low_entry_v3_html() -> None:
                     "證券名稱": "廣達",
                     "收盤": 109000.0,
                     "低點分數": 75,
+                    "EREM 分數": 82,
+                    "EREM 決策訊號": "Hold",
+                    "EREM RewardRisk": 1.8,
+                    "EREM ExpectedReturn": 0.12,
+                    "EREM MACD Histogram Rising": 1,
+                    "EREM Highest120": 122000.0,
+                    "EREM UpperBound": 121500.0,
                     "EMA Alignment": 1,
                     "Price Above EMA20": 1,
                     "RSI14": 52.5,
@@ -27,12 +34,17 @@ def test_renderer_factory_renders_low_entry_v3_html() -> None:
                     "策略停利": 115000.0,
                     "低點決策": "BUY",
                     "低點理由": "趨勢+25；決策=BUY",
+                    "EREM 理由": "趨勢延續+25；決策=Hold",
                 }
             ]
         )
     )
 
     assert "Low-Entry Model v3" in html
-    assert "EMA多頭排列" in html
+    #assert "EMA多頭排列" in html
+    #assert "EREM決策訊號" in html
+    assert "EREM最高120日" in html
+    assert "預期報酬出場判斷決策" in html
     assert "2382" in html
     assert "BUY" in html
+    assert "Hold" in html

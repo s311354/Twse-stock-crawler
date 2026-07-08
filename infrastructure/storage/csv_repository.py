@@ -9,13 +9,14 @@ import pandas as pd
 
 from config.settings import DATA_DIR
 from domain.models import StockRows
+from infrastructure.storage.stock_repository import CsvStockRepository
 
 
-class CsvRepository:
+class CsvRepository(CsvStockRepository):
     """Owns CSV filesystem writes so application code stays storage-agnostic."""
 
     def __init__(self, output_dir: str | Path = DATA_DIR) -> None:
-        self.output_dir = Path(output_dir)
+        super().__init__(output_dir)
 
     def write_daily_rows(self, file_name: str, scheduled_time: str, rows: StockRows) -> Path:
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -32,4 +33,3 @@ class CsvRepository:
         output_path = self.output_dir / f"{file_name}_analysis_dataset.csv"
         dataset.to_csv(output_path, index=False)
         return output_path
-

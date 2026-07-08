@@ -56,9 +56,11 @@ class TwseColumns:
 class Stocktype(enum.Enum):
     VEH = 12,
     ELEC = 13,
-    SEMI = 14,
+    BUI = 14,
     AIR = 15,
+    CHEMI = 21,
     BIO = 22,
+    SEMI = 24,
     COMM = 27
 
     def __str__(self) -> str:

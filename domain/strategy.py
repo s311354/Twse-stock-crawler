@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -44,39 +45,38 @@ class StrategyRegistry:
 
 
 strategy_registry = StrategyRegistry()
-_BUILTINS_LOADED = False
+_BUILTINS_LOADED: set[str] = set()
 
 _BUILTIN_STRATEGIES = {
+    "expected_return_exit": "domain.strategies.expected_return_exit.ExpectedReturnExitStrategy",
+    "expected_return_exit_v2": "domain.strategies.expected_return_exit_v2.ExpectedReturnExitV2Strategy",
     "low_entry_score": "domain.strategies.low_entry_score.LowEntryScoreStrategy",
     "low_entry_score_v2": "domain.strategies.low_entry_score_v2.LowEntryScoreV2Strategy",
     "low_entry_score_v3": "domain.strategies.low_entry_score_v3.LowEntryScoreV3Strategy",
 }
 
-def load_builtin_strategies(name: str) -> None:
+def load_builtin_strategies(name: str | None = None) -> None:
     """Register bundled strategies once.
 
     External plugins can call register_strategy() without importing application
     code. Built-ins are lazily loaded to keep CLI help/imports lightweight.
+    Passing a name loads only that strategy; omitting it loads every built-in.
     """
 
-    global _BUILTINS_LOADED
-    if _BUILTINS_LOADED:
-        return
+    names = [name] if name is not None else sorted(_BUILTIN_STRATEGIES)
 
-    strategy_path = _BUILTIN_STRATEGIES.get(name)
-    if strategy_path is None:
-        raise ValueError(f"Unknown builtin strategy: {name}")
-    
-    module_name, class_name = strategy_path.rsplit(".", 1)
-    module = __import__(
-        module_name,
-        fromlist=[class_name],
-    )
+    for strategy_name in names:
+        strategy_path = _BUILTIN_STRATEGIES.get(strategy_name)
+        if strategy_path is None:
+            raise ValueError("Unknown builtin strategy: {}".format(strategy_name))
+        if strategy_name in _BUILTINS_LOADED:
+            continue
 
-    strategy_cls = getattr(module, class_name)
-    strategy_registry.register(strategy_cls(), replace=True)
-
-    _BUILTINS_LOADED = True
+        module_name, class_name = strategy_path.rsplit(".", 1)
+        module = import_module(module_name)
+        strategy_cls = getattr(module, class_name)
+        strategy_registry.register(strategy_cls(), replace=True)
+        _BUILTINS_LOADED.add(strategy_name)
 
 
 def register_strategy(strategy: Strategy, replace: bool = False) -> Strategy:

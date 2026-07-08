@@ -38,8 +38,6 @@ StockhtmlMessage = """\
         <br>
         **Note** <br>
         - I am not a professional investor and also not responsible for your losses. This is just the edcational content. <br>
-        - There's a potential risk of max profit happening in the order of TWSE data between different dates. This probably causes imprecise max profit and profit ratio. <br>
-
         <br>
         Regards, <br>
         Shi-rong (Louis) Liu <br>
@@ -55,7 +53,6 @@ StockhtmlImgMessage = """\
 
         **Note**
         - I am not a professional investor and also not responsible for your losses. This is just the edcational content.
-        - There's a potential risk of max profit happening in the order of TWSE data between different dates. This probably causes imprecise max profit and profit ratio.
 
         Regards,
         Shi-rong (Louis) Liu

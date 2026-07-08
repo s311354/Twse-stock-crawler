@@ -185,4 +185,10 @@ def test_analysis_dataset_includes_low_entry_score_v3_columns() -> None:
     assert "EMA Alignment" in dataset.columns
     assert "Volume Above MA20" in dataset.columns
     assert "OBV Rising" in dataset.columns
+    assert "EREM 分數" in dataset.columns
+    assert "EREM 決策訊號" in dataset.columns
+    assert "EREM RewardRisk" in dataset.columns
+    assert "EREM Highest120" in dataset.columns
+    assert "EREM MACD Histogram Rising" in dataset.columns
     assert dataset.loc[0, "EMA Alignment"] == 1
+    assert dataset.loc[0, "EREM 決策訊號"] in {"Strong Hold", "Hold", "Reduce Position", "Take Profit", "Exit"}

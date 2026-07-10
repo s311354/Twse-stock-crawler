@@ -50,6 +50,7 @@ _BUILTINS_LOADED: set[str] = set()
 _BUILTIN_STRATEGIES = {
     "expected_return_exit": "domain.strategies.expected_return_exit.ExpectedReturnExitStrategy",
     "expected_return_exit_v2": "domain.strategies.expected_return_exit_v2.ExpectedReturnExitV2Strategy",
+    "expected_return_exit_v3": "domain.strategies.expected_return_exit_v3.ExpectedReturnExitV3Strategy",
     "low_entry_score": "domain.strategies.low_entry_score.LowEntryScoreStrategy",
     "low_entry_score_v2": "domain.strategies.low_entry_score_v2.LowEntryScoreV2Strategy",
     "low_entry_score_v3": "domain.strategies.low_entry_score_v3.LowEntryScoreV3Strategy",

@@ -42,7 +42,7 @@ if ! "$PYTHON_BIN" -c "import requests, pandas, tabulate, xlsxwriter, matplotlib
 fi
 
 "$PYTHON_BIN" "$SCRIPT_DIR/main.py" -o shirong  \
-                                             -e 60 \
+                                             -e 500 \
                                              -b 0 \
                                              -t ELEC \
                                              -m \

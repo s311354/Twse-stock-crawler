@@ -132,43 +132,43 @@ class LowEntryV2Renderer(LowEntryHtmlRenderer):
         )
 
 
-class LowEntryV3Renderer(LowEntryHtmlRenderer):
+class ExpectedReturnExitV3Renderer(LowEntryHtmlRenderer):
     def __init__(self) -> None:
         super().__init__(
-            title="低點進場判斷（Low-Entry Model v3）+ 預期報酬出場判斷",
+            title="低點進場判斷（Low-Entry Model v3）+ 預期報酬出場判斷（EREM v3）",
             description=(
                 "<strong>Score 規則 v3</strong>：趨勢 25 分、動能 20 分、波動 20 分、量能 20 分、結構 15 分，合計 0-100 分。"
-                "<br><strong>Score 規則 EREM v2</strong>：趨勢延續 25 分、動能 20 分、波動 15 分、籌碼 20 分、120 日剩餘報酬 20 分，合計 0-100 分。"
+                "<br><strong>Score 規則 EREM v3</strong>：趨勢、動能、波動、籌碼、剩餘報酬、TAIEX 相對強弱、"
+                "趨勢結構、Entry LES、週轉強度與 VWAP。規格原始權重合計 105 分，固定正規化為 0-100 分。"
             ),
             metrics=[
                 MetricColumn("低點分數", "低點分數"),
                 MetricColumn("EREM分數", "EREM 分數"),
-                #MetricColumn("EREM決策訊號", "EREM 決策訊號", 0),
+                #MetricColumn("持有信心", "EREM Holding Confidence"),
+                #MetricColumn("Entry LES", "EREM Entry LES"),
                 #MetricColumn("EREM RR", "EREM RewardRisk"),
-                #MetricColumn("EREM預期報酬", "EREM ExpectedReturn", 4),
-                #MetricColumn("EREM柱狀上升", "EREM MACD Histogram Rising", 0),
-                MetricColumn("EREM最高120日", "EREM Highest120"),
-                MetricColumn("EREM上界", "EREM UpperBound"),
-                #MetricColumn("EMA多頭排列", "EMA Alignment", 0),
-                #MetricColumn("站上EMA20", "Price Above EMA20", 0),
-                #MetricColumn("RSI14", "RSI14"),
-                #MetricColumn("MACD翻正", "MACD Bullish", 0),
-                #MetricColumn("近布林下緣", "Near Lower Band", 0),
-                #MetricColumn("ATR收斂", "ATR Contraction", 0),
-                #MetricColumn("量大於MA20", "Volume Above MA20", 0),
-                #MetricColumn("OBV上升", "OBV Rising", 0),
-                #MetricColumn("支撐未破", "Support Holding", 0),
-                #MetricColumn("Higher Low", "Higher Low", 0),
+                #MetricColumn("RS60", "EREM Relative Strength60", 4),
+                #MetricColumn("Higher High", "EREM Higher High", 0),
+                #MetricColumn("Higher Low", "EREM Higher Low", 0),
+                #MetricColumn("週轉強度", "EREM Turnover Strength", 4),
+                #MetricColumn("VWAP60", "EREM VWAP60"),
+                #MetricColumn("EREM最高120日", "EREM Highest120"),
+                #MetricColumn("EREM上界", "EREM UpperBound"),
                 MetricColumn("策略停損", "策略停損"),
                 MetricColumn("策略停利", "策略停利"),
             ],
             decision_note=(
                 "<strong>低點進場判斷決策</strong>：BUY &gt;= 75；WATCH = 60-74；WAIT &lt; 60。"
-                "<br><strong>預期報酬出場判斷決策</strong>：Strong Hold &gt;= 85；Hold = 70-84；"
-                "Reduce Position = 55-69；Take Profit = 40-54；Exit &lt; 40。"
+                "<br><strong>預期報酬出場判斷決策</strong>（依 Holding Confidence）：STRONG HOLD &gt;= 85；"
+                "HOLD = 70-84；HOLD = 55-69；REDUCE 25% = 40-54；EXIT &lt; 40。"
+                "此分級以降低不必要換手與過度交易。"
                 "<br>風控採 ATR14：策略停損 = 收盤 - 2*ATR14；策略停利 = 收盤 + 3*ATR14。"
             ),
         )
+
+
+class LowEntryV3Renderer(ExpectedReturnExitV3Renderer):
+    """Backward-compatible renderer alias for the existing LES v3 report key."""
 
 
 class RendererFactory:
@@ -176,6 +176,7 @@ class RendererFactory:
         "low_entry_score": LowEntryV1Renderer(),
         "low_entry_score_v2": LowEntryV2Renderer(),
         "low_entry_score_v3": LowEntryV3Renderer(),
+        "expected_return_exit_v3": ExpectedReturnExitV3Renderer(),
     }
 
     @classmethod

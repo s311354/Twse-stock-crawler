@@ -12,6 +12,7 @@ from typing import Any, NamedTuple, TypeAlias
 from requests import Response
 from requests import exceptions as requests_exceptions
 from textmewhenitsdone import TextMeWhenItsDone
+from twse.parser import clean_cell, parse_price
 
 StockRow: TypeAlias = list[str]
 StockRows: TypeAlias = list[StockRow]
@@ -126,6 +127,7 @@ class SMTPEmail(object):
 
 class TwStockCrawler(object):
     _logged_insecure_ssl_fallback = False
+    TAIEX_INDEX_NAME = "發行量加權股價指數"
 
     def __init__(self) -> None:
         self.url: str = 'https://www.twse.com.tw/exchangeReport/MI_INDEX'
@@ -174,6 +176,44 @@ class TwStockCrawler(object):
             return data
 
         raise RuntimeError("TWSE response at {} does not contain stock data".format(date_time))
+
+
+    def _extract_taiex_close(self, content: JsonPayload, date_time: str) -> float:
+        """Read TAIEX by schema labels instead of table or row positions."""
+        for table in content.get("tables", []):
+            if not isinstance(table, dict):
+                continue
+
+            fields = table.get("fields")
+            data = table.get("data")
+            if not isinstance(fields, list) or not isinstance(data, list):
+                continue
+
+            index_field = next((field for field in ("指數", "指數名稱") if field in fields), None)
+            close_field = next((field for field in ("收盤指數", "收盤價") if field in fields), None)
+            if index_field is None or close_field is None:
+                continue
+
+            index_column = fields.index(index_field)
+            close_column = fields.index(close_field)
+            required_width = max(index_column, close_column) + 1
+
+            for row in data:
+                if not isinstance(row, list) or len(row) < required_width:
+                    continue
+                if clean_cell(row[index_column]) != self.TAIEX_INDEX_NAME:
+                    continue
+
+                taiex_close = parse_price(row[close_column])
+                if taiex_close is None or taiex_close <= 0:
+                    raise RuntimeError(
+                        "TWSE TAIEX close at {} is invalid: {}".format(date_time, row[close_column])
+                    )
+                return taiex_close
+
+        raise RuntimeError(
+            "TWSE response at {} does not contain {}".format(date_time, self.TAIEX_INDEX_NAME)
+        )
 
 
     def _get_content_keys(self, content: object) -> list[str]:
@@ -236,6 +276,46 @@ class TwStockCrawler(object):
     
         logging.info('Date: {}, Stock number: {}, Stock price: {}'.format(date_time, row[0][0], row[0][5]))
         return row
+
+
+    def get_taiex_close(self, date_time: str) -> float | None:
+        """Fetch one TAIEX close for a trading day from the index-only payload."""
+        query_params = {
+            "date": date_time,
+            "response": "json",
+            "type": "IND",
+            "_": str(round(time.time() * 1000) - 500),
+        }
+
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                page = self._request_stocktype_data(query_params=query_params, date_time=date_time)
+                if not page.ok:
+                    raise RuntimeError(
+                        "TWSE returned HTTP {} for TAIEX at {}".format(page.status_code, date_time)
+                    )
+
+                content = page.json()
+                if not isinstance(content, dict):
+                    raise RuntimeError("TWSE returned an invalid TAIEX payload at {}".format(date_time))
+                return self._extract_taiex_close(content=content, date_time=date_time)
+            except (json.JSONDecodeError, RuntimeError) as error:
+                logging.warning(
+                    "Unable to read TAIEX close at %s on attempt %s/%s: %s",
+                    date_time,
+                    attempt,
+                    self.max_attempts,
+                    error,
+                )
+                if attempt < self.max_attempts:
+                    time.sleep(1)
+
+        logging.warning(
+            "Skipping TWSE date %s because TAIEX was unavailable after %s attempts.",
+            date_time,
+            self.max_attempts,
+        )
+        return None
 
 
     def maxProfit(self, prices: list[int]) -> int:

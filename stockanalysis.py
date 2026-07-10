@@ -34,8 +34,8 @@ from domain.services import max_profit_k_transactions
 from domain.services import max_profit_unlimited
 from domain.services import max_profit_with_fee
 from domain.strategy import get_strategy
-from domain.strategies.expected_return_exit_v2 import EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS
-from domain.strategies.expected_return_exit_v2 import EXPECTED_RETURN_EXIT_STRATEGY_NAME
+from domain.strategies.expected_return_exit_v3 import EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS
+from domain.strategies.expected_return_exit_v3 import EXPECTED_RETURN_EXIT_STRATEGY_NAME
 from domain.strategies.low_entry_score_v3 import LOW_ENTRY_OUTPUT_COLUMNS
 from domain.strategies.low_entry_score_v3 import LOW_ENTRY_STRATEGY_NAME
 from infrastructure.report.html_renderer import RendererFactory
@@ -75,6 +75,7 @@ class TwseCrawker():
         self.daily_closes: list[list[float]] = [[] for _ in range(self.stocklistsize)]
         self.daily_volumes: list[list[float]] = [[] for _ in range(self.stocklistsize)]
         self.daily_pe_ratios: list[list[float | None]] = [[] for _ in range(self.stocklistsize)]
+        self.daily_taiex_closes: list[list[float]] = [[] for _ in range(self.stocklistsize)]
         self.iso_scheduled_times: list[str] = list()
         self.transactiondays: int = 0
 
@@ -90,6 +91,7 @@ class TwseCrawker():
         self.daily_closes = [[] for _ in range(self.stocklistsize)]
         self.daily_volumes = [[] for _ in range(self.stocklistsize)]
         self.daily_pe_ratios = [[] for _ in range(self.stocklistsize)]
+        self.daily_taiex_closes = [[] for _ in range(self.stocklistsize)]
 
 
     def clean_data(self, row: StockRow) -> StockRow:
@@ -434,6 +436,14 @@ class TwseCrawker():
                 logging.warning("Skipping %s because no TWSE rows passed schema validation.", scheduled_time)
                 continue
 
+            taiex_close = self.twse_client.get_daily_taiex_close(scheduled_time)
+            if taiex_close is None:
+                logging.warning(
+                    "Skipping %s because no valid TAIEX close was available for date alignment.",
+                    scheduled_time,
+                )
+                continue
+
             row_data: StockRows = [[] for _ in range(self.stocklistsize)]
     
             # Store stock data structure
@@ -462,6 +472,7 @@ class TwseCrawker():
                 self.daily_closes[item].append(twse_stock.close * 1000)
                 self.daily_volumes[item].append(twse_stock.volume)
                 self.daily_pe_ratios[item].append(twse_stock.pe)
+                self.daily_taiex_closes[item].append(taiex_close)
             
             # Record TWSE information of stock price
             if any(row_data):
@@ -569,6 +580,7 @@ class TwseCrawker():
                 "Close": self.daily_closes[item],
                 "Volume": self.daily_volumes[item],
                 "PE": self.daily_pe_ratios[item],
+                "TAIEX Close": self.daily_taiex_closes[item],
             }
         )
 
@@ -681,7 +693,7 @@ class TwseCrawker():
 
 
     def build_entry_signal_analysis(self, analysis_dataset: pd.DataFrame) -> str:
-        renderer = RendererFactory.get_renderer(LOW_ENTRY_STRATEGY_NAME)
+        renderer = RendererFactory.get_renderer(EXPECTED_RETURN_EXIT_STRATEGY_NAME)
         return renderer.render(analysis_dataset)
 
 

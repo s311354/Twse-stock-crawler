@@ -61,6 +61,7 @@ class Stocktype(enum.Enum):
     CHEMI = 21,
     BIO = 22,
     SEMI = 24,
+    COMP = 25,
     COMM = 27
 
     def __str__(self) -> str:

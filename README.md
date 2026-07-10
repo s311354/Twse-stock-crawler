@@ -36,6 +36,7 @@ The crawler keeps the legacy scripts compatible while introducing a cleaner, low
 |   `-- strategies/
 |       |-- expected_return_exit.py # Expected Return Exit Model v1 strategy
 |       |-- expected_return_exit_v2.py # Expected Return Exit Model v2 strategy
+|       |-- expected_return_exit_v3.py # Expected Return Exit Model v3 strategy
 |       |-- low_entry_score.py      # built-in Low Entry Score v1 strategy
 |       |-- low_entry_score_v2.py   # refined Low Entry Score v2 strategy
 |       `-- low_entry_score_v3.py   # advanced Low Entry Score v3 strategy
@@ -67,7 +68,7 @@ class Strategy(ABC):
 
 Built-in strategies are lazily registered through [`domain/strategy.py`](domain/strategy.py). External strategies can register themselves with `register_strategy(MyStrategy())`.
 
-The report combines `low_entry_score_v3` from [`domain/strategies/low_entry_score_v3.py`](domain/strategies/low_entry_score_v3.py) with `expected_return_exit_v2` from [`domain/strategies/expected_return_exit_v2.py`](domain/strategies/expected_return_exit_v2.py). The original `expected_return_exit` plugin remains registered for compatibility.
+The report combines `low_entry_score_v3` from [`domain/strategies/low_entry_score_v3.py`](domain/strategies/low_entry_score_v3.py) with `expected_return_exit_v3` from [`domain/strategies/expected_return_exit_v3.py`](domain/strategies/expected_return_exit_v3.py). The v1 and v2 EREM plugins remain registered for compatibility.
 
 Low Entry Score v3 consumes TWSE daily OHLCV data and calculates:
 - Trend score: `EMA20 > EMA50 > EMA200`, plus price above `EMA20`
@@ -83,24 +84,27 @@ Decision mapping:
 - `WATCH`: 60 <= score < 75
 - `WAIT`: score < 60
 
-HTML report rendering uses [`RendererFactory`](infrastructure/report/html_renderer.py), with separate renderers for `low_entry_score`, `low_entry_score_v2`, and `low_entry_score_v3`.
-
-Expected Return Exit Model v2 (EREM v2) consumes the same OHLCV history and calculates:
-- Trend continuation score: EMA alignment and price above/below EMA20.
-- Momentum score: RSI14, MACD confirmation, rising/falling histogram, and bearish divergence.
-- Volatility score: upper Bollinger-band state and ATR14 versus ATR20MA.
-- Distribution score: OBV direction, volume confirmation, and volume-spike/flat-price penalty.
-- Remaining expected return score: `RewardRisk = (Highest120 - Close) / (Close - Lowest120)` and `ExpectedReturn = (UpperBound - Close) / Close`, where `UpperBound = Mean120 + 2*StdDev120`.
+Expected Return Exit Model v3 (EREM v3) consumes OHLCV, TAIEX, plus optional entry LES and turnover history. Its deterministic component rules are:
+- Trend, 0-20: EMA20 > EMA50 > EMA200 adds 12; Close > EMA20 adds 8.
+- Momentum, 0-15: RSI14 in 45-70, MACD > Signal, and a rising MACD histogram each add 5; a two-day histogram decline or bearish divergence removes 5, with the component clipped to 0-15.
+- Volatility, 0-10: ATR14 <= ATR20MA and Close below the upper Bollinger band each add 5; excessive ATR or an upper-band touch with momentum exhaustion removes 5, clipped to 0-10.
+- Distribution, 0-15: rising OBV, price rising on volume above VolumeMA20, and no distribution warning each add 5. Warnings include price weakness on high volume, five falling OBV days, and price/OBV divergence.
+- Remaining return, 0-15: Reward/Risk > 2 adds 10, 1-2 adds 5, and Close below `Mean120 + 2*StdDev120` adds 5. A zero or negative risk denominator produces `N/A`, never infinity.
+- Relative strength, 0-10: positive `Stock Return60 - TAIEX Return60` adds 10, where `Return60 = Price[t] / Price[t-60] - 1`. At least 61 aligned trading-day observations are required.
+- Trend structure, 0-5: both a Higher High and Higher Low across consecutive 20-day windows add 5.
+- Entry quality, 0-5: Entry LES >= 75 adds 5; 60-74 adds 3. A value recorded on an entry row is forward-filled so the original entry quality is preserved throughout later holding rows.
+- Turnover, 0-5: turnover strength >= 1.2 with non-declining price adds 5. If no turnover column is supplied, `Volume / VolumeMA20` is used as an explicit proxy.
+- VWAP safety, 0-5: Close <= rolling VWAP60 adds 5.
 
 EREM decision mapping:
 
-- `Strong Hold`: score >= 85
-- `Hold`: 70 <= score < 85
-- `Reduce Position`: 55 <= score < 70
-- `Take Profit`: 40 <= score < 55
-- `Exit`: score < 40
+- `STRONG HOLD`: Holding Confidence >= 85
+- `HOLD`: 70 <= Holding Confidence < 85
+- `HOLD`: 55 <= Holding Confidence < 70
+- `REDUCE 25%`: 40 <= Holding Confidence < 55
+- `EXIT`: Holding Confidence < 40
 
-The email section title is `低點進場判斷（Low-Entry Model v3）+ 預期報酬出場判斷`; the table includes `EREM 分數`, `EREM 決策訊號`, and `EREM Highest120`.
+The 55-69 band deliberately remains `HOLD`, and the 40-54 band limits reduction to 25%, reducing unnecessary turnover and overtrading.
 
 ### To Authenticate Email  ###
 
@@ -177,7 +181,7 @@ Or call the clean entrypoint directly:
 
 The shell script automatically loads SMTP and runtime variables from `.env` when present, or `.env.example` as a fallback. Real email sending still requires real `TWSE_SMTP_*` values.
 
-Outputs are written under [`data`](data/), including daily TWSE CSV files and `shirong_analysis_dataset.csv`. The analysis dataset includes Low Entry v3 columns plus EREM v2 columns such as `EREM 分數`, `EREM 決策訊號`, `EREM RewardRisk`, `EREM ExpectedReturn`, `EREM Highest120`, and `EREM MACD Histogram Rising`.
+Outputs are written under [`data`](data/), including daily TWSE CSV files and `shirong_analysis_dataset.csv`. The analysis dataset includes Low Entry v3 columns plus EREM v3 columns such as `EREM 分數`, `EREM Holding Confidence`, `EREM 決策訊號`, `EREM RewardRisk`, `EREM Relative Strength60`, `EREM Turnover Strength`, and `EREM VWAP60`.
 
 Run tests:
 

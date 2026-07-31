@@ -2,15 +2,16 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os
-import requests
 import datetime
-import json
 import time
 import logging
+from collections.abc import Callable
 from typing import Any, NamedTuple, TypeAlias
-from requests import Response
-from requests import exceptions as requests_exceptions
+from config.settings import AppSettings
+from infrastructure.crawler.twse_http_client import TwseHttpClient
+from infrastructure.crawler.twse_http_client import TwseNetworkError
+from infrastructure.crawler.twse_http_client import TwseNoDataError
+from infrastructure.crawler.twse_http_client import TwseSchemaChangedError
 from textmewhenitsdone import TextMeWhenItsDone
 from twse.parser import clean_cell, parse_price
 
@@ -29,14 +30,24 @@ class AuthenticationServer(NamedTuple):
 
 class SMTPEmail(object):
 
-    def __init__(self, subject: str | None = None, ccreceiver: str | None = None) -> None:
+    def __init__(
+        self,
+        subject: str | None = None,
+        ccreceiver: str | None = None,
+        settings: AppSettings | None = None,
+    ) -> None:
+        self.settings = settings or AppSettings.from_env(
+            mops_enabled=False,
+            validate_paths=False,
+        )
         self.authentication: AuthenticationServer | None = None
         self.subject = subject
-        self.email = os.getenv("TWSE_SMTP_EMAIL", "your-email-account@gmail")
-        self.password = os.getenv("TWSE_SMTP_PASSWORD", "your-password")
-        receivers = os.getenv("TWSE_SMTP_RECEIVERS", "receiver1,receiver2")
-        self.receiver: list[str] = [receiver.strip() for receiver in receivers.split(",") if receiver.strip()]
-        self.ccreceiver = ccreceiver or os.getenv("TWSE_SMTP_CC", "ccreceiver")
+        self.email = self.settings.smtp_email
+        self.password = self.settings.smtp_password
+        self.receiver = list(self.settings.smtp_receivers)
+        self.ccreceiver = (
+            self.settings.smtp_cc if ccreceiver is None else ccreceiver
+        )
 
 
     def prompt(self, prompt: str) -> str:
@@ -54,8 +65,8 @@ class SMTPEmail(object):
             return False
 
         return (
-            email != "your-email-account@gmail" and
-            password != "your-password" and
+            bool(email) and
+            bool(password) and
             bool(self.receiver)
         )
 
@@ -80,7 +91,11 @@ class SMTPEmail(object):
             logging.warning("Skipping email send because SMTP credentials are not configured.")
             return
 
-        textmewhenitsdone = TextMeWhenItsDone(self.authentication.email)
+        textmewhenitsdone = TextMeWhenItsDone(
+            self.authentication.email,
+            smtp_host=self.settings.smtp_server_host,
+            smtp_port=self.settings.smtp_port,
+        )
 
         textmewhenitsdone.login(self.authentication.email, self.authentication.password)
 
@@ -107,7 +122,11 @@ class SMTPEmail(object):
             logging.warning("Skipping email send because SMTP credentials are not configured.")
             return
 
-        textmewhenitsdone = TextMeWhenItsDone(self.authentication.email)
+        textmewhenitsdone = TextMeWhenItsDone(
+            self.authentication.email,
+            smtp_host=self.settings.smtp_server_host,
+            smtp_port=self.settings.smtp_port,
+        )
 
         textmewhenitsdone.login(self.authentication.email, self.authentication.password)
 
@@ -126,60 +145,94 @@ class SMTPEmail(object):
 
 
 class TwStockCrawler(object):
-    _logged_insecure_ssl_fallback = False
     TAIEX_INDEX_NAME = "發行量加權股價指數"
+    MARKET_DATA_FALLBACK_URL = (
+        "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
+    )
 
-    def __init__(self) -> None:
+    def __init__(self, http_client: TwseHttpClient | None = None) -> None:
         self.url: str = 'https://www.twse.com.tw/exchangeReport/MI_INDEX'
-        self.timeout: int = 30
-        self.max_attempts: int = 2
-        self.allow_insecure_twse_fallback: bool = os.getenv("TWSE_ALLOW_INSECURE_SSL_FALLBACK", "1") != "0"
+        self.fallback_url: str = self.MARKET_DATA_FALLBACK_URL
+        self.http_client = http_client or TwseHttpClient()
+        self.timeout = self.http_client.config.timeout_seconds
+        self.max_attempts = self.http_client.config.max_attempts
 
 
-    def _should_retry_without_ssl_verification(self, error: requests_exceptions.SSLError) -> bool:
-        return self.allow_insecure_twse_fallback and "Missing Subject Key Identifier" in str(error)
-
-
-    def _request_stocktype_data(self, query_params: dict[str, str | int], date_time: str) -> Response:
-        try:
-            return requests.get(self.url, params = query_params, timeout = self.timeout)
-        except requests_exceptions.SSLError as error:
-            if not self._should_retry_without_ssl_verification(error):
-                raise RuntimeError(
-                    "TWSE SSL verification failed at {}. Set TWSE_ALLOW_INSECURE_SSL_FALLBACK=1 "
-                    "to allow the compatibility fallback if you trust the network path.".format(date_time)
-                ) from error
-
-            if not TwStockCrawler._logged_insecure_ssl_fallback:
+    def _request_stocktype_data(
+        self,
+        query_params: dict[str, str | int],
+        date_time: str,
+        payload_validator: Callable[[object], None] | None = None,
+    ) -> object:
+        endpoints = tuple(dict.fromkeys((self.url, self.fallback_url)))
+        for endpoint_index, endpoint in enumerate(endpoints):
+            try:
+                return self.http_client.get_json(
+                    endpoint,
+                    params=query_params,
+                    context="TWSE market data at {}".format(date_time),
+                    payload_validator=payload_validator,
+                ).payload
+            except TwseNetworkError as error:
+                if endpoint_index == len(endpoints) - 1:
+                    raise
                 logging.warning(
-                    "TWSE SSL certificate verification failed at %s; retrying once without certificate verification.",
+                    "TWSE status=NETWORK_ERROR date=%s endpoint=%s "
+                    "failover_endpoint=%s detail=%s",
                     date_time,
+                    endpoint,
+                    endpoints[endpoint_index + 1],
+                    error,
                 )
-                TwStockCrawler._logged_insecure_ssl_fallback = True
-            requests.packages.urllib3.disable_warnings()  # type: ignore[attr-defined]
-            return requests.get(self.url, params = query_params, timeout = self.timeout, verify = False)
-        except requests_exceptions.RequestException as error:
-            raise RuntimeError("Unable to fetch TWSE stock data at {}: {}".format(date_time, error)) from error
+
+        raise AssertionError("TWSE market-data endpoint list cannot be empty")
 
 
     def _extract_stock_rows(self, content: JsonPayload, date_time: str) -> StockRows:
-        if 'data1' in content and content['data1']:
-            return content['data1']
+        if 'data1' in content:
+            data1 = content['data1']
+            if isinstance(data1, list) and data1:
+                return data1
+            if data1 == []:
+                raise TwseNoDataError(
+                    "TWSE stock table at {} is empty".format(date_time),
+                    retryable=True,
+                )
+            raise TwseSchemaChangedError(
+                "TWSE data1 at {} is not a list".format(date_time)
+            )
 
+        found_stock_table = False
         for table in content.get('tables', []):
             data = table.get('data') if isinstance(table, dict) else None
             fields = table.get('fields') if isinstance(table, dict) else None
-            if not data:
+            if not isinstance(fields, list) or "證券代號" not in fields:
                 continue
-            if fields and "證券代號" not in fields:
-                continue
+            found_stock_table = True
+            if data == []:
+                raise TwseNoDataError(
+                    "TWSE stock table at {} is empty".format(date_time),
+                    retryable=True,
+                )
+            if not isinstance(data, list):
+                raise TwseSchemaChangedError(
+                    "TWSE stock table data at {} is not a list".format(date_time)
+                )
             return data
 
-        raise RuntimeError("TWSE response at {} does not contain stock data".format(date_time))
+        if found_stock_table:
+            raise TwseNoDataError(
+                "TWSE response at {} contains no stock rows".format(date_time),
+                retryable=True,
+            )
+        raise TwseSchemaChangedError(
+            "TWSE response at {} does not contain a stock table".format(date_time)
+        )
 
 
     def _extract_taiex_close(self, content: JsonPayload, date_time: str) -> float:
         """Read TAIEX by schema labels instead of table or row positions."""
+        found_index_table = False
         for table in content.get("tables", []):
             if not isinstance(table, dict):
                 continue
@@ -193,6 +246,7 @@ class TwStockCrawler(object):
             close_field = next((field for field in ("收盤指數", "收盤價") if field in fields), None)
             if index_field is None or close_field is None:
                 continue
+            found_index_table = True
 
             index_column = fields.index(index_field)
             close_column = fields.index(close_field)
@@ -206,13 +260,19 @@ class TwStockCrawler(object):
 
                 taiex_close = parse_price(row[close_column])
                 if taiex_close is None or taiex_close <= 0:
-                    raise RuntimeError(
-                        "TWSE TAIEX close at {} is invalid: {}".format(date_time, row[close_column])
+                    raise TwseNoDataError(
+                        "TWSE TAIEX close at {} is invalid: {}".format(date_time, row[close_column]),
+                        retryable=True,
                     )
                 return taiex_close
 
-        raise RuntimeError(
-            "TWSE response at {} does not contain {}".format(date_time, self.TAIEX_INDEX_NAME)
+        if found_index_table:
+            raise TwseNoDataError(
+                "TWSE response at {} contains no {}".format(date_time, self.TAIEX_INDEX_NAME),
+                retryable=True,
+            )
+        raise TwseSchemaChangedError(
+            "TWSE response at {} does not contain an index table".format(date_time)
         )
 
 
@@ -221,8 +281,6 @@ class TwStockCrawler(object):
 
 
     def get_stocktype_data(self, date_time: str, stocktype: int) -> StockRows:
-        row: StockRows = list()
-
         query_params = {
             'date': date_time,
             'response': 'json',
@@ -230,50 +288,44 @@ class TwStockCrawler(object):
             '_': str(round(time.time() * 1000) - 500)
         }
 
-        last_error = None
-
-        for attempt in range(1, self.max_attempts + 1):
-            # Get json data
-            page = self._request_stocktype_data(query_params = query_params, date_time = date_time)
-
-            print(date_time)
-            if not page.ok:
-                raise RuntimeError("TWSE returned HTTP {} at {}".format(page.status_code, date_time))
-
-            try:
-                content = page.json()
-            except json.JSONDecodeError as error:
-                raise RuntimeError("TWSE returned invalid JSON at {}".format(date_time)) from error
-
-            try:
-                for data in self._extract_stock_rows(content = content, date_time = date_time):
-                    row.append(data)
-                break
-            except RuntimeError as error:
-                last_error = error
-                logging.warning(
-                    "TWSE payload at %s had no stock rows on attempt %s/%s; keys=%s stat=%s",
-                    date_time,
-                    attempt,
-                    self.max_attempts,
-                    self._get_content_keys(content),
-                    content.get('stat') if isinstance(content, dict) else None,
+        def validate_stock_payload(payload: object) -> None:
+            if not isinstance(payload, dict):
+                raise TwseSchemaChangedError(
+                    "TWSE market data at {} is not an object".format(date_time)
                 )
-                row = list()
-                if attempt < self.max_attempts:
-                    time.sleep(1)
-                    continue
-                logging.warning(
-                    "Skipping TWSE date %s because no stock rows were available after %s attempts.",
-                    date_time,
-                    self.max_attempts,
-                )
-                return []
+            self._extract_stock_rows(content=payload, date_time=date_time)
 
-        if not row:
-            logging.warning("Skipping TWSE date %s because the stock dataset was empty.", date_time)
+        try:
+            content = self._request_stocktype_data(
+                query_params=query_params,
+                date_time=date_time,
+                payload_validator=validate_stock_payload,
+            )
+        except TwseNoDataError as error:
+            logging.warning(
+                "TWSE status=NO_DATA date=%s detail=%s",
+                date_time,
+                error,
+            )
             return []
-    
+
+        print(date_time)
+        if not isinstance(content, dict):
+            raise TwseSchemaChangedError(
+                "TWSE market data at {} is not an object".format(date_time)
+            )
+        try:
+            row = self._extract_stock_rows(content=content, date_time=date_time)
+        except TwseNoDataError as error:
+            logging.warning(
+                "TWSE status=NO_DATA date=%s keys=%s stat=%s detail=%s",
+                date_time,
+                self._get_content_keys(content),
+                content.get('stat'),
+                error,
+            )
+            return []
+
         logging.info('Date: {}, Stock number: {}, Stock price: {}'.format(date_time, row[0][0], row[0][5]))
         return row
 
@@ -287,35 +339,41 @@ class TwStockCrawler(object):
             "_": str(round(time.time() * 1000) - 500),
         }
 
-        for attempt in range(1, self.max_attempts + 1):
-            try:
-                page = self._request_stocktype_data(query_params=query_params, date_time=date_time)
-                if not page.ok:
-                    raise RuntimeError(
-                        "TWSE returned HTTP {} for TAIEX at {}".format(page.status_code, date_time)
-                    )
-
-                content = page.json()
-                if not isinstance(content, dict):
-                    raise RuntimeError("TWSE returned an invalid TAIEX payload at {}".format(date_time))
-                return self._extract_taiex_close(content=content, date_time=date_time)
-            except (json.JSONDecodeError, RuntimeError) as error:
-                logging.warning(
-                    "Unable to read TAIEX close at %s on attempt %s/%s: %s",
-                    date_time,
-                    attempt,
-                    self.max_attempts,
-                    error,
+        def validate_taiex_payload(payload: object) -> None:
+            if not isinstance(payload, dict):
+                raise TwseSchemaChangedError(
+                    "TWSE TAIEX data at {} is not an object".format(date_time)
                 )
-                if attempt < self.max_attempts:
-                    time.sleep(1)
+            self._extract_taiex_close(content=payload, date_time=date_time)
 
-        logging.warning(
-            "Skipping TWSE date %s because TAIEX was unavailable after %s attempts.",
-            date_time,
-            self.max_attempts,
-        )
-        return None
+        try:
+            content = self._request_stocktype_data(
+                query_params=query_params,
+                date_time=date_time,
+                payload_validator=validate_taiex_payload,
+            )
+        except TwseNoDataError as error:
+            logging.warning(
+                "TWSE status=NO_DATA date=%s dataset=TAIEX detail=%s",
+                date_time,
+                error,
+            )
+            return None
+
+        if not isinstance(content, dict):
+            raise TwseSchemaChangedError(
+                "TWSE TAIEX data at {} is not an object".format(date_time)
+            )
+
+        try:
+            return self._extract_taiex_close(content=content, date_time=date_time)
+        except TwseNoDataError as error:
+            logging.warning(
+                "TWSE status=NO_DATA date=%s dataset=TAIEX detail=%s",
+                date_time,
+                error,
+            )
+            return None
 
 
     def maxProfit(self, prices: list[int]) -> int:

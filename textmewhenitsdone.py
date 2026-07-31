@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os
 import smtplib
 from smtplib import SMTP
 from email.mime.text import MIMEText
@@ -66,14 +65,18 @@ class TextMeWhenItsDone(object):
     The smtplib module defines an SMTP client session object that can be used to send mail to any internet machine with an SMTP or ESMTP listener daemon
     """
 
-    def __init__(self, email: str) -> None:
+    def __init__(
+        self,
+        email: str,
+        *,
+        smtp_host: str = "",
+        smtp_port: int = 587,
+    ) -> None:
         self.server: SMTP | None = None
-        smtp_host = os.getenv("TWSE_SMTP_HOST")
-        smtp_port = os.getenv("TWSE_SMTP_PORT")
 
         # Connect to the SMTP server
-        if smtp_host and smtp_port:
-            self.server = smtplib.SMTP(smtp_host, int(smtp_port))
+        if smtp_host:
+            self.server = smtplib.SMTP(smtp_host, smtp_port)
             return
 
         if "@" not in email:

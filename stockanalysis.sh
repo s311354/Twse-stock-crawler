@@ -42,10 +42,10 @@ if ! "$PYTHON_BIN" -c "import requests, pandas, tabulate, xlsxwriter, matplotlib
 fi
 
 "$PYTHON_BIN" "$SCRIPT_DIR/main.py" -t ELEC -o shirong \
-														-e 10 \
-														-b 0 \
-														-p 7 \
-														-l \
-														-m \
-														-s I \
-                                             			"$SCRIPT_DIR/stocklist_elec_list" "$SCRIPT_DIR/holidays_2026"
+  -e 10 \
+  -b 0 \
+  -p 7 \
+  -l \
+  -m \
+  -s I \
+  "$SCRIPT_DIR/stocklist_elec_list"

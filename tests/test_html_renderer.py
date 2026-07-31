@@ -59,3 +59,107 @@ def test_renderer_factory_renders_low_entry_v3_html() -> None:
 
 def test_renderer_factory_exposes_expected_return_exit_v3_renderer() -> None:
     assert RendererFactory.get_renderer("expected_return_exit_v3") is not None
+
+
+def test_renderer_factory_renders_low_entry_v4_gates() -> None:
+    renderer = RendererFactory.get_renderer("low_entry_score_v4")
+    rendered = renderer.render(
+        pd.DataFrame(
+            [
+                {
+                    "證券代號": "2330",
+                    "證券名稱": "台積電",
+                    "收盤": 1000.0,
+                    "Quality Gate": "PASS",
+                    "Quality Score": 84,
+                    "Data Confidence": 91,
+                    "Available Metric Weight": 89,
+                    "Market Data Gate": "PASS",
+                    "Fundamental Available At": "2026-07-21T03:00:00+00:00",
+                    "Fundamental Availability Source": "FIRST_OBSERVED_DOWNLOAD",
+                    "Fundamental Revision": 2,
+                    "低點分數": 82,
+                    "No Veto": 1,
+                    "LES v4 Trigger": 1,
+                    "Risk Gate": "PASS",
+                    "RewardRisk": 2.2,
+                    "RS20": 0.03,
+                    "策略停損": 960.0,
+                    "策略停利": 1088.0,
+                    "低點決策": "BUY",
+                    "EREM 決策訊號": "HOLD",
+                    "低點理由": "所有進場 Gate 通過",
+                    "EREM 理由": "持有",
+                }
+            ]
+        )
+    )
+
+    assert "Low-Entry Model v4" in rendered
+    assert "Quality Gate" in rendered
+    assert "Data Confidence" in rendered
+    assert "可用QS權重" in rendered
+    assert "Risk Gate" in rendered
+    assert "Market Data Gate" in rendered
+    assert "FIRST_OBSERVED_DOWNLOAD" in rendered
+    assert "財報版本" in rendered
+    assert "WATCH_ONLY" in rendered
+    assert "2330" in rendered
+    assert "BUY" in rendered
+
+
+def test_renderer_factory_renders_low_entry_v4_1_components() -> None:
+    renderer = RendererFactory.get_renderer("low_entry_score_v4_1")
+    rendered = renderer.render(
+        pd.DataFrame(
+            [
+                {
+                    "證券代號": "2330",
+                    "證券名稱": "台積電",
+                    "收盤": 1000.0,
+                    "LES Profile": "BALANCED_PROFILE",
+                    "Quality Gate": "PASS",
+                    "Quality Score": 84,
+                    "Data Confidence": 91,
+                    "Current Audit Opinion": "REVIEWED_UNMODIFIED",
+                    "Comparative Audit Opinion": (
+                        "QUALIFIED_SCOPE_LIMITATION"
+                    ),
+                    "Provisional Buy Eligible": 0,
+                    "Market Data Gate": "PASS",
+                    "低點分數": 82,
+                    "市場環境分數": 15,
+                    "價格位置分數": 12,
+                    "止跌結構分數": 25,
+                    "買盤確認分數": 16,
+                    "動能分數": 8,
+                    "執行風控分數": 6,
+                    "No Veto": 1,
+                    "LES v4.1 Technical Trigger": 1,
+                    "LES v4.1 Strict Trigger": 1,
+                    "LES v4.1 Trigger": 1,
+                    "Liquidity Gate": "PASS",
+                    "Risk Gate": "PASS",
+                    "Strict Risk Gate": "PASS",
+                    "RewardRisk": 2.2,
+                    "Position Fraction": 1 / 3,
+                    "策略停損": 960.0,
+                    "策略停利": 1088.0,
+                    "低點決策": "BUY",
+                    "EREM 決策訊號": "HOLD",
+                    "低點理由": "所有進場 Gate 通過",
+                    "EREM 理由": "持有",
+                }
+            ]
+        )
+    )
+
+    assert "Low-Entry Model v4.1" in rendered
+    assert "動能" in rendered
+    assert "Technical Trigger" in rendered
+    assert "Liquidity Gate" in rendered
+    assert "BALANCED_PROFILE" in rendered
+    assert "REVIEWED_UNMODIFIED" in rendered
+    assert "QUALIFIED_SCOPE_LIMITATION" in rendered
+    assert "BUY_SMALL" in rendered
+    assert "BUY" in rendered

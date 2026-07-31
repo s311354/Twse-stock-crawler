@@ -11,38 +11,28 @@ This script is designed to help streamline models, by taking the Taiwan Stock Ex
 """
 
 import argparse
-import html
 import pandas as pd
 import enum
 import time
 import datetime
 import logging
-from tabulate import tabulate
 
+from application.analysis_dataset import AnalysisDatasetBuilder
 from domain.models import Stocktype
 from domain.models import Ohlc
-from domain.models import ProfitRow
-from domain.models import SignalRow
 from domain.models import StockSelector
 from domain.models import StockRow
 from domain.models import StockRows
 from domain.models import TWSEStock
 from domain.models import TwseColumns
-from domain.services import compute_signal_features
-from domain.services import max_profit
-from domain.services import max_profit_k_transactions
-from domain.services import max_profit_unlimited
-from domain.services import max_profit_with_fee
-from domain.strategy import get_strategy
-from domain.strategies.expected_return_exit_v3 import EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS
-from domain.strategies.expected_return_exit_v3 import EXPECTED_RETURN_EXIT_STRATEGY_NAME
-from domain.strategies.low_entry_score_v3 import LOW_ENTRY_OUTPUT_COLUMNS
-from domain.strategies.low_entry_score_v3 import LOW_ENTRY_STRATEGY_NAME
-from infrastructure.report.html_renderer import RendererFactory
+from domain.market_breadth import derive_twse_market_breadth
+from domain.trading_days import build_backtrack_dates
+from infrastructure.calendar.twse_calendar import TradingDayStatus
+from infrastructure.calendar.twse_calendar import TwseCalendar
 from infrastructure.crawler.twse_client import TwseClient
-from infrastructure.notification.mail import SMTPEmail
-from infrastructure.storage.chart_repository import save_profit_ratio_chart
-from infrastructure.storage.csv_repository import CsvRepository
+from infrastructure.crawler.twse_http_client import TwseHttpClient
+from infrastructure.legacy_crawler_facade import CsvRepositoryPort
+from infrastructure.legacy_crawler_facade import LegacyCrawlerFacade
 from twse.parser import clean_cell
 from twse.parser import parse_price
 
@@ -53,29 +43,54 @@ class QUERY(enum.Enum):
     PALEOGENE = 15
     CRETACEOUS = 30
 
-class TwseCrawker():
+class TwseCrawker(LegacyCrawlerFacade):
     _logged_missing_price_warnings: set[tuple[str, str, str, str, str, str]] = set()
 
     def __init__(
         self,
         stocklistsize: int,
         twse_client: TwseClient | None = None,
-        csv_repository: CsvRepository | None = None,
+        csv_repository: CsvRepositoryPort | None = None,
+        http_client: TwseHttpClient | None = None,
+        app_settings: object | None = None,
+        analysis_dataset_builder: AnalysisDatasetBuilder | None = None,
     ) -> None:
+        if twse_client is not None and http_client is not None:
+            raise ValueError("Pass either twse_client or http_client, not both")
         self.stocklistsize: int = stocklistsize
-        self.twse_client = twse_client or TwseClient()
-        self.csv_repository = csv_repository or CsvRepository()
+        self.twse_client = twse_client or TwseClient(http_client=http_client)
+        self._initialize_legacy_facade(
+            csv_repository=csv_repository,
+            app_settings=app_settings,
+            analysis_dataset_builder=analysis_dataset_builder,
+        )
         self.daily_stocks: list[list[float]] = [[] for _ in range(self.stocklistsize)]
         self.stocknumbers: list[str] = ['' for _ in range(self.stocklistsize)]
         self.stocknames: list[str] = ['' for _ in range(self.stocklistsize)]
         self.tracked_stock_numbers: list[str | None] = [None for _ in range(self.stocklistsize)]
+        self.missing_tracked_stock_numbers: set[str] = set()
         self.stocksprice: list[float | None] = list()
         self.daily_highs: list[list[float]] = [[] for _ in range(self.stocklistsize)]
         self.daily_lows: list[list[float]] = [[] for _ in range(self.stocklistsize)]
         self.daily_closes: list[list[float]] = [[] for _ in range(self.stocklistsize)]
         self.daily_volumes: list[list[float]] = [[] for _ in range(self.stocklistsize)]
+        self.daily_trade_counts: list[list[float | None]] = [[] for _ in range(self.stocklistsize)]
+        self.daily_trade_values: list[list[float | None]] = [[] for _ in range(self.stocklistsize)]
+        self.daily_bid_prices: list[list[float | None]] = [[] for _ in range(self.stocklistsize)]
+        self.daily_ask_prices: list[list[float | None]] = [[] for _ in range(self.stocklistsize)]
         self.daily_pe_ratios: list[list[float | None]] = [[] for _ in range(self.stocklistsize)]
         self.daily_taiex_closes: list[list[float]] = [[] for _ in range(self.stocklistsize)]
+        self.daily_dates: list[list[str]] = [[] for _ in range(self.stocklistsize)]
+        self.market_breadth_snapshots_by_date: dict[
+            str,
+            dict[str, object],
+        ] = {}
+        self.annual_fundamentals_by_stock: dict[str, pd.DataFrame] = {}
+        self.fundamental_snapshots_by_stock: dict[str, dict[str, object]] = {}
+        self.fundamental_status_by_stock: dict[str, str] = {}
+        self.fundamental_status_detail_by_stock: dict[str, str] = {}
+        self.low_entry_v4_signal_dates_by_stock: dict[str, str] = {}
+        self.low_entry_v4_account_equity: float | None = None
         self.iso_scheduled_times: list[str] = list()
         self.transactiondays: int = 0
 
@@ -86,12 +101,24 @@ class TwseCrawker():
         self.transactiondays = 0
         self.stocksprice = list()
         self.tracked_stock_numbers = [None for _ in range(self.stocklistsize)]
+        self.missing_tracked_stock_numbers = set()
         self.daily_highs = [[] for _ in range(self.stocklistsize)]
         self.daily_lows = [[] for _ in range(self.stocklistsize)]
         self.daily_closes = [[] for _ in range(self.stocklistsize)]
         self.daily_volumes = [[] for _ in range(self.stocklistsize)]
+        self.daily_trade_counts = [[] for _ in range(self.stocklistsize)]
+        self.daily_trade_values = [[] for _ in range(self.stocklistsize)]
+        self.daily_bid_prices = [[] for _ in range(self.stocklistsize)]
+        self.daily_ask_prices = [[] for _ in range(self.stocklistsize)]
         self.daily_pe_ratios = [[] for _ in range(self.stocklistsize)]
         self.daily_taiex_closes = [[] for _ in range(self.stocklistsize)]
+        self.daily_dates = [[] for _ in range(self.stocklistsize)]
+        self.market_breadth_snapshots_by_date = {}
+        self.annual_fundamentals_by_stock = {}
+        self.fundamental_snapshots_by_stock = {}
+        self.fundamental_status_by_stock = {}
+        self.fundamental_status_detail_by_stock = {}
+        self.low_entry_v4_signal_dates_by_stock = {}
 
 
     def clean_data(self, row: StockRow) -> StockRow:
@@ -198,11 +225,26 @@ class TwseCrawker():
         if tracked_stock_no:
             stock_row = stock_lookup.get(tracked_stock_no)
             if stock_row is None:
-                logging.warning(
-                    "Skipping tracked stock %s at %s because it is missing from the TWSE response.",
+                if tracked_stock_no not in self.missing_tracked_stock_numbers:
+                    logging.warning(
+                        "Skipping tracked stock %s starting at %s because it is missing from the TWSE response.",
+                        tracked_stock_no,
+                        scheduled_time,
+                    )
+                    self.missing_tracked_stock_numbers.add(tracked_stock_no)
+                else:
+                    logging.debug(
+                        "Tracked stock %s remains missing from the TWSE response at %s.",
+                        tracked_stock_no,
+                        scheduled_time,
+                    )
+            elif tracked_stock_no in self.missing_tracked_stock_numbers:
+                logging.info(
+                    "Tracked stock %s returned to the TWSE response at %s.",
                     tracked_stock_no,
                     scheduled_time,
                 )
+                self.missing_tracked_stock_numbers.remove(tracked_stock_no)
             return stock_row
 
         selector_text = str(selector).strip()
@@ -277,6 +319,10 @@ class TwseCrawker():
         low_price = self.parse_price(stock_row[TwseColumns.LOW])
         close_price = self.parse_price(stock_row[TwseColumns.CLOSE])
         volume = self.parse_price(stock_row[TwseColumns.VOLUME])
+        trades = self.parse_price(stock_row[TwseColumns.TRADE_COUNT])
+        amount = self.parse_price(stock_row[TwseColumns.TRADE_VALUE])
+        bid = self.parse_price(stock_row[TwseColumns.BID_PRICE])
+        ask = self.parse_price(stock_row[TwseColumns.ASK_PRICE])
         pe_ratio = self.parse_price(stock_row[TwseColumns.PE])
 
         if None in (open_price, high_price, low_price, close_price):
@@ -310,6 +356,10 @@ class TwseCrawker():
             close=close_price,
             volume=int(volume) if volume is not None else 0,
             pe=pe_ratio,
+            trades=int(trades) if trades is not None else None,
+            amount=amount,
+            bid=bid,
+            ask=ask,
         )
 
 
@@ -380,26 +430,44 @@ class TwseCrawker():
         return self.parse_stock_row_ohlc(stock_row, scheduled_time)
 
 
-    def get_date_times(self, start_date: int, backtrack_days: int, holidays: list[str]) -> None:
+    def get_date_times(
+        self,
+        begin_backtrack: int,
+        end_backtrack: int,
+        calendar: TwseCalendar | None = None,
+        reference_date: datetime.date | None = None,
+        include_reference: bool = False,
+    ) -> None:
+        self.iso_scheduled_times = []
+        effective_reference_date = reference_date or datetime.datetime.now().date()
 
-        now_date_time = datetime.datetime.now()
+        for candidate in build_backtrack_dates(
+            reference_date=effective_reference_date,
+            begin_backtrack=begin_backtrack,
+            end_backtrack=end_backtrack,
+            include_reference=include_reference,
+        ):
+            status = (
+                calendar.trading_day_status(candidate)
+                if calendar is not None
+                else TradingDayStatus.UNKNOWN
+            )
+            print(f"TWSE backtrack date {candidate.isoformat()}: {status.value.upper()}")
 
-        for day in range(-backtrack_days, -start_date, 1):
-            # ISO 8601 format, YYYY-MM-DD
-            iso_date_time = (now_date_time + datetime.timedelta(days=day)).strftime("%Y-%m-%d")
-
-            # Bypass weekend
-            if (now_date_time + datetime.timedelta(days=day)).isoweekday() == 6 or (now_date_time + datetime.timedelta(days=day)).isoweekday() == 7:
+            if status is TradingDayStatus.CLOSED:
+                continue
+            if status is TradingDayStatus.UNKNOWN and candidate.isoweekday() in (6, 7):
                 continue
 
-            # TWSE Stock market haven't opened
-            date_time = ''.join(iso_date_time.split('-'))
-            if date_time in holidays:
-                continue
+            self.iso_scheduled_times.append(candidate.isoformat())
 
-            self.iso_scheduled_times.append(iso_date_time)
-
-        self.transactiondays = self.days_between_isodates(self.iso_scheduled_times[0], self.iso_scheduled_times[-1])
+        if self.iso_scheduled_times:
+            self.transactiondays = self.days_between_isodates(
+                self.iso_scheduled_times[0],
+                self.iso_scheduled_times[-1],
+            )
+        else:
+            self.transactiondays = 0
 
 
     def days_between_isodates(self, date1: str, date2: str) -> int:
@@ -420,6 +488,7 @@ class TwseCrawker():
 
     def get_twse_daily_stocks(self, file_name: str, stocktype: Stocktype, stocks: list[StockSelector]) -> None:
         valid_iso_scheduled_times: list[str] = []
+        previous_taiex_close: float | None = None
     
         # Crawing daily TWSE Stock data
         for iso_scheduled_time in self.iso_scheduled_times:
@@ -443,6 +512,22 @@ class TwseCrawker():
                     scheduled_time,
                 )
                 continue
+
+            breadth = derive_twse_market_breadth(
+                row,
+                as_of=iso_scheduled_time,
+                universe=getattr(stocktype, "name", str(stocktype)),
+                source_final=True,
+                taiex_return=(
+                    taiex_close / previous_taiex_close - 1
+                    if previous_taiex_close not in (None, 0)
+                    else None
+                ),
+            )
+            previous_taiex_close = taiex_close
+            self.market_breadth_snapshots_by_date[
+                iso_scheduled_time
+            ] = breadth.to_mapping()
 
             row_data: StockRows = [[] for _ in range(self.stocklistsize)]
     
@@ -471,8 +556,13 @@ class TwseCrawker():
                 self.daily_lows[item].append(twse_stock.low * 1000)
                 self.daily_closes[item].append(twse_stock.close * 1000)
                 self.daily_volumes[item].append(twse_stock.volume)
+                self.daily_trade_counts[item].append(twse_stock.trades)
+                self.daily_trade_values[item].append(twse_stock.amount)
+                self.daily_bid_prices[item].append(twse_stock.bid * 1000 if twse_stock.bid is not None else None)
+                self.daily_ask_prices[item].append(twse_stock.ask * 1000 if twse_stock.ask is not None else None)
                 self.daily_pe_ratios[item].append(twse_stock.pe)
                 self.daily_taiex_closes[item].append(taiex_close)
+                self.daily_dates[item].append(iso_scheduled_time)
             
             # Record TWSE information of stock price
             if any(row_data):
@@ -489,220 +579,3 @@ class TwseCrawker():
 
         self.iso_scheduled_times = valid_iso_scheduled_times
         self.transactiondays = self.days_between_isodates(self.iso_scheduled_times[0], self.iso_scheduled_times[-1])
-
-
-    def smtp_email(self, subject: str, ccreceiver: str | None, stocktype: Stocktype, maxprofits: list[ProfitRow]) -> None:
-
-        analysis_dataset = self.build_analysis_dataset(maxprofits)
-        stockprofittable = self.record_to_html_tablefmt(analysis_dataset)
-        entryanalysis = self.build_entry_signal_analysis(analysis_dataset)
-
-        smtpemail = SMTPEmail(subject, ccreceiver)
-        smtpemail.smtpauthentication()
-
-        # Send HTML email with Python
-        smtpemail.textstockprofittable(iso_scheduled_times = self.iso_scheduled_times, 
-                                     transactiondays = self.transactiondays,
-                                     stocktype = stocktype,
-                                     stockprofittable = stockprofittable,
-                                     entryanalysis = entryanalysis)
-
-
-    def smtp_img_email(self, subject: str, ccreceiver: str | None, stocktype: Stocktype, backtrack: str) -> None:
-        smtpemail = SMTPEmail(subject, ccreceiver)
-        smtpemail.smtpauthentication()
-
-        # Send HTML email with Python
-        smtpemail.imgstockprofittable(backtrack = backtrack, stocktype = stocktype)
-
-
-    def draw_linechart(self, duration: int, maxprofitratios: list[list[float]]) -> None:
-        save_profit_ratio_chart(
-            duration = duration,
-            maxprofitratios = maxprofitratios,
-            stocknumbers = self.stocknumbers,
-            stocksprice = self.stocksprice,
-        )
-
-
-    def cal_max_profit(self) -> list[ProfitRow]:
-        maxprofits: list[ProfitRow] = [[] for _ in range(self.stocklistsize)]
-    
-        # Caculate max profit and stock profit's table
-        for item, daily_stock in zip(range(self.stocklistsize), self.daily_stocks):
-            if not daily_stock:
-                logging.warning("Skipping max profit calculation for stock index %s because no valid prices were collected.", item)
-                maxprofits[item].extend([0, 0, 0, 0, None])
-                self.stocksprice.append(None)
-                continue
-
-            profit_with_fee = max_profit_with_fee(daily_stock, 300)
-            maxprofits[item].append(round(max_profit_unlimited(daily_stock), 2))
-            maxprofits[item].append(round(max_profit(daily_stock), 2))
-            maxprofits[item].append(round(max_profit_k_transactions(5, daily_stock), 2))
-            maxprofits[item].append(round(profit_with_fee, 2))
-
-            # stock profit ratio
-            maxprofits[item].append(round(profit_with_fee/daily_stock[-1], 2))
-
-            # stock opening price
-            self.stocksprice.append(round(daily_stock[-1], 2))
-
-        return maxprofits
-
-
-    def cal_signal_features(self) -> list[SignalRow]:
-        signal_features: list[SignalRow] = [[] for _ in range(self.stocklistsize)]
-
-        for item in range(self.stocklistsize):
-            features = compute_signal_features(
-                closes = self.daily_closes[item],
-                highs = self.daily_highs[item],
-                lows = self.daily_lows[item],
-            )
-            signal_features[item] = [
-                features.trend_score,
-                features.mom,
-                features.cs,
-                features.stop_loss,
-                features.take_profit,
-            ]
-
-        return signal_features
-
-
-    def build_strategy_history(self, item: int) -> pd.DataFrame:
-        return pd.DataFrame(
-            {
-                "Open": self.daily_stocks[item],
-                "High": self.daily_highs[item],
-                "Low": self.daily_lows[item],
-                "Close": self.daily_closes[item],
-                "Volume": self.daily_volumes[item],
-                "PE": self.daily_pe_ratios[item],
-                "TAIEX Close": self.daily_taiex_closes[item],
-            }
-        )
-
-
-    def cal_low_entry_strategy(self) -> pd.DataFrame:
-        strategy = get_strategy(LOW_ENTRY_STRATEGY_NAME)
-        strategy_rows: list[dict[str, object]] = []
-
-        for item in range(self.stocklistsize):
-            result = strategy.run(self.build_strategy_history(item))
-            latest = result.iloc[-1].to_dict() if not result.empty else {}
-            strategy_rows.append({column: latest.get(column) for column in LOW_ENTRY_OUTPUT_COLUMNS})
-
-        return pd.DataFrame(strategy_rows, columns = LOW_ENTRY_OUTPUT_COLUMNS)
-
-
-    def cal_expected_return_exit_strategy(self) -> pd.DataFrame:
-        strategy = get_strategy(EXPECTED_RETURN_EXIT_STRATEGY_NAME)
-        strategy_rows: list[dict[str, object]] = []
-
-        for item in range(self.stocklistsize):
-            result = strategy.run(self.build_strategy_history(item))
-            latest = result.iloc[-1].to_dict() if not result.empty else {}
-            strategy_rows.append({column: latest.get(column) for column in EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS})
-
-        return pd.DataFrame(strategy_rows, columns = EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS)
-
-
-    def build_analysis_dataset(self, maxprofits: list[ProfitRow]) -> pd.DataFrame:
-        df_analysis = pd.DataFrame(maxprofits)
-        df_analysis.columns = ["無限次交易", "交易一次", "至多五次交易", "無限次交易(手續費$NTD300)", "利潤比"]
-        df_signal_features = pd.DataFrame(
-            self.cal_signal_features(),
-            columns = ["Trend Score", "MOM", "CS", "Stop_Loss", "Take_Profit"],
-        )
-        df_low_entry = self.cal_low_entry_strategy()
-        df_expected_return_exit = self.cal_expected_return_exit_strategy()
-        df_analysis = pd.concat([df_analysis, df_signal_features, df_low_entry, df_expected_return_exit], axis = 1)
-        df_analysis["日期"] = self.iso_scheduled_times[-1]
-        df_analysis["證券代號"] = self.stocknumbers
-        df_analysis["證券名稱"] = self.stocknames
-        df_analysis["開盤"] = [stocks[-1] if stocks else None for stocks in self.daily_stocks]
-        df_analysis["最高"] = [highs[-1] if highs else None for highs in self.daily_highs]
-        df_analysis["最低"] = [lows[-1] if lows else None for lows in self.daily_lows]
-        df_analysis["收盤"] = [closes[-1] if closes else None for closes in self.daily_closes]
-
-        base_columns = [
-            "日期",
-            "證券代號",
-            "證券名稱",
-            "開盤",
-            "最高",
-            "最低",
-            "收盤",
-            "無限次交易(手續費$NTD300)",
-            "利潤比",
-            "Trend Score",
-            "MOM",
-            "CS",
-            "Stop_Loss",
-            "Take_Profit",
-        ]
-
-        return df_analysis[base_columns + LOW_ENTRY_OUTPUT_COLUMNS + EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS]
-
-
-    def cal_max_profit_ratio_data(self) -> list[list[float]]:
-        maxprofitratios: list[list[float]] = [[] for _ in range(self.stocklistsize)]
-
-        # Caculate max profit and stock profit's table
-        for item, daily_stock in zip(range(self.stocklistsize), self.daily_stocks):
-            if not daily_stock:
-                continue
-            # stock profit ratio
-            maxprofitratios[item].append(round(max_profit_with_fee(daily_stock, 300)/daily_stock[-1], 2))
-             # stock opening price       
-            self.stocksprice.append(round(daily_stock[-1], 2))
-
-        logging.info('Max Profit Ratio: ', maxprofitratios)
-
-        return maxprofitratios
-
-
-    def record_to_html_tablefmt(self, analysis_dataset: pd.DataFrame) -> str:
-        max_profit_columns = [
-            "日期",
-            "證券代號",
-            "證券名稱",
-            "開盤",
-            "收盤",
-            "無限次交易(手續費$NTD300)",
-            "利潤比",
-        ]
-        stockprofittable = tabulate(
-            analysis_dataset[max_profit_columns],
-            headers = 'keys',
-            tablefmt = 'html',
-            showindex = False,
-        )
-
-        return stockprofittable
-
-
-    def format_signal_value(self, value: object, precision: int = 4) -> str:
-        if pd.isna(value):
-            return "N/A"
-        if isinstance(value, str):
-            return html.escape(value)
-        return str(round(float(value), precision))
-
-
-    def build_entry_signal_analysis(self, analysis_dataset: pd.DataFrame) -> str:
-        renderer = RendererFactory.get_renderer(EXPECTED_RETURN_EXIT_STRATEGY_NAME)
-        return renderer.render(analysis_dataset)
-
-
-    def record_analysis_dataset(self, file_name: str, maxprofits: list[ProfitRow]) -> None:
-        self.csv_repository.write_analysis_dataset(file_name, self.build_analysis_dataset(maxprofits))
-
-
-    def record(self, file_name: str, scheduled_time: str, row_data: StockRows) -> None:
-        if not any(row_data):
-            logging.warning("Skipping CSV write for %s because row_data is empty.", scheduled_time)
-            return
-        self.csv_repository.write_daily_rows(file_name, scheduled_time, row_data)

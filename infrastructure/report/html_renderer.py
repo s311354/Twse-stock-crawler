@@ -171,11 +171,129 @@ class LowEntryV3Renderer(ExpectedReturnExitV3Renderer):
     """Backward-compatible renderer alias for the existing LES v3 report key."""
 
 
+class LowEntryV4Renderer(LowEntryHtmlRenderer):
+    def __init__(self) -> None:
+        super().__init__(
+            title="低點進場判斷（Low-Entry Model v4）+ 預期報酬出場判斷（EREM v3）",
+            description=(
+                "<strong>LES v4</strong>：Quality Score 只評估可計算財報指標；Data Confidence 獨立衡量"
+                "覆蓋率、時效、驗證與來源可靠度。缺值不等於零分或安全，非 PASS 不得 BUY。"
+            ),
+            metrics=[
+                MetricColumn("Quality Gate", "Quality Gate", 0),
+                MetricColumn("Quality Score", "Quality Score"),
+                MetricColumn("Data Confidence", "Data Confidence"),
+                MetricColumn("可用QS權重", "Available Metric Weight"),
+                MetricColumn("會計師意見", "Audit Opinion", 0),
+                MetricColumn("Market Data Gate", "Market Data Gate", 0),
+                MetricColumn("財報可用時間", "Fundamental Available At", 0),
+                MetricColumn("時間來源", "Fundamental Availability Source", 0),
+                MetricColumn("財報版本", "Fundamental Revision", 0),
+                MetricColumn("LES v4 分數", "低點分數"),
+                MetricColumn("No Veto", "No Veto", 0),
+                MetricColumn("Trigger", "LES v4 Trigger", 0),
+                MetricColumn("Risk Gate", "Risk Gate", 0),
+                MetricColumn("RR", "RewardRisk"),
+                MetricColumn("RS20", "RS20", 4),
+                MetricColumn("策略停損", "策略停損"),
+                MetricColumn("策略目標", "策略停利"),
+            ],
+            decision_note=(
+                "<strong>Quality 狀態</strong>：QS &gt;= 70 且 DC &gt;= 70 才是 PASS；DC 50-69 為 PROVISIONAL；"
+                "QS 55-69 為 WATCH_QUALITY；DC &lt; 50 為 UNKNOWN。"
+                "範圍受限但僅涉及未核閱的非重要子公司／被投資公司時，標示 QUALIFIED_SCOPE_LIMITATION、"
+                "DC 扣 10 分但不觸發 Hard Reject。"
+                "<br><strong>LES v4 決策順序</strong>：REJECT &gt; DATA_INSUFFICIENT &gt; WATCH_ONLY &gt; NO_BUY &gt; AVOID &gt; WATCH &gt; ARMED &gt; BUY。"
+                "BUY 必須同時符合 Quality Gate=PASS、Market Data Gate=PASS、No Veto、Score &gt;= 80、Trigger、RR &gt;= 2、"
+                "停損距離 &lt;= 1.5 ATR 與 Liquidity Gate。"
+                "<br><strong>成交規則</strong>：訊號日收盤確認，下一交易日突破訊號日最高價才成交；"
+                "若跳空造成 Risk Gate 失效則取消，不追價。"
+            ),
+        )
+
+
+class LowEntryV41Renderer(LowEntryHtmlRenderer):
+    def __init__(self) -> None:
+        super().__init__(
+            title=(
+                "低點進場判斷（Low-Entry Model v4.1）"
+                "+ 預期報酬出場判斷（EREM v3）"
+            ),
+            description=(
+                "<strong>LES v4.1 BALANCED_PROFILE</strong>：先通過 Quality Score 與 "
+                "Data Confidence，再依市場環境 15、價格位置 15、止跌結構 30、"
+                "買盤確認 20、動能 10、執行風控 10 計分。"
+                "高分不能抵銷 Falling-Knife Veto。"
+            ),
+            metrics=[
+                MetricColumn("Profile", "LES Profile", 0),
+                MetricColumn(
+                    "產業品質 Profile",
+                    "Industry Quality Profile",
+                    0,
+                ),
+                MetricColumn(
+                    "產業模式",
+                    "Industry Profile Mode",
+                    0,
+                ),
+                MetricColumn(
+                    "產業規則版本",
+                    "Industry Profile Version",
+                    0,
+                ),
+                MetricColumn("Quality Gate", "Quality Gate", 0),
+                MetricColumn("Quality Score", "Quality Score"),
+                MetricColumn("Data Confidence", "Data Confidence"),
+                MetricColumn("本期意見", "Current Audit Opinion", 0),
+                MetricColumn("前期意見", "Comparative Audit Opinion", 0),
+                MetricColumn("Provisional Eligible", "Provisional Buy Eligible", 0),
+                MetricColumn("Market Data Gate", "Market Data Gate", 0),
+                MetricColumn("LES v4.1 分數", "低點分數"),
+                MetricColumn("市場", "市場環境分數", 0),
+                MetricColumn("位置", "價格位置分數", 0),
+                MetricColumn("止跌", "止跌結構分數", 0),
+                MetricColumn("買盤", "買盤確認分數", 0),
+                MetricColumn("動能", "動能分數", 0),
+                MetricColumn("執行", "執行風控分數", 0),
+                MetricColumn("No Veto", "No Veto", 0),
+                MetricColumn("Technical Trigger", "LES v4.1 Technical Trigger", 0),
+                MetricColumn("Strict Trigger", "LES v4.1 Strict Trigger", 0),
+                MetricColumn("Trigger", "LES v4.1 Trigger", 0),
+                MetricColumn("Liquidity Gate", "Liquidity Gate", 0),
+                MetricColumn("Risk Gate", "Risk Gate", 0),
+                MetricColumn("Strict Risk", "Strict Risk Gate", 0),
+                MetricColumn("RR", "RewardRisk"),
+                MetricColumn("部位比例", "Position Fraction", 4),
+                MetricColumn("策略停損", "策略停損"),
+                MetricColumn("策略目標", "策略停利"),
+            ],
+            decision_note=(
+                "<strong>決策順序</strong>：REJECT→NO_BUY；UNKNOWN→DATA_INSUFFICIENT；"
+                "SECTOR_UNSUPPORTED→NO_MODEL；WATCH_QUALITY 原則上→WATCH_ONLY。"
+                "CHEMICAL_PROFILE 為 ACTIVE：QS≥65 可進標準 BUY 流程；"
+                "QS 60–64、DC≥75 僅可在 Strict Trigger、Strict Risk 與所有 "
+                "Veto 通過時進入 1/8 部位 BUY_SMALL。"
+                "<br><strong>BALANCED PASS</strong>：任一 Veto→NO_BUY；"
+                "Score&lt;55→AVOID；55–64→WATCH；65–74→ARMED；"
+                "Score≥75 且 Trigger、Risk Gate、RR≥1.7、停損距離≤1.8 ATR14 "
+                "與流動性通過才是 BUY，初始部位上限為 1/3。"
+                "<br><strong>PROVISIONAL BUY_SMALL</strong>：僅限 QS≥75、DC≥60、"
+                "獲利與資產負債覆蓋率各≥70%、無 Hard Flag、無已確認負 CFO；"
+                "並須 Score≥80、Strict Trigger、Strict Risk=PASS、RR≥2、"
+                "停損距離≤1.5 ATR14，初始部位上限為 1/6。"
+                "訊號於收盤確認，下一交易日突破訊號日最高價才考慮成交。"
+            ),
+        )
+
+
 class RendererFactory:
     _renderers: dict[str, HtmlRenderer] = {
         "low_entry_score": LowEntryV1Renderer(),
         "low_entry_score_v2": LowEntryV2Renderer(),
         "low_entry_score_v3": LowEntryV3Renderer(),
+        "low_entry_score_v4": LowEntryV4Renderer(),
+        "low_entry_score_v4_1": LowEntryV41Renderer(),
         "expected_return_exit_v3": ExpectedReturnExitV3Renderer(),
     }
 

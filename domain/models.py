@@ -30,6 +30,10 @@ class TWSEStock:
     close: float
     volume: int
     pe: float | None = None
+    trades: int | None = None
+    amount: float | None = None
+    bid: float | None = None
+    ask: float | None = None
 
 
 class TwseColumns:

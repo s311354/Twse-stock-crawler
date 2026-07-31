@@ -45,5 +45,7 @@ fi
                                              -e 500 \
                                              -b 0 \
                                              -t ELEC \
+                                             --mops-history-years "${MOPS_HISTORY_YEARS:-5}" \
+                                             --account-equity "${TWSE_ACCOUNT_EQUITY:-1000000}" \
                                              -m \
-                                             "$SCRIPT_DIR/stocklist_elec" "$SCRIPT_DIR/holidays_2026"
+                                             "$SCRIPT_DIR/stocklist_elec"

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import pandas as pd
+    from domain.features import FeatureFrame
 
 
 class Strategy(ABC):
@@ -18,6 +19,16 @@ class Strategy(ABC):
     @abstractmethod
     def run(self, data: pd.DataFrame) -> pd.DataFrame:
         """Return a copy of data with strategy output columns appended."""
+
+    def run_with_features(
+        self,
+        data: pd.DataFrame,
+        features: FeatureFrame,
+    ) -> pd.DataFrame:
+        """Use shared features when supported, otherwise preserve plugin API."""
+
+        del features
+        return self.run(data)
 
 
 class StrategyRegistry:
@@ -54,6 +65,8 @@ _BUILTIN_STRATEGIES = {
     "low_entry_score": "domain.strategies.low_entry_score.LowEntryScoreStrategy",
     "low_entry_score_v2": "domain.strategies.low_entry_score_v2.LowEntryScoreV2Strategy",
     "low_entry_score_v3": "domain.strategies.low_entry_score_v3.LowEntryScoreV3Strategy",
+    "low_entry_score_v4": "domain.strategies.low_entry_score_v4.LowEntryScoreV4Strategy",
+    "low_entry_score_v4_1": "domain.strategies.low_entry_score_v4_1.LowEntryScoreV41Strategy",
 }
 
 def load_builtin_strategies(name: str | None = None) -> None:

@@ -7,6 +7,9 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from domain.features import FeatureFrame
+from domain.features import SharedFeatureConfig
+from domain.features import SharedFeaturePipeline
 from domain.strategy import Strategy
 
 EXPECTED_RETURN_EXIT_STRATEGY_NAME = "expected_return_exit_v3"
@@ -99,18 +102,34 @@ class ExpectedReturnExitV3Strategy(Strategy):
         self.config = config or ExpectedReturnExitV3Config()
 
     def run(self, data: pd.DataFrame) -> pd.DataFrame:
+        features = SharedFeaturePipeline(
+            self._shared_feature_config()
+        ).build(data)
+        return self.run_with_features(data, features)
+
+    def run_with_features(
+        self,
+        data: pd.DataFrame,
+        features: FeatureFrame,
+    ) -> pd.DataFrame:
         if data.empty:
             return pd.DataFrame([self._empty_result()])
 
+        features.assert_compatible(data)
+        if features.config != self._shared_feature_config():
+            raise ValueError(
+                "FeatureFrame config does not match EREM strategy"
+            )
         df = data.copy()
-        high = self._numeric_column(df, ("High", "最高"))
-        low = self._numeric_column(df, ("Low", "最低"))
-        close = self._numeric_column(df, ("Close", "收盤"))
-        volume = self._numeric_column(df, ("Volume", "成交量")).fillna(0)
+        feature_data = features.to_pandas()
+        high = feature_data["high"]
+        low = feature_data["low"]
+        close = feature_data["close"]
+        volume = feature_data["volume_filled"]
 
-        ema20 = close.ewm(span=self.config.ema_short_window, adjust=False, min_periods=1).mean()
-        ema50 = close.ewm(span=self.config.ema_medium_window, adjust=False, min_periods=1).mean()
-        ema200 = close.ewm(span=self.config.ema_long_window, adjust=False, min_periods=1).mean()
+        ema20 = feature_data["ema_short"]
+        ema50 = feature_data["ema_medium"]
+        ema200 = feature_data["ema_long"]
         ema_alignment = (ema20 > ema50) & (ema50 > ema200)
         price_above_ema20 = close > ema20
         # The v2 15:10 trend ratio is scaled to the v3 component maximum of 20.
@@ -120,12 +139,10 @@ class ExpectedReturnExitV3Strategy(Strategy):
             dtype="float64",
         )
 
-        rsi = self._rsi(close)
-        ema12 = close.ewm(span=12, adjust=False, min_periods=1).mean()
-        ema26 = close.ewm(span=26, adjust=False, min_periods=1).mean()
-        macd = ema12 - ema26
-        macd_signal = macd.ewm(span=9, adjust=False, min_periods=1).mean()
-        macd_histogram = macd - macd_signal
+        rsi = feature_data["rsi14_sma"]
+        macd = feature_data["macd"]
+        macd_signal = feature_data["macd_signal"]
+        macd_histogram = feature_data["macd_histogram"]
         macd_histogram_rising = macd_histogram > macd_histogram.shift(1)
         histogram_falling_two_days = (
             macd_histogram.diff().lt(0).rolling(2, min_periods=2).sum().eq(2)
@@ -150,11 +167,9 @@ class ExpectedReturnExitV3Strategy(Strategy):
             dtype="float64",
         ).clip(lower=0, upper=15)
 
-        middle_band = close.rolling(self.config.bollinger_window, min_periods=1).mean()
-        std20 = close.rolling(self.config.bollinger_window, min_periods=2).std(ddof=0)
-        upper_band = middle_band + (2 * std20)
-        atr14 = self._atr(high=high, low=low, close=close)
-        atr20ma = atr14.rolling(self.config.atr_ma_window, min_periods=1).mean()
+        upper_band = feature_data["bollinger_upper"]
+        atr14 = feature_data["atr14_sma"]
+        atr20ma = feature_data["atr14_sma_ma20"]
         atr_stable = atr14 <= atr20ma
         excessive_atr = atr14 > (atr20ma * self.config.excessive_atr_ratio)
         below_upper_band = upper_band.notna() & (close < upper_band)
@@ -168,8 +183,8 @@ class ExpectedReturnExitV3Strategy(Strategy):
             dtype="float64",
         ).clip(lower=0, upper=10)
 
-        volume_ma20 = volume.rolling(self.config.volume_window, min_periods=1).mean()
-        obv = self._obv(close=close, volume=volume)
+        volume_ma20 = feature_data["volume_ma20"]
+        obv = feature_data["obv"]
         obv_rising = obv > obv.shift(1)
         obv_falling_five_days = (
             obv.diff().lt(0).rolling(
@@ -229,10 +244,7 @@ class ExpectedReturnExitV3Strategy(Strategy):
             dtype="float64",
         ).clip(lower=0, upper=15)
 
-        taiex_close = self._numeric_column(
-            df,
-            ("TAIEX Close", "TAIEX收盤", "大盤收盤", "Benchmark Close"),
-        )
+        taiex_close = feature_data["taiex"]
         stock_return60 = close.pct_change(self.config.relative_return_window, fill_method=None)
         taiex_return60 = taiex_close.pct_change(self.config.relative_return_window, fill_method=None)
         relative_strength60 = stock_return60 - taiex_return60
@@ -288,9 +300,7 @@ class ExpectedReturnExitV3Strategy(Strategy):
             dtype="float64",
         )
 
-        rolling_price_volume = (close * volume).rolling(self.config.vwap_window, min_periods=1).sum()
-        rolling_volume = volume.rolling(self.config.vwap_window, min_periods=1).sum()
-        vwap60 = (rolling_price_volume / rolling_volume).where(rolling_volume > self.config.epsilon)
+        vwap60 = feature_data["vwap60_close"]
         vwap_safety = vwap60.notna() & (close < vwap60)
         vwap_score = pd.Series(
             np.where(vwap_safety, 5, 0),
@@ -395,6 +405,20 @@ class ExpectedReturnExitV3Strategy(Strategy):
 
         return pd.concat([df, result], axis=1)
 
+    def _shared_feature_config(self) -> SharedFeatureConfig:
+        return SharedFeatureConfig(
+            ema_short_window=self.config.ema_short_window,
+            ema_medium_window=self.config.ema_medium_window,
+            ema_long_window=self.config.ema_long_window,
+            rsi_window=self.config.rsi_window,
+            atr_window=self.config.atr_window,
+            atr_ma_window=self.config.atr_ma_window,
+            volume_window=self.config.volume_window,
+            bollinger_window=self.config.bollinger_window,
+            vwap_long_window=self.config.vwap_window,
+            epsilon=self.config.epsilon,
+        )
+
     def _numeric_column(self, data: pd.DataFrame, names: tuple[str, ...]) -> pd.Series:
         for name in names:
             if name in data.columns:
@@ -406,36 +430,6 @@ class ExpectedReturnExitV3Strategy(Strategy):
             if name in df.columns:
                 return pd.to_numeric(df[name], errors="coerce"), name
         return volume, "Volume/VolumeMA20 proxy"
-
-    def _rsi(self, close: pd.Series) -> pd.Series:
-        delta = close.diff()
-        gain = delta.clip(lower=0)
-        loss = (-delta).clip(lower=0)
-        avg_gain = gain.rolling(self.config.rsi_window, min_periods=1).mean()
-        avg_loss = loss.rolling(self.config.rsi_window, min_periods=1).mean()
-        rs = avg_gain / avg_loss.replace(0, np.nan)
-        rsi = 100 - (100 / (1 + rs))
-        return rsi.where(avg_loss != 0, np.where(avg_gain > 0, 100, 50)).fillna(50)
-
-    def _atr(self, high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
-        previous_close = close.shift(1)
-        true_range = pd.concat(
-            [
-                high - low,
-                (high - previous_close).abs(),
-                (low - previous_close).abs(),
-            ],
-            axis=1,
-        ).max(axis=1)
-        return true_range.rolling(self.config.atr_window, min_periods=1).mean()
-
-    def _obv(self, close: pd.Series, volume: pd.Series) -> pd.Series:
-        direction = np.select(
-            [close > close.shift(1), close < close.shift(1)],
-            [1, -1],
-            default=0,
-        )
-        return pd.Series(direction * volume, index=close.index).cumsum()
 
     def _decision(self, score: pd.Series) -> pd.Series:
         return pd.Series(

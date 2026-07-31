@@ -90,11 +90,21 @@ Low Entry Model v4.1 defaults to `BALANCED_PROFILE` and evaluates entry eligibil
 5. `Balanced Trigger`: requires one price confirmation (`Close > EMA5 and VWAP20`, a prior-high breakout, or a confirmed higher low with rising EMA5), `CLV > 0.2`, and one demand confirmation (improving `CMF20`, positive five-day OBV slope, or up-day volume ratio at least 0.6).
 6. `Risk Gate`: requires a confirmed swing-low stop, stop distance no more than `1.8 ATR14`, reward/risk at least 1.7, executable TWSE odd-lot sizing, and sufficient liquidity. The strict profile retains the `1.5 ATR14`/RR 2 gate.
 
-LES decision mapping:
+### Low-Entry Model v4.1 Decision Mapping ###
 
-- `BUY`: score >= 75
-- `WATCH`: 60 <= score < 75
-- `WAIT`: score < 60
+For a stock whose `Quality Gate` is `PASS`, `BALANCED_PROFILE` maps the
+Low-Entry score and execution evidence as follows:
+
+| Condition | Decision | Meaning |
+|---|---|---|
+| Score `< 55` | `AVOID` | Entry quality is below the minimum watch threshold. |
+| Score `55-64` | `WATCH` | Monitor for stabilization and improving demand. |
+| Score `>= 65`, but Trigger or Risk Gate is incomplete | `ARMED` | Candidate is ready for confirmation, but no order is authorized. |
+| Score `>= 75` and Trigger, Risk Gate, and Market Data Gate all pass | `BUY` | Standard entry is eligible when no Falling-Knife Veto exists. |
+
+A score never overrides `Quality Gate`, `Market Data Gate`, or a
+Falling-Knife Veto. Industry-specific and provisional `BUY_SMALL` paths retain
+their own stricter eligibility, trigger, liquidity, and risk requirements.
 
 ### MOPS / iXBRL Data Path ###
 

@@ -34,7 +34,7 @@ from domain.strategies.low_entry_score_v4 import attach_low_entry_v4_context
 
 LOW_ENTRY_STRATEGY_NAME = "low_entry_score_v4_1"
 LES_V41_MODEL_VERSION = "4.1.0"
-LES_V41_PARAMETER_VERSION = "2026-07-31-balanced-spec-elec-breadth-v4"
+LES_V41_PARAMETER_VERSION = "2026-07-31-balanced-spec-elec-breadth-v5"
 
 
 class LowEntryProfile(str, Enum):
@@ -99,7 +99,12 @@ class LowEntryScoreV41Config(LowEntryScoreV4Config):
     electronics_recovery_minimum_price_position_score: float = 7.0
     electronics_recovery_minimum_stabilization_score: float = 6.0
     electronics_recovery_minimum_demand_score: float = 4.0
-    breadth_rally_score_threshold: float = 50.0
+    # A completed, broad, date-aligned market rally can make lagging trend and
+    # momentum components understate a genuine same-session reversal.  This
+    # lower threshold is intentionally confined to the 1/16 BUY_SMALL path;
+    # quality, every veto, the reversal trigger, risk/reward and liquidity
+    # gates remain mandatory.
+    breadth_rally_score_threshold: float = 45.0
     breadth_rally_minimum_quality_score: float = 80.0
     breadth_rally_minimum_data_confidence: float = 80.0
     breadth_rally_minimum_coverage: float = 0.80

@@ -26,6 +26,8 @@ class HtmlRenderer(ABC):
 
 
 class LowEntryHtmlRenderer(HtmlRenderer):
+    _REASON_SECTION_BREAK = "__LOW_ENTRY_REASON_SECTION_BREAK__"
+
     def __init__(
         self,
         title: str,
@@ -53,7 +55,7 @@ class LowEntryHtmlRenderer(HtmlRenderer):
             row.extend([
                 html.escape(str(stock.get("低點決策", "N/A"))),
                 html.escape(str(stock.get("EREM 決策訊號", "N/A"))),
-                html.escape(str(stock.get("低點理由", "N/A"))),
+                self._format_low_entry_reason(stock.get("低點理由", "N/A")),
                 html.escape(str(stock.get("EREM 理由", "N/A"))),
             ])
             rows.append(row)
@@ -68,16 +70,26 @@ class LowEntryHtmlRenderer(HtmlRenderer):
             ],
         )
 
+        table_html = tabulate(
+            df_entry,
+            headers="keys",
+            tablefmt="html",
+            showindex=False,
+        ).replace(
+            self._REASON_SECTION_BREAK,
+            '<br><span style="display:inline-block;margin-top:4px">&#8226; </span>',
+        )
+
         return """
         <h3>{}</h3>
-        <p>{}</p>
-        <p>{}</p>
-        {}
+        <div>{}</div>
+        <div>{}</div>
+        <div style="overflow-x:auto">{}</div>
         """.format(
             html.escape(self.title),
             self.description,
             self.decision_note,
-            tabulate(df_entry, headers="keys", tablefmt="html", showindex=False),
+            table_html,
         )
 
     def _format_value(self, value: object, precision: int = 2) -> str:
@@ -90,6 +102,35 @@ class LowEntryHtmlRenderer(HtmlRenderer):
         if precision == 0:
             return str(int(rounded_value))
         return str(rounded_value)
+
+    def _format_low_entry_reason(self, value: object) -> str:
+        if value is None or pd.isna(value):
+            return "N/A"
+        formatted = html.escape(str(value))
+        section_labels = (
+            "分數",
+            "Profile",
+            "ProvisionalEligible",
+            "Veto",
+            "TechnicalTrigger",
+            "StrictTrigger",
+            "Trigger",
+            "Liquidity",
+            "Risk",
+            "CHEMIProbe",
+            "ELECProbe",
+            "ELECRecovery",
+            "BroadRally",
+            "ELECRally",
+            "SEMIProbe",
+            "決策",
+        )
+        for label in section_labels:
+            formatted = formatted.replace(
+                "；{}=".format(label),
+                "{}{}=".format(self._REASON_SECTION_BREAK, label),
+            )
+        return formatted
 
 
 class LowEntryV1Renderer(LowEntryHtmlRenderer):
@@ -220,10 +261,17 @@ class LowEntryV41Renderer(LowEntryHtmlRenderer):
                 "+ 預期報酬出場判斷（EREM v3）"
             ),
             description=(
-                "<strong>LES v4.1 BALANCED_PROFILE</strong>：先通過 Quality Score 與 "
-                "Data Confidence，再依市場環境 15、價格位置 15、止跌結構 30、"
-                "買盤確認 20、動能 10、執行風控 10 計分。"
-                "高分不能抵銷 Falling-Knife Veto。"
+                '<section style="border-left:4px solid #1f6f5f;padding:8px 12px;'
+                'margin:8px 0;background:#f4f8f6">'
+                "<strong>LES v4.1 / BALANCED_PROFILE</strong>"
+                '<ul style="margin:6px 0 0 18px;padding:0">'
+                "<li><strong>先看品質</strong>：Quality Score 與 Data Confidence "
+                "必須符合進場資格。</li>"
+                "<li><strong>再算技術分數</strong>：市場環境 15、價格位置 15、"
+                "止跌結構 30、買盤確認 20、動能 10、執行風控 10，合計 100 分。</li>"
+                "<li><strong>最後檢查硬條件</strong>：高分不能抵銷 "
+                "Falling-Knife Veto，也不能略過 Trigger、Risk 與流動性。</li>"
+                "</ul></section>"
             ),
             metrics=[
                 MetricColumn("Profile", "LES Profile", 0),
@@ -269,20 +317,33 @@ class LowEntryV41Renderer(LowEntryHtmlRenderer):
                 MetricColumn("策略目標", "策略停利"),
             ],
             decision_note=(
-                "<strong>決策順序</strong>：REJECT→NO_BUY；UNKNOWN→DATA_INSUFFICIENT；"
-                "SECTOR_UNSUPPORTED→NO_MODEL；WATCH_QUALITY 原則上→WATCH_ONLY。"
-                "CHEMICAL_PROFILE 為 ACTIVE：QS≥65 可進標準 BUY 流程；"
-                "QS 60–64、DC≥75 僅可在 Strict Trigger、Strict Risk 與所有 "
-                "Veto 通過時進入 1/8 部位 BUY_SMALL。"
-                "<br><strong>BALANCED PASS</strong>：任一 Veto→NO_BUY；"
-                "Score&lt;55→AVOID；55–64→WATCH；65–74→ARMED；"
-                "Score≥75 且 Trigger、Risk Gate、RR≥1.7、停損距離≤1.8 ATR14 "
-                "與流動性通過才是 BUY，初始部位上限為 1/3。"
-                "<br><strong>PROVISIONAL BUY_SMALL</strong>：僅限 QS≥75、DC≥60、"
-                "獲利與資產負債覆蓋率各≥70%、無 Hard Flag、無已確認負 CFO；"
-                "並須 Score≥80、Strict Trigger、Strict Risk=PASS、RR≥2、"
-                "停損距離≤1.5 ATR14，初始部位上限為 1/6。"
-                "訊號於收盤確認，下一交易日突破訊號日最高價才考慮成交。"
+                '<section style="margin:10px 0">'
+                "<h4 style=\"margin:0 0 6px\">決策快速表</h4>"
+                '<table style="border-collapse:collapse" border="1" cellpadding="5">'
+                "<tr><th>前提／分數</th><th>決策</th><th>必要條件</th></tr>"
+                "<tr><td>Quality=REJECT</td><td>NO_BUY</td><td>不可被技術分數覆蓋</td></tr>"
+                "<tr><td>Quality=UNKNOWN</td><td>DATA_INSUFFICIENT</td><td>補足資料後再評估</td></tr>"
+                "<tr><td>產業不支援</td><td>NO_MODEL</td><td>不套用錯誤產業門檻</td></tr>"
+                "<tr><td>Quality=WATCH_QUALITY</td><td>WATCH_ONLY</td>"
+                "<td>原則上只觀察；符合產業專屬嚴格條件時才可走 BUY_SMALL</td></tr>"
+                "<tr><td>PASS，Score &lt; 55</td><td>AVOID</td><td>不進場</td></tr>"
+                "<tr><td>PASS，Score 55–64</td><td>WATCH</td><td>等待止跌與買盤確認</td></tr>"
+                "<tr><td>PASS，Score 65–74</td><td>ARMED</td><td>等待 Trigger／Risk 完成</td></tr>"
+                "<tr><td>PASS，Score ≥ 75</td><td>BUY</td><td>無 Veto；Trigger、Risk、"
+                "Market Data 與流動性全部通過</td></tr>"
+                "</table>"
+                '<div style="margin-top:8px"><strong>標準 BUY 風控</strong>：'
+                "RR ≥ 1.7、停損距離 ≤ 1.8 ATR14；初始部位上限 1/3。</div>"
+                '<div style="margin-top:8px"><strong>CHEMICAL_PROFILE</strong>：'
+                "QS ≥ 65 可走標準流程；QS 60–64 且 DC ≥ 75，只能在 Strict "
+                "Trigger、Strict Risk 與所有 Veto 通過後，以 1/8 部位 BUY_SMALL。</div>"
+                '<div style="margin-top:8px"><strong>PROVISIONAL BUY_SMALL</strong>：'
+                "QS ≥ 75、DC ≥ 60、獲利與資產負債覆蓋率各 ≥ 70%，且無 Hard Flag "
+                "或已確認負 CFO；另須 Score ≥ 80、Strict Trigger、Strict Risk=PASS、"
+                "RR ≥ 2、停損距離 ≤ 1.5 ATR14，初始部位上限 1/6。</div>"
+                '<div style="margin-top:8px"><strong>成交原則</strong>：訊號於收盤確認；'
+                "下一交易日突破訊號日最高價才考慮成交。</div>"
+                "</section>"
             ),
         )
 

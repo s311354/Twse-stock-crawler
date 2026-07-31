@@ -1083,7 +1083,7 @@ def test_electronics_breadth_rally_buy_small_never_overrides_veto() -> None:
     common = {
         "quality": quality,
         "provisional_eligible": False,
-        "score": pd.Series([50], index=index),
+        "score": pd.Series([45], index=index),
         "trigger": pd.Series([False], index=index),
         "strict_trigger": pd.Series([False], index=index),
         "risk_gate": pd.Series(["FAIL"], index=index),
@@ -1100,6 +1100,51 @@ def test_electronics_breadth_rally_buy_small_never_overrides_veto() -> None:
 
     assert state.iloc[0] == "BUY_SMALL"
     assert vetoed.iloc[0] == "NO_BUY"
+
+
+def test_electronics_breadth_rally_below_relaxed_floor_does_not_buy() -> None:
+    strategy = LowEntryScoreV41Strategy()
+    index = pd.RangeIndex(1)
+    quality = QualityGateResult(
+        status=GateStatus.PASS,
+        score=85.0,
+        data_confidence=90.0,
+        industry_profile=ELECTRONICS_PROFILE.name,
+        industry_profile_version=ELECTRONICS_PROFILE.version,
+        industry_profile_mode=IndustryProfileMode.ACTIVE.value,
+    )
+    vetoes = pd.DataFrame(
+        {
+            name: [False]
+            for name in (
+                "breaks_previous_low",
+                "high_volume_weak_close",
+                "accelerating_downtrend",
+                "repeated_breakdown",
+                "gap_below_support",
+                "market_relative_deterioration",
+                "quality_prohibition",
+            )
+        },
+        index=index,
+    )
+
+    state = strategy._resolve_v41_state(
+        quality=quality,
+        provisional_eligible=False,
+        score=pd.Series([44.99], index=index),
+        trigger=pd.Series([False], index=index),
+        strict_trigger=pd.Series([False], index=index),
+        risk_gate=pd.Series(["FAIL"], index=index),
+        strict_risk_gate=pd.Series(["FAIL"], index=index),
+        market_data_gate=pd.Series(["PASS"], index=index),
+        vetoes=vetoes,
+        electronics_rally_eligible=True,
+        electronics_rally_trigger=pd.Series([True], index=index),
+        electronics_rally_risk_gate=pd.Series(["PASS"], index=index),
+    )
+
+    assert state.iloc[0] == "AVOID"
 
 
 def test_electronics_recovery_state_expands_watchlist_without_buying() -> None:

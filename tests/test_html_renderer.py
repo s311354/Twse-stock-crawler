@@ -147,7 +147,12 @@ def test_renderer_factory_renders_low_entry_v4_1_components() -> None:
                     "策略停利": 1088.0,
                     "低點決策": "BUY",
                     "EREM 決策訊號": "HOLD",
-                    "低點理由": "所有進場 Gate 通過",
+                    "低點理由": (
+                        "Quality=PASS(QS=84；DC=91)；"
+                        "分數=15/12/25/16/8/6；Profile=BALANCED_PROFILE；"
+                        "Veto=NONE；Trigger=YES；Risk=PASS/PASS(PASS)；"
+                        "決策=BUY"
+                    ),
                     "EREM 理由": "持有",
                 }
             ]
@@ -161,5 +166,12 @@ def test_renderer_factory_renders_low_entry_v4_1_components() -> None:
     assert "BALANCED_PROFILE" in rendered
     assert "REVIEWED_UNMODIFIED" in rendered
     assert "QUALIFIED_SCOPE_LIMITATION" in rendered
+    assert "決策快速表" in rendered
+    assert "PASS，Score 65–74" in rendered
+    assert "等待 Trigger／Risk 完成" in rendered
+    assert "PROVISIONAL BUY_SMALL" in rendered
+    assert "<br>" in rendered
+    assert "&#8226; </span>分數=15/12/25/16/8/6" in rendered
+    assert "&#8226; </span>Veto=NONE" in rendered
     assert "BUY_SMALL" in rendered
     assert "BUY" in rendered

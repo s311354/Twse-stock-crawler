@@ -102,9 +102,6 @@ Low-Entry score and execution evidence as follows:
 | Score `>= 65`, but Trigger or Risk Gate is incomplete | `ARMED` | Candidate is ready for confirmation, but no order is authorized. |
 | Score `>= 75` and Trigger, Risk Gate, and Market Data Gate all pass | `BUY` | Standard entry is eligible when no Falling-Knife Veto exists. |
 
-A score never overrides `Quality Gate`, `Market Data Gate`, or a
-Falling-Knife Veto. Industry-specific and provisional `BUY_SMALL` paths retain
-their own stricter eligibility, trigger, liquidity, and risk requirements.
 
 ### MOPS / iXBRL Data Path ###
 

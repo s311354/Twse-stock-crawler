@@ -14,6 +14,10 @@ from domain.strategy import Strategy
 from domain.strategy import get_strategy
 
 
+class StrategyOutputSchemaError(ValueError):
+    """Raised when a strategy plugin violates its declared output schema."""
+
+
 @dataclass(frozen=True)
 class PreparedStrategyInputs:
     histories: tuple[pd.DataFrame, ...]
@@ -77,6 +81,19 @@ class StrategyExecutionService:
             prepared.feature_frames,
         ):
             result = strategy.run_with_features(history, features)
+            missing_columns = [
+                column
+                for column in output_columns
+                if column not in result.columns
+            ]
+            if missing_columns:
+                raise StrategyOutputSchemaError(
+                    "Strategy '{}' omitted declared output columns: {}"
+                    .format(
+                        strategy_name,
+                        ", ".join(missing_columns),
+                    )
+                )
             latest = (
                 result.iloc[-1].to_dict()
                 if not result.empty
@@ -94,4 +111,5 @@ class StrategyExecutionService:
 __all__ = [
     "PreparedStrategyInputs",
     "StrategyExecutionService",
+    "StrategyOutputSchemaError",
 ]

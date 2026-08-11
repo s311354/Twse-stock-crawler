@@ -11,7 +11,9 @@ from application.filing_refresh_planner import FilingRefreshPlanner
 from application.fundamental_service import MopsFundamentalService
 from domain.data_provenance import FIRST_OBSERVED_DOWNLOAD
 from domain.data_provenance import MOPS_PUBLIC_ANNOUNCEMENT
+from domain.fundamental_derivation import FUNDAMENTAL_DERIVATION_VERSION
 from domain.fundamental_derivation import FundamentalBundle
+from domain.fundamental_models import FilingCorrection
 from domain.fundamental_models import FilingDocument
 from infrastructure.fundamentals.ixbrl_parser import NormalizedFact
 from infrastructure.fundamentals.models import MopsFiling
@@ -22,7 +24,7 @@ from infrastructure.fundamentals.twse_financial_batch import TwseFinancialSnapsh
 from infrastructure.crawler.twse_http_client import TwseNoDataError
 
 
-def test_refresh_planner_seeds_five_years_then_verifies_two_recent_periods() -> None:
+def test_refresh_planner_seeds_five_years_and_only_verifies_corrections() -> None:
     planner = FilingRefreshPlanner()
     candidates = [_candidate(year, 4) for year in range(2020, 2026)] + [
         _candidate(2025, 1),
@@ -51,16 +53,14 @@ def test_refresh_planner_seeds_five_years_then_verifies_two_recent_periods() -> 
         corrected_periods={(2022, 4)},
     )
 
-    assert _candidate_periods(daily.verify_revision) == [
-        (2022, 4),
-        (2025, 4),
-        (2026, 1),
-    ]
+    assert _candidate_periods(daily.verify_revision) == [(2022, 4)]
     assert {(item.fiscal_year, item.quarter) for item in daily.reuse} == {
         (2021, 4),
         (2023, 4),
         (2024, 4),
         (2025, 1),
+        (2025, 4),
+        (2026, 1),
     }
     assert daily.download == []
 
@@ -77,6 +77,27 @@ def test_monthly_refresh_is_timezone_aware_and_due_once_per_month() -> None:
 
     with pytest.raises(ValueError, match="timezone-aware"):
         planner.is_monthly_refresh_due(None, dt.datetime(2026, 7, 21))
+
+
+def test_recent_revision_check_is_due_once_per_taipei_day() -> None:
+    planner = FilingRefreshPlanner()
+    last_check = dt.datetime(2026, 7, 21, 1, 0, tzinfo=dt.timezone.utc)
+    taipei = dt.timezone(dt.timedelta(hours=8))
+    same_day = dt.datetime(2026, 7, 21, 23, 30, tzinfo=taipei)
+    next_day = dt.datetime(2026, 7, 22, 0, 1, tzinfo=taipei)
+
+    assert planner.is_daily_revision_check_due(None, same_day) is True
+    assert planner.is_daily_revision_check_due(
+        int(last_check.timestamp()),
+        same_day,
+    ) is False
+    assert planner.is_daily_revision_check_due(
+        int(last_check.timestamp()),
+        next_day,
+    ) is True
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        planner.is_daily_revision_check_due(None, dt.datetime(2026, 7, 21))
 
 
 def test_sector_fallback_does_not_promote_market_label_to_official_code(tmp_path) -> None:
@@ -188,13 +209,178 @@ def test_fundamental_service_reuses_hash_snapshot_and_limits_daily_downloads(
     )
 
     assert isinstance(first, FundamentalBundle)
-    assert len(client.downloaded_periods) == 7
-    assert client.downloaded_periods[-2:] == [(2024, 4), (2025, 4)]
-    assert client.announcement_years[-1] == [2026]
+    assert len(client.downloaded_periods) == 5
+    assert client.announcement_years[-1] == list(range(2020, 2027))
     assert derivation_calls == 1
 
 
-def test_twse_batch_skips_unchanged_mops_and_rechecks_changed_values(
+def test_bulk_snapshot_fast_path_uses_one_query_and_never_reads_facts(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    repository = MopsRepository(tmp_path / "mops")
+    candidates = [_candidate(year, 4) for year in range(2021, 2026)]
+    announcements = [
+        FilingAnnouncement(
+            symbol="2330",
+            fiscal_year=candidate.fiscal_year,
+            quarter=4,
+            available_at=candidate.available_at or "",
+            title="財務報告",
+        )
+        for candidate in candidates
+    ]
+    client = _FakeMopsClient(repository, candidates, announcements)
+    service = _fundamental_service(client, repository)
+    service._company_sectors = {"2330": "24"}
+    service.load(
+        "2330",
+        signal_date="2026-07-21T13:30:00+08:00",
+        sector="ELEC",
+        history_years=5,
+    )
+
+    traced: list[str] = []
+    real_connect = repository._connect
+
+    def traced_connect():
+        connection = real_connect()
+        connection.set_trace_callback(traced.append)
+        return connection
+
+    monkeypatch.setattr(repository, "_connect", traced_connect)
+    cached = repository.load_cached_bundles(
+        {"2330": "24"},
+        as_of="2026-07-22T13:30:00+08:00",
+        derivation_version=FUNDAMENTAL_DERIVATION_VERSION,
+    )
+
+    selects = [query for query in traced if query.lstrip().upper().startswith("SELECT")]
+    assert list(cached) == ["2330"]
+    assert len(selects) == 1
+    assert "facts" not in selects[0].lower()
+    assert cached["2330"].annual_history_years == 5
+    assert cached["2330"].latest_period == (2025, 4)
+
+
+def test_bulk_snapshot_fast_path_rejects_stale_contract_and_revision(
+    tmp_path,
+) -> None:
+    repository = MopsRepository(tmp_path / "mops")
+    candidates = [_candidate(year, 4) for year in range(2021, 2026)]
+    announcements = [
+        FilingAnnouncement(
+            symbol="2330",
+            fiscal_year=candidate.fiscal_year,
+            quarter=4,
+            available_at=candidate.available_at or "",
+            title="財務報告",
+        )
+        for candidate in candidates
+    ]
+    client = _FakeMopsClient(repository, candidates, announcements)
+    service = _fundamental_service(client, repository)
+    service._company_sectors = {"2330": "24"}
+    service.load(
+        "2330",
+        signal_date="2026-07-21T13:30:00+08:00",
+        sector="ELEC",
+        history_years=5,
+    )
+
+    assert repository.load_cached_bundles(
+        {"2330": "25"},
+        as_of="2026-07-22T13:30:00+08:00",
+        derivation_version=FUNDAMENTAL_DERIVATION_VERSION,
+    ) == {}
+    assert repository.load_cached_bundles(
+        {"2330": "24"},
+        as_of="2025-01-01T13:30:00+08:00",
+        derivation_version=FUNDAMENTAL_DERIVATION_VERSION,
+    ) == {}
+    assert repository.load_cached_bundles(
+        {"2330": "24"},
+        as_of="2026-07-22T13:30:00+08:00",
+        derivation_version="obsolete-derivation",
+    ) == {}
+
+    revised = _candidate(2025, 4)
+    repository.save_revision(
+        revised,
+        b"revised-filing",
+        [_fact(200.0)],
+        available_at=revised.available_at or "",
+        fetched_at="2026-07-22T06:00:00+00:00",
+    )
+    assert repository.load_cached_bundles(
+        {"2330": "24"},
+        as_of="2026-07-22T13:30:00+08:00",
+        derivation_version=FUNDAMENTAL_DERIVATION_VERSION,
+    ) == {}
+
+
+def test_service_bulk_preload_skips_facts_and_filters_refresh_events(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    repository = MopsRepository(tmp_path / "mops")
+    candidates = [_candidate(year, 4) for year in range(2021, 2026)]
+    announcements = [
+        FilingAnnouncement(
+            symbol="2330",
+            fiscal_year=candidate.fiscal_year,
+            quarter=4,
+            available_at=candidate.available_at or "",
+            title="財務報告",
+        )
+        for candidate in candidates
+    ]
+    client = _FakeMopsClient(repository, candidates, announcements)
+    service = _fundamental_service(client, repository)
+    service._company_sectors = {"2330": "24"}
+    service.load(
+        "2330",
+        signal_date="2026-07-21T13:30:00+08:00",
+        sector="ELEC",
+        history_years=5,
+    )
+
+    def fail_if_facts_are_loaded(*args, **kwargs):
+        raise AssertionError("bulk snapshot preload must not load filing facts")
+
+    monkeypatch.setattr(
+        repository,
+        "load_filed_financials",
+        fail_if_facts_are_loaded,
+    )
+    cached = service.load_cached_bundles(
+        ["2330"],
+        signal_date="2026-07-22T13:30:00+08:00",
+        sector="ELEC",
+        history_years=5,
+    )
+    assert cached["2330"].snapshot["remote_refresh_skipped"] is True
+
+    service._daily_corrections = {
+        "2330": {
+            (2025, 4): FilingCorrection(
+                symbol="2330",
+                fiscal_year=2025,
+                quarter=4,
+                announced_on="20260722",
+                description="更正財務報告",
+            )
+        }
+    }
+    assert service.load_cached_bundles(
+        ["2330"],
+        signal_date="2026-07-22T13:30:00+08:00",
+        sector="ELEC",
+        history_years=5,
+    ) == {}
+
+
+def test_complete_cache_refreshes_only_when_twse_batch_period_advances(
     tmp_path,
 ) -> None:
     repository = MopsRepository(tmp_path / "mops")
@@ -220,6 +406,11 @@ def test_twse_batch_skips_unchanged_mops_and_rechecks_changed_values(
     observed = dt.datetime(2026, 7, 21, 5, 30, tzinfo=dt.timezone.utc)
 
     assert service.prepare_daily_batch(observed) == 1
+    seeded_history = repository.load_financial_batch_snapshots(
+        "2330",
+        as_of="2026-07-21T05:30:00+00:00",
+    )
+    assert [snapshot.period for snapshot in seeded_history] == [(2025, 4)]
     first = service.load(
         "2330",
         signal_date="2026-07-21T13:30:00+08:00",
@@ -231,7 +422,7 @@ def test_twse_batch_skips_unchanged_mops_and_rechecks_changed_values(
 
     unchanged = service.load(
         "2330",
-        signal_date="2026-07-22T13:30:00+08:00",
+        signal_date="2026-07-21T14:30:00+08:00",
         sector="ELEC",
         history_years=5,
     )
@@ -245,13 +436,13 @@ def test_twse_batch_skips_unchanged_mops_and_rechecks_changed_values(
     service.prepare_daily_batch(observed + dt.timedelta(days=1))
     service.load(
         "2330",
-        signal_date="2026-07-23T13:30:00+08:00",
+        signal_date="2026-07-22T13:30:00+08:00",
         sector="ELEC",
         history_years=5,
     )
 
-    assert client.discovery_calls == discovery_calls_after_seed + 1
-    assert client.downloaded_periods[-2:] == [(2024, 4), (2025, 4)]
+    assert client.discovery_calls == discovery_calls_after_seed
+    assert client.downloaded_periods == downloads_after_seed
 
     batch_client.snapshot = replace(
         _batch_snapshot(revenue=300.0),
@@ -261,10 +452,13 @@ def test_twse_batch_skips_unchanged_mops_and_rechecks_changed_values(
     service.prepare_daily_batch(observed + dt.timedelta(days=2))
     service.load(
         "2330",
-        signal_date="2026-07-24T13:30:00+08:00",
+        signal_date="2026-07-23T13:30:00+08:00",
         sector="ELEC",
         history_years=5,
     )
+
+    assert client.discovery_calls == discovery_calls_after_seed + 1
+    assert client.downloaded_periods == downloads_after_seed
 
     with repository.company_connection() as connection:
         batch_state = repository.load_financial_batch_state(
@@ -273,6 +467,132 @@ def test_twse_batch_skips_unchanged_mops_and_rechecks_changed_values(
         )
     assert batch_state is not None
     assert batch_state[0] == (2025, 4)
+
+
+def test_complete_mops_cache_skips_cross_day_remote_without_revision_event(
+    tmp_path,
+) -> None:
+    repository = MopsRepository(tmp_path / "mops")
+    candidates = [_candidate(year, 4) for year in range(2021, 2026)]
+    announcements = [
+        FilingAnnouncement(
+            symbol="2330",
+            fiscal_year=candidate.fiscal_year,
+            quarter=4,
+            available_at=candidate.available_at or "",
+            title="財務報告",
+        )
+        for candidate in candidates
+    ]
+    client = _FakeMopsClient(repository, candidates, announcements)
+    service = _fundamental_service(client, repository)
+    service._company_sectors = {"2330": "24"}
+
+    first = service.load(
+        "2330",
+        signal_date="2026-07-21T13:30:00+08:00",
+        sector="ELEC",
+        history_years=5,
+    )
+    discovery_after_seed = client.discovery_calls
+    downloads_after_seed = list(client.downloaded_periods)
+    second = service.load(
+        "2330",
+        signal_date="2026-07-22T15:00:00+08:00",
+        sector="ELEC",
+        history_years=5,
+    )
+
+    assert first.snapshot["base_quality_evidence_mode"] == (
+        "MOPS_POINT_IN_TIME_BASE_FALLBACK"
+    )
+    assert second.snapshot["base_quality_evidence_mode"] == (
+        "MOPS_POINT_IN_TIME_BASE_FALLBACK"
+    )
+    assert client.discovery_calls == discovery_after_seed
+    assert client.downloaded_periods == downloads_after_seed
+    assert repository.last_recent_revision_check_epoch("2330") is not None
+
+    service.load(
+        "2330",
+        signal_date="2026-08-01T13:30:00+08:00",
+        sector="ELEC",
+        history_years=5,
+    )
+
+    assert client.discovery_calls == discovery_after_seed + 1
+    assert client.announcement_years[-1] == [2026]
+    assert client.downloaded_periods == downloads_after_seed
+
+
+def test_market_wide_correction_event_verifies_only_affected_period(tmp_path) -> None:
+    repository = MopsRepository(tmp_path / "mops")
+    candidates = [_candidate(year, 4) for year in range(2021, 2026)]
+    announcements = [
+        FilingAnnouncement(
+            symbol="2330",
+            fiscal_year=candidate.fiscal_year,
+            quarter=4,
+            available_at=candidate.available_at or "",
+            title="財務報告",
+        )
+        for candidate in candidates
+    ]
+    client = _FirstObservedMopsClient(
+        repository,
+        candidates,
+        announcements,
+        observed_at="2026-02-15T05:00:00+00:00",
+    )
+    service = _fundamental_service(client, repository)
+    service._company_sectors = {"2330": "24"}
+    service.load(
+        "2330",
+        signal_date="2026-02-15T13:30:00+08:00",
+        sector="ELEC",
+        history_years=5,
+    )
+    discovery_after_seed = client.discovery_calls
+    downloads_after_seed = list(client.downloaded_periods)
+    client.corrections = [
+        FilingCorrection(
+            symbol="2330",
+            fiscal_year=2025,
+            quarter=4,
+            announced_on="20260216",
+            description="更正財務報告",
+        )
+    ]
+
+    assert service.prepare_daily_revisions(
+        dt.datetime(2026, 2, 16, 5, 30, tzinfo=dt.timezone.utc)
+    ) == 1
+    service.load(
+        "2330",
+        signal_date="2026-02-16T13:30:00+08:00",
+        sector="ELEC",
+        history_years=5,
+    )
+
+    assert client.correction_scan_periods == [[(2025, 3), (2025, 4)]]
+    assert client.discovery_calls == discovery_after_seed + 1
+    assert client.downloaded_periods == downloads_after_seed + [(2025, 4)]
+
+
+def test_financial_batch_resolver_reuses_latest_point_in_time_cache(tmp_path) -> None:
+    repository = MopsRepository(tmp_path / "mops")
+    cached = _batch_snapshot(revenue=900.0)
+    repository.save_financial_batch_snapshot(cached)
+    client = _FakeMopsClient(repository, [], [])
+    service = _fundamental_service(client, repository)
+    signal = pd.Timestamp("2026-07-22T13:30:00+08:00")
+
+    with repository.unit_of_work() as uow:
+        resolution = service._resolve_batch_snapshot("2330", signal, uow=uow)
+
+    assert resolution.snapshot == cached
+    assert resolution.source == "TWSE_OPENAPI_CACHE_FALLBACK"
+    assert resolution.cache_hit is True
 
 
 def test_fundamental_service_uses_point_in_time_cache_when_catalog_is_unavailable(
@@ -375,6 +695,46 @@ def test_live_fundamental_service_uses_filings_observed_during_same_run(tmp_path
     }
 
 
+def test_fundamental_service_consumes_individual_scope_fallbacks_per_run(
+    tmp_path,
+) -> None:
+    repository = MopsRepository(tmp_path / "mops")
+    candidates = [
+        replace(
+            _candidate(year, 4),
+            report_id="A",
+            statement_scope="individual",
+        )
+        for year in (2023, 2024, 2025)
+    ]
+    client = _FirstObservedMopsClient(
+        repository,
+        candidates,
+        [],
+        observed_at="2026-07-21T06:00:05+00:00",
+    )
+    service = _fundamental_service(
+        client,
+        repository,
+        include_current_observations=True,
+        now_provider=lambda: dt.datetime.fromisoformat(
+            "2026-07-21T06:00:00+00:00"
+        ),
+    )
+    service._company_sectors = {"2330": "24"}
+
+    service.reset_scope_fallback_diagnostics()
+    service.load(
+        "2330",
+        signal_date="2026-07-21T05:30:00+00:00",
+        sector="ELEC",
+        history_years=3,
+    )
+
+    assert service.consume_scope_fallback_symbols() == ("2330",)
+    assert service.consume_scope_fallback_symbols() == ()
+
+
 def test_historical_service_does_not_seed_undated_catalog_filings(tmp_path) -> None:
     repository = MopsRepository(tmp_path / "mops")
     candidates = [replace(_candidate(2025, 4), available_at=None)]
@@ -410,6 +770,8 @@ class _FakeMopsClient:
         self.announcements = announcements
         self.downloaded_periods: list[tuple[int, int]] = []
         self.announcement_years: list[list[int]] = []
+        self.corrections: list[FilingCorrection] = []
+        self.correction_scan_periods: list[list[tuple[int, int]]] = []
         self.discovery_calls = 0
 
     def discover(self, symbol: str) -> list[MopsFilingCandidate]:
@@ -428,8 +790,27 @@ class _FakeMopsClient:
             if dt.datetime.fromisoformat(announcement.available_at).year in calendar_years
         ]
 
+    def discover_corrections(
+        self,
+        periods: list[tuple[int, int]],
+    ) -> list[FilingCorrection]:
+        self.correction_scan_periods.append(list(periods))
+        selected = set(periods)
+        return [
+            correction
+            for correction in self.corrections
+            if (correction.fiscal_year, correction.quarter) in selected
+        ]
+
     def latest_correction(self, candidate: MopsFilingCandidate):
-        return None
+        matching = [
+            correction
+            for correction in self.corrections
+            if correction.symbol == candidate.symbol
+            and correction.fiscal_year == candidate.fiscal_year
+            and correction.quarter == candidate.quarter
+        ]
+        return max(matching, key=lambda item: item.announced_on, default=None)
 
     def download(
         self,

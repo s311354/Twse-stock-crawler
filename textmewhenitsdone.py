@@ -23,11 +23,8 @@ StockhtmlMessage = """\
 
     <body>
         <p>
-        Hey, Thank you for your waiting! The estimated max profit within {days} days ({begin} ~ {end}) is done. We are continuing with our effort in processing it and will update the latest information to you soon. :) <br>
-        <br>
-
-        ## Here is the estimated max profit: ($NTD)<br>
-        {stocktable} <br>
+        TWSE daily strategy analysis covering {days} trading days ({begin} ~ {end}) is complete.<br>
+        The report below separates entry timing from position-exit evaluation.<br>
         <br>
 
         {entryanalysis} <br>
@@ -149,7 +146,7 @@ class TextMeWhenItsDone(object):
     ) -> None:
         # Create the email message
         msg = MIMEMultipart('alternative')
-        msg['Subject'] = "[TWSE Stock {}] [{}]: Estimated Max Profit ({} ~ {})".format(subject, stocktype, iso_scheduled_times[0], iso_scheduled_times[-1])
+        msg['Subject'] = "[TWSE Stock {}] [{}]: LES v5 / EREM v3 ({} ~ {})".format(subject, stocktype, iso_scheduled_times[0], iso_scheduled_times[-1])
 
         # RFC 5322
         msg['From']  = email
@@ -159,7 +156,6 @@ class TextMeWhenItsDone(object):
         part2 = MIMEText(StockhtmlMessage.format(begin = iso_scheduled_times[0],
                                                  end   = iso_scheduled_times[-1],
                                                  days  = transactiondays,
-                                                 stocktable = stockprofittable,
                                                  entryanalysis = entryanalysis), 'html')
 
         # The HTML message, is best and preferred

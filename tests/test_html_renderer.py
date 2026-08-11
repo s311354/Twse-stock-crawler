@@ -1,14 +1,50 @@
-import pandas as pd
+import datetime
 
+from domain.model_contracts import DecisionField
+from domain.model_contracts import FieldSource
+from domain.model_contracts import FieldUnit
+from domain.model_contracts import StrategyDecision
 from infrastructure.report.html_renderer import RendererFactory
+from textmewhenitsdone import StockhtmlMessage
+
+
+EVALUATED_AT = datetime.datetime(
+    2026,
+    7,
+    25,
+    13,
+    30,
+    tzinfo=datetime.timezone(datetime.timedelta(hours=8)),
+)
+
+
+def decisions(values: dict[str, object]) -> tuple[StrategyDecision, ...]:
+    fields = tuple(
+        DecisionField(
+            name=name,
+            value=value,
+            source=FieldSource.LES_V5,
+            available_at=EVALUATED_AT,
+            confidence=100,
+            unit=FieldUnit.TEXT,
+            model_version="renderer-test-v1",
+        )
+        for name, value in values.items()
+    )
+    return (
+        StrategyDecision(
+            strategy_name="renderer_test",
+            evaluated_at=EVALUATED_AT,
+            fields=fields,
+        ),
+    )
 
 
 def test_renderer_factory_renders_low_entry_v3_html() -> None:
     renderer = RendererFactory.get_renderer("low_entry_score_v3")
     html = renderer.render(
-        pd.DataFrame(
-            [
-                {
+        decisions(
+            {
                     "證券代號": "2382",
                     "證券名稱": "廣達",
                     "收盤": 109000.0,
@@ -40,8 +76,7 @@ def test_renderer_factory_renders_low_entry_v3_html() -> None:
                     "低點決策": "BUY",
                     "低點理由": "趨勢+25；決策=BUY",
                     "EREM 理由": "趨勢延續+20；決策=HOLD",
-                }
-            ]
+            }
         )
     )
 
@@ -64,9 +99,8 @@ def test_renderer_factory_exposes_expected_return_exit_v3_renderer() -> None:
 def test_renderer_factory_renders_low_entry_v4_gates() -> None:
     renderer = RendererFactory.get_renderer("low_entry_score_v4")
     rendered = renderer.render(
-        pd.DataFrame(
-            [
-                {
+        decisions(
+            {
                     "證券代號": "2330",
                     "證券名稱": "台積電",
                     "收盤": 1000.0,
@@ -90,8 +124,7 @@ def test_renderer_factory_renders_low_entry_v4_gates() -> None:
                     "EREM 決策訊號": "HOLD",
                     "低點理由": "所有進場 Gate 通過",
                     "EREM 理由": "持有",
-                }
-            ]
+            }
         )
     )
 
@@ -111,9 +144,8 @@ def test_renderer_factory_renders_low_entry_v4_gates() -> None:
 def test_renderer_factory_renders_low_entry_v4_1_components() -> None:
     renderer = RendererFactory.get_renderer("low_entry_score_v4_1")
     rendered = renderer.render(
-        pd.DataFrame(
-            [
-                {
+        decisions(
+            {
                     "證券代號": "2330",
                     "證券名稱": "台積電",
                     "收盤": 1000.0,
@@ -154,8 +186,7 @@ def test_renderer_factory_renders_low_entry_v4_1_components() -> None:
                         "決策=BUY"
                     ),
                     "EREM 理由": "持有",
-                }
-            ]
+            }
         )
     )
 
@@ -175,3 +206,181 @@ def test_renderer_factory_renders_low_entry_v4_1_components() -> None:
     assert "&#8226; </span>Veto=NONE" in rendered
     assert "BUY_SMALL" in rendered
     assert "BUY" in rendered
+
+
+def test_renderer_factory_renders_low_entry_v5_quality_and_panic_state() -> None:
+    renderer = RendererFactory.get_renderer("low_entry_score_v5")
+    rendered = renderer.render(
+        decisions(
+            {
+                    "證券代號": "3036A",
+                    "證券名稱": "文曄甲特",
+                    "Security Type": "PREFERRED",
+                    "Issuer Symbol": "3036",
+                    "收盤": 1000.0,
+                    "LES v5 Final Quality Status": "QUALITY_CONFIRMED",
+                    "LES v5 Final Quality Score": 82,
+                    "Base Quality Status": "BASE_PASS",
+                    "Base Quality Score": 80,
+                    "Base Data Confidence": 92,
+                    "Extended Quality Status": "EXTENDED_PASS",
+                    "Extended Quality Score": 85,
+                    "Extended Data Confidence": 88,
+                    "Critical Field Coverage": 90,
+                    "Quality Warnings": "TWSE_BASE_NOT_POINT_IN_TIME",
+                    "Quality Hard Rejects": "NONE",
+                    "Valuation Gate": "PASS",
+                    "Valuation Model Status": "COMPLETE",
+                    "Base Case Expected CAGR": 0.13,
+                    "Base Case Fair Value": 1120.0,
+                    "Bear Case Fair Value": 880.0,
+                    "Bear Case Permanent Loss": 0.12,
+                    "Bull Case Fair Value": 1420.0,
+                    "Valuation Reasons": "NONE",
+                    "Falling Knife State": "REVERSAL_WATCH",
+                    "Panic Condition Count": 2,
+                    "Reversal Confirmation Count": 4,
+                    "Broad Rally Regime": "ACTIVE",
+                    "Broad Rally Trigger": 1,
+                    "Broad Rally Full BUY Trigger": 0,
+                    "Broad Rally Absorption Trigger": 1,
+                    "Broad Rally Risk Gate": "PASS",
+                    "低點分數": 84,
+                    "Required Technical Score": 80,
+                    "LES v5 Trigger": 1,
+                    "Risk Gate": "PASS",
+                    "RewardRisk": 2.3,
+                    "Position Fraction": 0.25,
+                    "策略停損": 960,
+                    "策略停利": 1090,
+                    "Entry Rule": "下一交易日突破訊號日最高價",
+                    "低點決策": "REVERSAL_WATCH",
+                    "EREM 決策訊號": "HOLD",
+                    "低點理由": (
+                        "Quality=QUALITY_CONFIRMED；Valuation=PASS；"
+                        "Falling=REVERSAL_WATCH；決策=REVERSAL_WATCH"
+                    ),
+                    "EREM 理由": "持有",
+            }
+        )
+    )
+
+    assert "Low-Entry Model v5" in rendered
+    assert "Low-Entry Model v5｜進場模式" in rendered
+    assert "EREM v3｜出場模式" in rendered
+    assert "高分不能抵銷 Hard Reject" in rendered
+    assert "40–54 REDUCE 25%" in rendered
+    assert "低於 40 EXIT" in rendered
+    assert "進場決策彙整（BUY / BUY_SMALL）" in rendered
+    assert "本次沒有 BUY / BUY_SMALL 可執行訊號" in rendered
+    assert "Quality-First Panic Reversal" in rendered
+    assert "QUALITY_CONFIRMED" in rendered
+    assert "REVERSAL_WATCH" in rendered
+    assert "決策總覽" in rendered
+    assert "個股依據與 QA" in rendered
+    assert "Base FV" in rendered
+    assert "1,120" in rendered
+    assert "Bear Loss" in rendered
+    assert "TWSE_BASE_NOT_POINT_IN_TIME" in rendered
+    assert "BASE_PASS" in rendered
+    assert "EXTENDED_PASS" in rendered
+    assert "QS 80" in rendered
+    assert "DC 92" in rendered
+    assert "QS 85" in rendered
+    assert "DC 88" in rendered
+    assert "ACTIVE" in rendered
+    assert "Absorption 1" in rendered
+    assert "下一交易日突破訊號日最高價" in rendered
+    assert "證券身分" in rendered
+    assert "發行人 3036" in rendered
+    assert "<th>Base Status</th>" not in rendered
+    assert "<th>Quality Warnings</th>" not in rendered
+    assert "<th>Breadth Full BUY</th>" not in rendered
+
+
+def test_email_body_omits_legacy_estimated_max_profit_table() -> None:
+    body = StockhtmlMessage.format(
+        days=335,
+        begin="2025-04-01",
+        end="2026-08-03",
+        entryanalysis="<section>LES v5 / EREM v3</section>",
+    )
+
+    assert "Here is the estimated max profit" not in body
+    assert "$NTD" not in body
+    assert "{stocktable}" not in body
+    assert "LES v5 / EREM v3" in body
+
+
+def test_low_entry_v5_renders_buy_decisions_in_a_separate_readable_summary() -> None:
+    renderer = RendererFactory.get_renderer("low_entry_score_v5")
+    buy = decisions(
+        {
+            "證券代號": "2330",
+            "證券名稱": "台積電",
+            "收盤": 1000.0,
+            "Entry Candidate": 1010.0,
+            "Entry Rule": "NEXT_SESSION_BREAKS_SIGNAL_HIGH",
+            "Position Fraction": 1 / 3,
+            "建議股數": 1000,
+            "策略停損": 960.0,
+            "策略停利": 1090.0,
+            "RewardRisk": 2.3,
+            "低點分數": 84,
+            "Required Technical Score": 80,
+            "LES v5 Trigger": 1,
+            "Risk Gate": "PASS",
+            "低點決策": "BUY",
+            "EREM 決策訊號": "HOLD",
+        }
+    )
+    buy_small = decisions(
+        {
+            "證券代號": "2317",
+            "證券名稱": "鴻海",
+            "收盤": 220.0,
+            "Entry Candidate": 222.0,
+            "Entry Rule": "NEXT_SESSION_BREAKS_SIGNAL_HIGH",
+            "Position Fraction": 0.125,
+            "建議股數": 2000,
+            "策略停損": 211.0,
+            "策略停利": 239.0,
+            "RewardRisk": 2.0,
+            "低點分數": 81,
+            "Required Technical Score": 80,
+            "LES v5 Trigger": 1,
+            "Risk Gate": "PASS",
+            "低點決策": "BUY_SMALL",
+            "EREM 決策訊號": "HOLD",
+        }
+    )
+    watch = decisions(
+        {
+            "證券代號": "2382",
+            "證券名稱": "廣達",
+            "收盤": 300.0,
+            "低點決策": "WATCH",
+            "EREM 決策訊號": "HOLD",
+        }
+    )
+
+    rendered = renderer.render(watch + buy_small + buy)
+    entry_section = rendered.split(
+        'data-section="entry-decisions"',
+        1,
+    )[1].split("</section>", 1)[0]
+
+    assert "共 <strong>2</strong> 檔" in entry_section
+    assert "BUY <strong>1</strong>" in entry_section
+    assert "BUY_SMALL <strong>1</strong>" in entry_section
+    assert "2330" in entry_section
+    assert "2317" in entry_section
+    assert "2382" not in entry_section
+    assert entry_section.index("2330") < entry_section.index("2317")
+    assert "觸發 1,010" in entry_section
+    assert "1,000 股" in entry_section
+    assert "停損 960" in entry_section
+    assert "目標 1,090" in entry_section
+    assert "RR 2.3" in entry_section
+    assert "LES 84 / 門檻 80" in entry_section
+    assert "BUY_SMALL 為縮小部位訊號" in entry_section

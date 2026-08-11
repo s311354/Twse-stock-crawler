@@ -152,6 +152,12 @@ class FundamentalSnapshot:
             "twse_net_income_ytd": self.net_income_ytd,
             "twse_parent_net_income_ytd": self.parent_net_income_ytd,
             "twse_basic_eps_ytd": self.basic_eps_ytd,
+            "twse_current_assets": self.current_assets,
+            "twse_total_assets": self.total_assets,
+            "twse_current_liabilities": self.current_liabilities,
+            "twse_total_liabilities": self.total_liabilities,
+            "twse_parent_equity": self.parent_equity,
+            "twse_total_equity": self.total_equity,
             "twse_gross_margin_ytd": _safe_div(
                 self.gross_profit_ytd,
                 self.revenue_ytd,

@@ -6,6 +6,7 @@ from application.analysis_dataset import AnalysisDatasetBuilder
 from application.market_history import MarketHistoryAssembler
 from application.market_history import MarketHistoryInput
 from application.strategy_execution import StrategyExecutionService
+from application.strategy_execution import StrategyOutputSchemaError
 from domain.features import SharedFeaturePipeline
 from domain.strategies.low_entry_score_v4 import ANNUAL_FUNDAMENTALS_ATTR
 from domain.strategies.low_entry_score_v4 import FUNDAMENTAL_SNAPSHOT_ATTR
@@ -121,6 +122,26 @@ def test_strategy_execution_builds_features_once_per_history_and_uses_latest() -
     assert factory_calls == 1
     assert builds == 2
     assert result["score"].tolist() == [1, 1]
+
+
+def test_strategy_execution_rejects_missing_declared_output_column() -> None:
+    prepared = StrategyExecutionService(
+        strategy_resolver=lambda name: ScoreStrategy(),
+    ).prepare(
+        [MarketHistoryAssembler().build(market_history_input(), 0)]
+    )
+
+    with pytest.raises(
+        StrategyOutputSchemaError,
+        match="omitted declared output columns: valuation_score",
+    ):
+        StrategyExecutionService(
+            strategy_resolver=lambda name: ScoreStrategy(),
+        ).evaluate(
+            "score",
+            ["score", "valuation_score"],
+            prepared,
+        )
 
 
 def test_dataset_builder_validates_profit_rows_before_strategy_execution() -> None:

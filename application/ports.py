@@ -24,6 +24,7 @@ class MarketDataPort(Protocol):
         calendar: MarketCalendarPort,
         market_date: datetime.date,
         is_trading_day: bool,
+        include_reference: bool,
     ) -> AnalysisContext:
         """Fetch the requested OHLCV history and return an opaque context."""
 

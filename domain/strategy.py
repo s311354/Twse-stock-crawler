@@ -15,6 +15,8 @@ class Strategy(ABC):
     """Base class for deterministic stock-analysis strategies."""
 
     name: str
+    description: str = ""
+    version: str = ""
 
     @abstractmethod
     def run(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -54,6 +56,10 @@ class StrategyRegistry:
     def names(self) -> list[str]:
         return sorted(self._strategies)
 
+    def all(self) -> list[Strategy]:
+        """Return all registered strategies."""
+        return [self._strategies[name] for name in self.names()]
+
 
 strategy_registry = StrategyRegistry()
 _BUILTINS_LOADED: set[str] = set()
@@ -67,6 +73,7 @@ _BUILTIN_STRATEGIES = {
     "low_entry_score_v3": "domain.strategies.low_entry_score_v3.LowEntryScoreV3Strategy",
     "low_entry_score_v4": "domain.strategies.low_entry_score_v4.LowEntryScoreV4Strategy",
     "low_entry_score_v4_1": "domain.strategies.low_entry_score_v4_1.LowEntryScoreV41Strategy",
+    "low_entry_score_v5": "domain.strategies.low_entry_score_v5.LowEntryScoreV5Strategy",
 }
 
 def load_builtin_strategies(name: str | None = None) -> None:

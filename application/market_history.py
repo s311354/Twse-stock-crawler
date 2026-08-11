@@ -10,6 +10,7 @@ from dataclasses import field
 import pandas as pd
 
 from domain.market_breadth import MARKET_BREADTH_ATTR
+from domain.market_breadth import MARKET_BREADTH_HISTORY_ATTR
 from domain.market_breadth import MARKET_DATA_THROUGH_ATTR
 from domain.market_breadth import MARKET_SESSION_FINAL_ATTR
 from domain.strategies.low_entry_score_v4 import ACCOUNT_EQUITY_ATTR
@@ -155,6 +156,27 @@ class MarketHistoryAssembler:
             )
         else:
             history.attrs[MARKET_SESSION_FINAL_ATTR] = False
+        # Preserve only breadth snapshots visible through this stock's signal
+        # date. Multi-session regimes must be derived from point-in-time facts,
+        # not from a narrative about market direction or future sessions.
+        if market.market_breadth_snapshots:
+            through_timestamp = pd.to_datetime(
+                market_data_through,
+                errors="coerce",
+            )
+            visible_breadth: dict[str, dict[str, object]] = {}
+            for date, snapshot in market.market_breadth_snapshots.items():
+                snapshot_date = pd.to_datetime(
+                    snapshot.get("as_of") or date,
+                    errors="coerce",
+                )
+                if (
+                    pd.notna(through_timestamp)
+                    and pd.notna(snapshot_date)
+                    and snapshot_date <= through_timestamp
+                ):
+                    visible_breadth[str(date)] = dict(snapshot)
+            history.attrs[MARKET_BREADTH_HISTORY_ATTR] = visible_breadth
         history.attrs[PRICE_SCALE_ATTR] = 1000.0
         if stock_no in market.annual_fundamentals:
             history.attrs[ANNUAL_FUNDAMENTALS_ATTR] = (

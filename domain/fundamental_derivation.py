@@ -54,6 +54,21 @@ class FundamentalBundle:
     as_of: str | None = None
 
 
+@dataclass(frozen=True)
+class CachedFundamentalBundle:
+    """Derived snapshot plus the metadata required for safe fast-path reuse."""
+
+    symbol: str
+    sector: str
+    filing_set_sha256: str
+    derivation_version: str
+    available_at_epoch: int
+    latest_period: tuple[int, int]
+    annual_history_years: int
+    full_catalog_checked_at_epoch: int
+    bundle: FundamentalBundle
+
+
 REVENUE = ("ifrs-full:Revenue", "ifrs-full:RevenueFromContractsWithCustomers")
 NET_INCOME = (
     "ifrs-full:ProfitLossAttributableToOwnersOfParent",
@@ -1069,6 +1084,7 @@ def _is_material_correction(description: str | None) -> bool:
 
 
 __all__ = [
+    "CachedFundamentalBundle",
     "FUNDAMENTAL_DERIVATION_VERSION",
     "FiledFact",
     "FiledFinancials",

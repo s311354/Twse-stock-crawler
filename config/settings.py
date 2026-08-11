@@ -63,6 +63,7 @@ class AppSettings:
     http_backoff_seconds: float = 1.0
     http_min_interval_seconds: float = 0.2
     allow_insecure_ssl_fallback: bool = True
+    market_history_cache_path: Path = DATA_DIR / "market_history.sqlite3"
 
     mops_cache_dir: Path = DATA_DIR / "mops"
     mops_sqlite_connect_attempts: int = 3
@@ -82,6 +83,7 @@ class AppSettings:
     smtp_host: str = ""
     smtp_port: int = 587
 
+    runtime_mode: str = "RELEASE"
     log_level: str = "INFO"
 
     @classmethod
@@ -93,6 +95,7 @@ class AppSettings:
         mops_enabled: bool = True,
         account_equity: float | None = None,
         mops_history_years: int | None = None,
+        runtime_mode: str | None = None,
         validate_paths: bool = True,
     ) -> "AppSettings":
         values = os.environ if environ is None else environ
@@ -140,6 +143,12 @@ class AppSettings:
                 values.get("TWSE_ALLOW_INSECURE_SSL_FALLBACK", "1"),
                 "TWSE_ALLOW_INSECURE_SSL_FALLBACK",
             ),
+            market_history_cache_path=Path(
+                values.get(
+                    "TWSE_MARKET_HISTORY_CACHE_PATH",
+                    str(DATA_DIR / "market_history.sqlite3"),
+                )
+            ).expanduser(),
             mops_cache_dir=Path(
                 values.get("MOPS_CACHE_DIR", str(DATA_DIR / "mops"))
             ).expanduser(),
@@ -181,6 +190,11 @@ class AppSettings:
             smtp_cc=values.get("TWSE_SMTP_CC", "").strip(),
             smtp_host=values.get("TWSE_SMTP_HOST", "").strip(),
             smtp_port=_parse_int(values, "TWSE_SMTP_PORT", 587),
+            runtime_mode=(
+                runtime_mode
+                if runtime_mode is not None
+                else values.get("TWSE_RUNTIME_MODE", "release")
+            ).strip().upper(),
             log_level=values.get("TWSE_LOG_LEVEL", "INFO").strip().upper(),
         )
         settings.validate(
@@ -231,6 +245,8 @@ class AppSettings:
             raise SettingsError("TWSE_ACCOUNT_EQUITY must be greater than zero")
         if self.smtp_port < 1 or self.smtp_port > 65535:
             raise SettingsError("TWSE_SMTP_PORT must be between 1 and 65535")
+        if self.runtime_mode not in {"RELEASE", "DEBUG"}:
+            raise SettingsError("TWSE_RUNTIME_MODE must be release or debug")
         if self.log_level not in {
             "CRITICAL",
             "ERROR",
@@ -242,6 +258,8 @@ class AppSettings:
 
         if mops_enabled and validate_paths:
             self._validate_mops_cache()
+        if validate_paths:
+            self._validate_market_history_cache()
         if mail_enabled:
             self._validate_smtp()
 
@@ -257,6 +275,24 @@ class AppSettings:
             raise SettingsError(
                 "MOPS_CACHE_DIR is not writable: {}".format(
                     self.mops_cache_dir
+                )
+            ) from error
+
+    def _validate_market_history_cache(self) -> None:
+        path = self.market_history_cache_path
+        try:
+            if path.exists() and not path.is_file():
+                raise OSError("cache path is not a file")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                dir=path.parent,
+                prefix=".market-history-write-test-",
+            ):
+                pass
+        except OSError as error:
+            raise SettingsError(
+                "TWSE_MARKET_HISTORY_CACHE_PATH is not writable: {}".format(
+                    path
                 )
             ) from error
 
@@ -287,3 +323,11 @@ class AppSettings:
         if domain in {"hotmail.com", "outlook.com", "live.com"}:
             return "smtp.live.com"
         return ""
+
+    @property
+    def effective_log_level(self) -> str:
+        """Make the runtime mode authoritative for diagnostic output."""
+
+        if self.runtime_mode == "DEBUG":
+            return "DEBUG"
+        return "INFO" if self.log_level == "DEBUG" else self.log_level

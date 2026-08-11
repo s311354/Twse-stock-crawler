@@ -4,6 +4,9 @@ import pytest
 import pandas as pd
 
 import interface.cli as cli
+from application.contracts import AnalysisContext
+from application.contracts import MarketStatus
+from application.contracts import StockAnalysisRequest
 from domain.fundamental_derivation import FundamentalBundle
 from infrastructure.calendar.twse_calendar import TradingDayStatus
 from infrastructure.calendar.twse_calendar import TwseCalendarUnavailableError
@@ -14,6 +17,7 @@ from infrastructure.crawler.twse_http_client import TwseSchemaChangedError
 from infrastructure.fundamentals.mops_repository import MopsStorageError
 from infrastructure.bootstrap import build_stock_analysis_runtime
 from infrastructure.bootstrap import build_stock_analysis_service
+from infrastructure.stock_analysis_adapters import CrawlerFundamentalAdapter
 from interface.cli import build_request
 
 
@@ -100,6 +104,14 @@ def test_application_service_orchestrates_injected_crawler() -> None:
         crawler_factory=crawler_factory,
         market_calendar=calendar,
         today_provider=lambda: today,
+        now_provider=lambda: datetime.datetime(
+            2026,
+            7,
+            20,
+            14,
+            0,
+            tzinfo=datetime.timezone(datetime.timedelta(hours=8)),
+        ),
     ).run(request)
 
     assert crawlers[0].stocklistsize == 1
@@ -112,6 +124,44 @@ def test_application_service_orchestrates_injected_crawler() -> None:
         "cal_max_profit",
         "record_analysis_dataset",
     ]
+
+
+def test_market_data_no_data_dates_are_added_to_run_summary() -> None:
+    class NoDataCrawler(FakeCrawler):
+        def __init__(self, stocklistsize: int) -> None:
+            super().__init__(stocklistsize)
+            self.twse_no_data_dates = set()
+            self.twse_closed_unscheduled_dates = set()
+            self.missing_tracked_stock_first_dates = {}
+
+        def get_twse_daily_stocks(self, file_name, stocktype, stocks) -> None:
+            super().get_twse_daily_stocks(file_name, stocktype, stocks)
+            self.twse_no_data_dates = {"2025-10-06", "2025-10-07"}
+            self.twse_closed_unscheduled_dates = {"2026-07-10"}
+            self.missing_tracked_stock_first_dates = {
+                "2327": "2025-08-14",
+                "3321": "2025-09-08",
+            }
+
+    runtime = build_stock_analysis_runtime(
+        crawler_factory=NoDataCrawler,
+        market_calendar=FakeCalendar(),
+        today_provider=lambda: datetime.date(2026, 7, 20),
+    )
+    runtime.service.run(
+        build_request(["-o", "shirong", "-e", "3", "-t", "ELEC", "0"])
+    )
+
+    summary = runtime.observer.snapshot()
+    assert summary["no_data_date_count"] == 2
+    assert summary["no_data_dates"] == ["2025-10-06", "2025-10-07"]
+    assert summary["closed_unscheduled_date_count"] == 1
+    assert summary["closed_unscheduled_dates"] == ["2026-07-10"]
+    assert summary["missing_tracked_stock_count"] == 2
+    assert summary["missing_tracked_stocks"] == {
+        "2327": "2025-08-14",
+        "3321": "2025-09-08",
+    }
 
 
 def test_application_service_runs_backtrack_analysis_when_market_is_closed(
@@ -195,10 +245,15 @@ def test_application_loads_mops_context_before_analysis() -> None:
         def __init__(self) -> None:
             self.calls = []
             self.batch_times = []
+            self.revision_times = []
 
         def prepare_daily_batch(self, observed_at):
             self.batch_times.append(observed_at)
             return 1
+
+        def prepare_daily_revisions(self, observed_at):
+            self.revision_times.append(observed_at)
+            return 0
 
         def load(self, symbol, *, signal_date, sector, history_years):
             self.calls.append((symbol, signal_date, sector, history_years))
@@ -232,10 +287,216 @@ def test_application_loads_mops_context_before_analysis() -> None:
             tzinfo=datetime.timezone(datetime.timedelta(hours=8)),
         )
     ]
+    assert fundamentals.revision_times == fundamentals.batch_times
     assert crawler.fundamentals[0] == "2330"
     assert crawler.fundamentals[3] == 2_000_000
     assert crawler.fundamentals[4] == "2026-07-20T13:30:00+08:00"
     assert crawler.called.index("set_low_entry_v4_fundamentals") < crawler.called.index("cal_max_profit")
+
+
+def test_fundamental_adapter_uses_bulk_snapshot_and_falls_back_per_symbol() -> None:
+    class BulkCrawler:
+        stocknumbers = ["2330", "2317"]
+        stocknames = ["台積電", "鴻海"]
+        daily_dates = [["2026-08-03"], ["2026-08-03"]]
+
+        def __init__(self) -> None:
+            self.attached: list[str] = []
+
+        def set_low_entry_v4_fundamentals(self, stock_no, **kwargs):
+            self.attached.append(stock_no)
+
+    class BulkService:
+        def __init__(self) -> None:
+            self.preload_calls = []
+            self.load_calls = []
+
+        def load_cached_bundles(self, symbols, **kwargs):
+            self.preload_calls.append((symbols, kwargs))
+            return {
+                "2330": FundamentalBundle(
+                    annual_fundamentals=pd.DataFrame({"fiscal_year": [2025]}),
+                    snapshot={"remote_refresh_skipped": True},
+                )
+            }
+
+        def load(self, symbol, **kwargs):
+            self.load_calls.append((symbol, kwargs))
+            return FundamentalBundle(
+                annual_fundamentals=pd.DataFrame({"fiscal_year": [2025]}),
+                snapshot={},
+            )
+
+    crawler = BulkCrawler()
+    service = BulkService()
+    adapter = CrawlerFundamentalAdapter(service)
+    context = AnalysisContext(
+        crawler,
+        datetime.date(2026, 8, 3),
+        MarketStatus.OPEN,
+    )
+    request = StockAnalysisRequest(
+        stocklist=["2330", "2317"],
+        stocktype="ELEC",
+        output_file_names="shirong",
+        endbacktrack=3,
+    )
+
+    adapter.refresh(
+        context,
+        request,
+        analysis_time=datetime.datetime(
+            2026,
+            8,
+            3,
+            13,
+            45,
+            tzinfo=datetime.timezone(datetime.timedelta(hours=8)),
+        ),
+    )
+
+    assert service.preload_calls[0][0] == ["2330", "2317"]
+    assert [call[0] for call in service.load_calls] == ["2317"]
+    assert crawler.attached == ["2330", "2317"]
+
+
+def test_fundamental_refresh_logs_one_individual_scope_fallback_summary(
+    caplog,
+) -> None:
+    class ScopeCrawler:
+        stocknumbers = ["7631", "6281"]
+        stocknames = ["測試一", "測試二"]
+        daily_dates = [["2026-08-03"], ["2026-08-03"]]
+
+        def set_low_entry_v4_fundamentals(self, *args, **kwargs):
+            pass
+
+    class ScopeFallbackService:
+        def __init__(self) -> None:
+            self.symbols: set[str] = set()
+
+        def reset_scope_fallback_diagnostics(self):
+            self.symbols.clear()
+
+        def consume_scope_fallback_symbols(self):
+            result = tuple(sorted(self.symbols))
+            self.symbols.clear()
+            return result
+
+        def load(self, symbol, **kwargs):
+            self.symbols.add(symbol)
+            return FundamentalBundle(
+                annual_fundamentals=pd.DataFrame({"fiscal_year": [2025]}),
+                snapshot={"available_at": "2026-08-03T13:45:00+08:00"},
+            )
+
+    class Observer:
+        def __init__(self) -> None:
+            self.records = []
+
+        def record(self, event, **kwargs):
+            self.records.append((event, kwargs))
+
+    service = ScopeFallbackService()
+    observer = Observer()
+    adapter = CrawlerFundamentalAdapter(service, observer=observer)
+    context = AnalysisContext(
+        ScopeCrawler(),
+        datetime.date(2026, 8, 3),
+        MarketStatus.OPEN,
+    )
+    analysis_request = StockAnalysisRequest(
+        stocklist=["7631", "6281"],
+        stocktype="ELEC",
+        output_file_names="shirong",
+        endbacktrack=3,
+    )
+
+    with caplog.at_level("INFO"):
+        adapter.refresh(
+            context,
+            analysis_request,
+            analysis_time=datetime.datetime(
+                2026,
+                8,
+                3,
+                13,
+                45,
+                tzinfo=datetime.timezone(datetime.timedelta(hours=8)),
+            ),
+        )
+
+    summaries = [
+        record
+        for record in caplog.records
+        if getattr(record, "status", None)
+        == "INDIVIDUAL_SCOPE_FALLBACK_SUMMARY"
+    ]
+    assert len(summaries) == 1
+    assert "stocks=2 symbols=6281,7631" in summaries[0].getMessage()
+    assert service.symbols == set()
+    assert any(
+        event == "fundamental_individual_scope_fallback_summary"
+        and values["fallback_symbols"] == ["6281", "7631"]
+        for event, values in observer.records
+    )
+
+
+def test_application_separates_preferred_security_from_mops_issuer() -> None:
+    class PreferredCrawler(FakeCrawler):
+        def __init__(self) -> None:
+            super().__init__(1)
+            self.stocknumbers = ["3036A"]
+            self.stocknames = ["文曄甲特"]
+            self.daily_dates = [["2026-07-20"]]
+            self.fundamentals = None
+
+        def set_low_entry_v4_fundamentals(
+            self,
+            stock_no,
+            annual_fundamentals,
+            fundamental_snapshot,
+            account_equity,
+            signal_date=None,
+        ):
+            self.fundamentals = (
+                stock_no,
+                annual_fundamentals,
+                fundamental_snapshot,
+                account_equity,
+                signal_date,
+            )
+
+    class RecordingFundamentalService:
+        def __init__(self) -> None:
+            self.symbols = []
+
+        def load(self, symbol, *, signal_date, sector, history_years):
+            self.symbols.append(symbol)
+            return FundamentalBundle(
+                annual_fundamentals=pd.DataFrame({"fiscal_year": [2025]}),
+                snapshot={"available_at": signal_date},
+                as_of=signal_date,
+            )
+
+    crawler = PreferredCrawler()
+    fundamentals = RecordingFundamentalService()
+    request = build_request([
+        "-o", "shirong", "-e", "3", "-t", "ELEC", "3036A",
+    ])
+
+    build_stock_analysis_service(
+        crawler_factory=lambda size: crawler,
+        market_calendar=FakeCalendar(),
+        today_provider=lambda: datetime.date(2026, 7, 20),
+        fundamental_service=fundamentals,
+    ).run(request)
+
+    assert fundamentals.symbols == ["3036"]
+    assert crawler.fundamentals[0] == "3036A"
+    assert crawler.fundamentals[2]["market_symbol"] == "3036A"
+    assert crawler.fundamentals[2]["issuer_symbol"] == "3036"
+    assert crawler.fundamentals[2]["security_type"] == "PREFERRED"
 
 
 def test_application_continues_when_mops_cache_is_unavailable(caplog) -> None:
@@ -263,7 +524,7 @@ def test_application_continues_when_mops_cache_is_unavailable(caplog) -> None:
     ).run(request)
 
     assert result is True
-    assert "LES v4 remains WATCH_ONLY" in caplog.text
+    assert "LES v5 formal BUY disabled" in caplog.text
     assert "record_analysis_dataset" in crawler.called
 
 

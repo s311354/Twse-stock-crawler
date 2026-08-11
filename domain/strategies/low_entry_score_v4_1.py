@@ -34,7 +34,7 @@ from domain.strategies.low_entry_score_v4 import attach_low_entry_v4_context
 
 LOW_ENTRY_STRATEGY_NAME = "low_entry_score_v4_1"
 LES_V41_MODEL_VERSION = "4.1.0"
-LES_V41_PARAMETER_VERSION = "2026-07-31-balanced-spec-elec-breadth-v5"
+LES_V41_PARAMETER_VERSION = "2026-07-31-balanced-spec-elec-breadth-v6"
 
 
 class LowEntryProfile(str, Enum):
@@ -68,6 +68,7 @@ class LowEntryScoreV41Config(LowEntryScoreV4Config):
     provisional_initial_position_fraction: float = 1 / 6
     chemical_buy_small_initial_position_fraction: float = 1 / 8
     electronics_buy_small_initial_position_fraction: float = 1 / 16
+    breadth_rally_initial_position_fraction: float = 1 / 8
     semiconductor_buy_small_initial_position_fraction: float = 1 / 8
     chemical_probe_score_threshold: float = 60.0
     chemical_probe_minimum_quality_score: float = 75.0
@@ -285,6 +286,8 @@ class LowEntryScoreV41Strategy(LowEntryScoreV4Strategy):
     """Quality-first LES v4.1 with explicit stabilization confirmation."""
 
     name = LOW_ENTRY_STRATEGY_NAME
+    description = "Balanced entry profile with Quality Gate, Market Data Gate, component scoring, trigger confirmation, and breadth-rally recovery paths"
+    version = LES_V41_MODEL_VERSION
 
     def __init__(self, config: LowEntryScoreV41Config | None = None) -> None:
         super().__init__(config or LowEntryScoreV41Config())
@@ -525,6 +528,9 @@ class LowEntryScoreV41Strategy(LowEntryScoreV4Strategy):
             ) = self._evaluate_electronics_probe_liquidity_gate(
                 indicators,
                 plan,
+                position_fraction=(
+                    self.config.breadth_rally_initial_position_fraction
+                ),
             )
             (
                 electronics_rally_risk_gate,
@@ -673,13 +679,15 @@ class LowEntryScoreV41Strategy(LowEntryScoreV4Strategy):
         position_fraction = pd.Series(
             np.select(
                 [
-                    electronics_probe_selected | electronics_rally_selected,
+                    electronics_probe_selected,
+                    electronics_rally_selected,
                     semiconductor_probe_selected,
                     state == "BUY_SMALL",
                     state == "BUY",
                 ],
                 [
                     self.config.electronics_buy_small_initial_position_fraction,
+                    self.config.breadth_rally_initial_position_fraction,
                     self.config.semiconductor_buy_small_initial_position_fraction,
                     buy_small_position_fraction,
                     self.config.standard_initial_position_fraction,
@@ -693,6 +701,10 @@ class LowEntryScoreV41Strategy(LowEntryScoreV4Strategy):
         ).where(
             output_plan["shares"].notna()
         )
+        state = self._enforce_executable_position(state, suggested_shares)
+        non_executable = ~state.isin(["BUY", "BUY_SMALL"])
+        position_fraction = position_fraction.mask(non_executable, 0.0)
+        suggested_shares = suggested_shares.mask(non_executable, 0.0)
 
         veto_text = vetoes.apply(self._format_v41_vetoes, axis=1)
         quality_reasons = "；".join(quality.reasons + quality.warnings)
@@ -1636,11 +1648,17 @@ class LowEntryScoreV41Strategy(LowEntryScoreV4Strategy):
         self,
         indicators: pd.DataFrame,
         plan: pd.DataFrame,
+        *,
+        position_fraction: float | None = None,
     ) -> tuple[pd.Series, pd.Series]:
         probe_plan = plan.copy()
+        if position_fraction is None:
+            position_fraction = (
+                self.config.electronics_buy_small_initial_position_fraction
+            )
         probe_plan["order_amount"] = (
             probe_plan["order_amount"]
-            * self.config.electronics_buy_small_initial_position_fraction
+            * position_fraction
         )
         return self._evaluate_liquidity_gate_with_thresholds(
             indicators,
@@ -2169,6 +2187,19 @@ class LowEntryScoreV41Strategy(LowEntryScoreV4Strategy):
             ),
             axis=1,
         )
+
+    @staticmethod
+    def _enforce_executable_position(
+        state: pd.Series,
+        suggested_shares: pd.Series,
+    ) -> pd.Series:
+        """Do not publish a buy state when the sized odd-lot is zero shares."""
+
+        non_executable_buy = (
+            state.isin(["BUY", "BUY_SMALL"])
+            & suggested_shares.fillna(0).lt(1)
+        )
+        return state.mask(non_executable_buy, "ARMED")
 
     @property
     def profile(self) -> LowEntryProfile:

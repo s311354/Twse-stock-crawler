@@ -10,7 +10,9 @@ from application.market_history import MarketHistoryAssembler
 from application.market_history import MarketHistoryInput
 from application.strategy_execution import PreparedStrategyInputs
 from application.strategy_execution import StrategyExecutionService
+from application.strategy_contracts import StrategyDecisionAssembler
 from domain.features import FeatureFrame
+from domain.model_contracts import StrategyDecision
 from domain.models import ProfitRow
 from domain.models import SignalRow
 from domain.services import compute_signal_features
@@ -20,8 +22,8 @@ from domain.strategies.expected_return_exit_v3 import (
 from domain.strategies.expected_return_exit_v3 import (
     EXPECTED_RETURN_EXIT_STRATEGY_NAME,
 )
-from domain.strategies.low_entry_score_v4_1 import LOW_ENTRY_OUTPUT_COLUMNS
-from domain.strategies.low_entry_score_v4_1 import LOW_ENTRY_STRATEGY_NAME
+from domain.strategies.low_entry_score_v5 import LOW_ENTRY_OUTPUT_COLUMNS
+from domain.strategies.low_entry_score_v5 import LOW_ENTRY_STRATEGY_NAME
 
 
 PROFIT_COLUMNS = [
@@ -50,6 +52,11 @@ BASE_COLUMNS = [
     "利潤比",
     *SIGNAL_COLUMNS,
 ]
+ANALYSIS_COLUMNS = (
+    BASE_COLUMNS
+    + LOW_ENTRY_OUTPUT_COLUMNS
+    + EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS
+)
 
 
 class AnalysisDatasetBuilder:
@@ -60,12 +67,16 @@ class AnalysisDatasetBuilder:
         *,
         history_assembler: MarketHistoryAssembler | None = None,
         strategy_execution: StrategyExecutionService | None = None,
+        decision_assembler: StrategyDecisionAssembler | None = None,
     ) -> None:
         self.history_assembler = (
             history_assembler or MarketHistoryAssembler()
         )
         self.strategy_execution = (
             strategy_execution or StrategyExecutionService()
+        )
+        self.decision_assembler = (
+            decision_assembler or StrategyDecisionAssembler()
         )
 
     def build_history(
@@ -147,6 +158,31 @@ class AnalysisDatasetBuilder:
         market: MarketHistoryInput,
         maxprofits: Sequence[ProfitRow],
     ) -> pd.DataFrame:
+        decisions = self.build_decisions(market, maxprofits)
+        return self.project_decisions(decisions)
+
+    def build_decisions(
+        self,
+        market: MarketHistoryInput,
+        maxprofits: Sequence[ProfitRow],
+    ) -> tuple[StrategyDecision, ...]:
+        analysis = self._build_analysis_frame(market, maxprofits)
+        return self.decision_assembler.assemble(analysis, market)
+
+    def project_decisions(
+        self,
+        decisions: Sequence[StrategyDecision],
+    ) -> pd.DataFrame:
+        return self.decision_assembler.project(
+            decisions,
+            ANALYSIS_COLUMNS,
+        )
+
+    def _build_analysis_frame(
+        self,
+        market: MarketHistoryInput,
+        maxprofits: Sequence[ProfitRow],
+    ) -> pd.DataFrame:
         if len(maxprofits) != market.stock_count:
             raise ValueError("maxprofits must match market stock_count")
 
@@ -189,15 +225,12 @@ class AnalysisDatasetBuilder:
             values[-1] if values else None
             for values in market.closes
         ]
-        return analysis[
-            BASE_COLUMNS
-            + LOW_ENTRY_OUTPUT_COLUMNS
-            + EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS
-        ]
+        return analysis[ANALYSIS_COLUMNS]
 
 
 __all__ = [
     "AnalysisDatasetBuilder",
+    "ANALYSIS_COLUMNS",
     "BASE_COLUMNS",
     "PROFIT_COLUMNS",
     "SIGNAL_COLUMNS",

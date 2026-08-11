@@ -11,8 +11,10 @@ import sqlite3
 import time
 from collections.abc import Callable
 from collections.abc import Iterator
+from collections.abc import Mapping
 from contextlib import closing
 from contextlib import contextmanager
+from dataclasses import asdict
 from pathlib import Path
 from types import TracebackType
 
@@ -22,9 +24,11 @@ from application.fundamental_ports import FundamentalUnitOfWork
 from config.settings import DATA_DIR
 from config.settings import AppSettings
 from domain.data_provenance import LEGACY_UNVERIFIED
+from domain.fundamental_derivation import CachedFundamentalBundle
 from domain.fundamental_derivation import FiledFact
 from domain.fundamental_derivation import FiledFinancials
 from domain.fundamental_derivation import FundamentalBundle
+from domain.fundamental_models import FundamentalSnapshot
 from domain.fundamental_models import NormalizedFact
 from infrastructure.fundamentals.models import MopsFiling
 from infrastructure.fundamentals.models import MopsFilingCandidate
@@ -230,6 +234,10 @@ class MopsRepository:
                         for fact in facts
                     ],
                 )
+                self._invalidate_active_bundle(
+                    active_connection,
+                    candidate.symbol,
+                )
 
         return MopsFiling(
             filing_id=filing_id,
@@ -281,6 +289,10 @@ class MopsRepository:
                         availability_source,
                         filing.filing_id,
                     ),
+                )
+                self._invalidate_active_bundle(
+                    active_connection,
+                    filing.symbol,
                 )
         return MopsFiling(
             filing_id=filing.filing_id,
@@ -517,6 +529,51 @@ class MopsRepository:
                     (symbol, self._to_epoch(refreshed_at)),
                 )
 
+    def last_recent_revision_check_epoch(
+        self,
+        symbol: str,
+        *,
+        uow: FundamentalUnitOfWork | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> int | None:
+        self._ensure_schema()
+        with self._borrow_connection(connection, uow) as active_connection:
+            row = active_connection.execute(
+                "SELECT recent_revision_checked_at_epoch "
+                "FROM refresh_state WHERE symbol = ?",
+                (symbol,),
+            ).fetchone()
+        return int(row[0]) if row is not None and row[0] is not None else None
+
+    def mark_recent_revision_check(
+        self,
+        symbol: str,
+        checked_at: str,
+        *,
+        uow: FundamentalUnitOfWork | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
+        self._ensure_schema()
+        externally_managed = uow is not None or connection is not None
+        checked_at_epoch = self._to_epoch(checked_at)
+        with self._borrow_connection(connection, uow) as active_connection:
+            with self._write_transaction(
+                active_connection,
+                externally_managed=externally_managed,
+            ):
+                active_connection.execute(
+                    """
+                    INSERT INTO refresh_state (
+                        symbol,
+                        full_catalog_checked_at_epoch,
+                        recent_revision_checked_at_epoch
+                    ) VALUES (?, ?, ?)
+                    ON CONFLICT(symbol) DO UPDATE SET
+                        recent_revision_checked_at_epoch = excluded.recent_revision_checked_at_epoch
+                    """,
+                    (symbol, checked_at_epoch, checked_at_epoch),
+                )
+
     def load_financial_batch_state(
         self,
         symbol: str,
@@ -577,6 +634,75 @@ class MopsRepository:
                     ),
                 )
 
+    def save_financial_batch_snapshot(
+        self,
+        snapshot: FundamentalSnapshot,
+        *,
+        uow: FundamentalUnitOfWork | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
+        """Store the first observed copy of each immutable TWSE revision."""
+
+        self._ensure_schema()
+        externally_managed = uow is not None or connection is not None
+        payload = json.dumps(
+            asdict(snapshot),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self._borrow_connection(connection, uow) as active_connection:
+            with self._write_transaction(
+                active_connection,
+                externally_managed=externally_managed,
+            ):
+                active_connection.execute(
+                    """
+                    INSERT OR IGNORE INTO financial_batch_snapshots (
+                        symbol, fiscal_year, quarter, content_sha256,
+                        observed_at, observed_at_epoch, snapshot_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot.symbol,
+                        snapshot.fiscal_year,
+                        snapshot.quarter,
+                        snapshot.content_sha256,
+                        snapshot.observed_at,
+                        self._to_epoch(snapshot.observed_at),
+                        payload,
+                    ),
+                )
+
+    def load_financial_batch_snapshots(
+        self,
+        symbol: str,
+        *,
+        as_of: str,
+        uow: FundamentalUnitOfWork | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> list[FundamentalSnapshot]:
+        """Return one latest eligible revision per period without look-ahead."""
+
+        self._ensure_schema()
+        with self._borrow_connection(connection, uow) as active_connection:
+            rows = active_connection.execute(
+                """
+                SELECT fiscal_year, quarter, observed_at_epoch, id, snapshot_json
+                FROM financial_batch_snapshots
+                WHERE symbol = ? AND observed_at_epoch <= ?
+                ORDER BY fiscal_year, quarter, observed_at_epoch, id
+                """,
+                (symbol, self._to_epoch(as_of)),
+            ).fetchall()
+        latest_by_period: dict[tuple[int, int], FundamentalSnapshot] = {}
+        for row in rows:
+            payload = json.loads(str(row[4]))
+            latest_by_period[(int(row[0]), int(row[1]))] = FundamentalSnapshot(
+                **payload
+            )
+        return [latest_by_period[period] for period in sorted(latest_by_period)]
+
     @staticmethod
     def filing_set_hash(filings: list[FiledFinancials]) -> str:
         """Hash all inputs that can change point-in-time fundamental output."""
@@ -596,6 +722,118 @@ class MopsRepository:
             for filing in filings
         ]
         return hashlib.sha256("\n".join(components).encode("utf-8")).hexdigest()
+
+    def load_cached_bundles(
+        self,
+        symbol_sectors: Mapping[str, str],
+        *,
+        as_of: str,
+        derivation_version: str,
+    ) -> dict[str, CachedFundamentalBundle]:
+        """Load active snapshots in one query without touching normalized facts."""
+
+        self._ensure_schema()
+        requested = {
+            str(symbol).strip(): str(sector).strip()
+            for symbol, sector in symbol_sectors.items()
+            if str(symbol).strip()
+        }
+        if not requested:
+            return {}
+        placeholders = ",".join("?" for _ in requested)
+        query = f"""
+            SELECT rs.symbol, rs.active_filing_set_sha256,
+                   rs.active_derivation_version,
+                   rs.active_snapshot_available_at_epoch,
+                   rs.active_latest_fiscal_year, rs.active_latest_quarter,
+                   rs.active_annual_history_years,
+                   rs.full_catalog_checked_at_epoch,
+                   fs.sector, fs.annual_json, fs.snapshot_json
+            FROM refresh_state AS rs
+            JOIN fundamental_snapshots AS fs
+              ON fs.symbol = rs.symbol
+             AND fs.filing_set_sha256 = rs.active_snapshot_cache_key
+            WHERE rs.symbol IN ({placeholders})
+              AND rs.active_derivation_version = ?
+              AND rs.active_snapshot_available_at_epoch <= ?
+        """
+        params = [
+            *requested,
+            derivation_version,
+            self._to_epoch(as_of),
+        ]
+        with closing(self._connect()) as connection:
+            rows = connection.execute(query, params).fetchall()
+
+        bundles: dict[str, CachedFundamentalBundle] = {}
+        for row in rows:
+            symbol = str(row[0])
+            stored_sector = str(row[8])
+            if requested.get(symbol) != stored_sector:
+                continue
+            annual = pd.read_json(io.StringIO(str(row[9])), orient="records")
+            snapshot = json.loads(str(row[10]))
+            bundles[symbol] = CachedFundamentalBundle(
+                symbol=symbol,
+                sector=stored_sector,
+                filing_set_sha256=str(row[1]),
+                derivation_version=str(row[2]),
+                available_at_epoch=int(row[3]),
+                latest_period=(int(row[4]), int(row[5])),
+                annual_history_years=int(row[6]),
+                full_catalog_checked_at_epoch=int(row[7]),
+                bundle=FundamentalBundle(
+                    annual_fundamentals=annual,
+                    snapshot=snapshot,
+                ),
+            )
+        return bundles
+
+    def mark_active_fundamental_bundle(
+        self,
+        symbol: str,
+        *,
+        filing_set_sha256: str,
+        snapshot_cache_key: str,
+        derivation_version: str,
+        available_at: str,
+        latest_period: tuple[int, int],
+        annual_history_years: int,
+        uow: FundamentalUnitOfWork | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
+        """Activate a snapshot only when catalog refresh state already exists."""
+
+        self._ensure_schema()
+        externally_managed = uow is not None or connection is not None
+        with self._borrow_connection(connection, uow) as active_connection:
+            with self._write_transaction(
+                active_connection,
+                externally_managed=externally_managed,
+            ):
+                active_connection.execute(
+                    """
+                    UPDATE refresh_state
+                    SET active_filing_set_sha256 = ?,
+                        active_snapshot_cache_key = ?,
+                        active_derivation_version = ?,
+                        active_snapshot_available_at_epoch = ?,
+                        active_latest_fiscal_year = ?,
+                        active_latest_quarter = ?,
+                        active_annual_history_years = ?
+                    WHERE symbol = ?
+                    """,
+                    (
+                        filing_set_sha256,
+                        snapshot_cache_key,
+                        derivation_version,
+                        self._to_epoch(available_at),
+                        latest_period[0],
+                        latest_period[1],
+                        annual_history_years,
+                        symbol,
+                    ),
+                )
 
     def load_fundamental_bundle(
         self,
@@ -726,7 +964,15 @@ class MopsRepository:
                     ON facts(filing_id, concept);
                 CREATE TABLE IF NOT EXISTS refresh_state (
                     symbol TEXT PRIMARY KEY,
-                    full_catalog_checked_at_epoch INTEGER NOT NULL
+                    full_catalog_checked_at_epoch INTEGER NOT NULL,
+                    recent_revision_checked_at_epoch INTEGER,
+                    active_filing_set_sha256 TEXT,
+                    active_snapshot_cache_key TEXT,
+                    active_derivation_version TEXT,
+                    active_snapshot_available_at_epoch INTEGER,
+                    active_latest_fiscal_year INTEGER,
+                    active_latest_quarter INTEGER,
+                    active_annual_history_years INTEGER
                 );
                 CREATE TABLE IF NOT EXISTS fundamental_snapshots (
                     symbol TEXT NOT NULL,
@@ -744,6 +990,21 @@ class MopsRepository:
                     content_sha256 TEXT NOT NULL,
                     observed_at_epoch INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS financial_batch_snapshots (
+                    id INTEGER PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    fiscal_year INTEGER NOT NULL,
+                    quarter INTEGER NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    observed_at_epoch INTEGER NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    UNIQUE(symbol, fiscal_year, quarter, content_sha256)
+                );
+                CREATE INDEX IF NOT EXISTS financial_batch_snapshots_point_in_time
+                    ON financial_batch_snapshots(
+                        symbol, observed_at_epoch, fiscal_year, quarter
+                    );
                 """
             )
             columns = {
@@ -774,6 +1035,57 @@ class MopsRepository:
             for column, statement in migrations.items():
                 if column not in columns:
                     connection.execute(statement)
+            refresh_columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(refresh_state)"
+                ).fetchall()
+            }
+            if "recent_revision_checked_at_epoch" not in refresh_columns:
+                connection.execute(
+                    "ALTER TABLE refresh_state ADD COLUMN "
+                    "recent_revision_checked_at_epoch INTEGER"
+                )
+            active_state_migrations = {
+                "active_filing_set_sha256": (
+                    "ALTER TABLE refresh_state ADD COLUMN "
+                    "active_filing_set_sha256 TEXT"
+                ),
+                "active_snapshot_cache_key": (
+                    "ALTER TABLE refresh_state ADD COLUMN "
+                    "active_snapshot_cache_key TEXT"
+                ),
+                "active_derivation_version": (
+                    "ALTER TABLE refresh_state ADD COLUMN "
+                    "active_derivation_version TEXT"
+                ),
+                "active_snapshot_available_at_epoch": (
+                    "ALTER TABLE refresh_state ADD COLUMN "
+                    "active_snapshot_available_at_epoch INTEGER"
+                ),
+                "active_latest_fiscal_year": (
+                    "ALTER TABLE refresh_state ADD COLUMN "
+                    "active_latest_fiscal_year INTEGER"
+                ),
+                "active_latest_quarter": (
+                    "ALTER TABLE refresh_state ADD COLUMN "
+                    "active_latest_quarter INTEGER"
+                ),
+                "active_annual_history_years": (
+                    "ALTER TABLE refresh_state ADD COLUMN "
+                    "active_annual_history_years INTEGER"
+                ),
+            }
+            for column, statement in active_state_migrations.items():
+                if column not in refresh_columns:
+                    connection.execute(statement)
+            connection.execute(
+                """
+                UPDATE refresh_state
+                SET recent_revision_checked_at_epoch = full_catalog_checked_at_epoch
+                WHERE recent_revision_checked_at_epoch IS NULL
+                """
+            )
             missing_epochs = connection.execute(
                 "SELECT id, available_at FROM filings WHERE available_at_epoch IS NULL"
             ).fetchall()
@@ -788,6 +1100,16 @@ class MopsRepository:
                 """
                 CREATE INDEX IF NOT EXISTS filings_symbol_available_epoch
                 ON filings(symbol, available_at_epoch, fiscal_year, quarter, revision_number)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS refresh_state_active_snapshot
+                ON refresh_state(
+                    active_derivation_version,
+                    active_snapshot_available_at_epoch,
+                    symbol
+                )
                 """
             )
             self._remove_legacy_empty_state(connection)
@@ -830,6 +1152,26 @@ class MopsRepository:
                 removed_snapshots,
                 removed_refresh_states,
             )
+
+    @staticmethod
+    def _invalidate_active_bundle(
+        connection: sqlite3.Connection,
+        symbol: str,
+    ) -> None:
+        connection.execute(
+            """
+            UPDATE refresh_state
+            SET active_filing_set_sha256 = NULL,
+                active_snapshot_cache_key = NULL,
+                active_derivation_version = NULL,
+                active_snapshot_available_at_epoch = NULL,
+                active_latest_fiscal_year = NULL,
+                active_latest_quarter = NULL,
+                active_annual_history_years = NULL
+            WHERE symbol = ?
+            """,
+            (symbol,),
+        )
 
     @contextmanager
     def _borrow_connection(

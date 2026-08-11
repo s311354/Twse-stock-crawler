@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Mapping
 from types import TracebackType
 from typing import Protocol
 from typing import Self
 
+from domain.fundamental_derivation import CachedFundamentalBundle
 from domain.fundamental_derivation import FiledFinancials
 from domain.fundamental_derivation import FundamentalBundle
 from domain.fundamental_models import FilingAnnouncement
@@ -70,6 +72,21 @@ class FundamentalRepositoryPort(Protocol):
         uow: FundamentalUnitOfWork | None = None,
     ) -> None: ...
 
+    def last_recent_revision_check_epoch(
+        self,
+        symbol: str,
+        *,
+        uow: FundamentalUnitOfWork | None = None,
+    ) -> int | None: ...
+
+    def mark_recent_revision_check(
+        self,
+        symbol: str,
+        checked_at: str,
+        *,
+        uow: FundamentalUnitOfWork | None = None,
+    ) -> None: ...
+
     def load_financial_batch_state(
         self,
         symbol: str,
@@ -87,6 +104,23 @@ class FundamentalRepositoryPort(Protocol):
         *,
         uow: FundamentalUnitOfWork | None = None,
     ) -> None: ...
+
+    def save_financial_batch_snapshot(
+        self,
+        snapshot: FundamentalSnapshot,
+        *,
+        uow: FundamentalUnitOfWork | None = None,
+    ) -> None:
+        """Persist the first observation of one immutable TWSE period revision."""
+
+    def load_financial_batch_snapshots(
+        self,
+        symbol: str,
+        *,
+        as_of: str,
+        uow: FundamentalUnitOfWork | None = None,
+    ) -> list[FundamentalSnapshot]:
+        """Load latest point-in-time TWSE revisions for every stored period."""
 
     def latest_filing(
         self,
@@ -124,6 +158,31 @@ class FundamentalRepositoryPort(Protocol):
 
     def filing_set_hash(self, filings: list[FiledFinancials]) -> str: ...
 
+    def load_cached_bundles(
+        self,
+        symbol_sectors: Mapping[str, str],
+        *,
+        as_of: str,
+        derivation_version: str,
+    ) -> dict[str, CachedFundamentalBundle]:
+        """Load version-compatible active snapshots without reading facts."""
+        ...
+
+    def mark_active_fundamental_bundle(
+        self,
+        symbol: str,
+        *,
+        filing_set_sha256: str,
+        snapshot_cache_key: str,
+        derivation_version: str,
+        available_at: str,
+        latest_period: tuple[int, int],
+        annual_history_years: int,
+        uow: FundamentalUnitOfWork | None = None,
+    ) -> None:
+        """Point refresh state at a snapshot eligible for fast reuse."""
+        ...
+
     def load_fundamental_bundle(
         self,
         symbol: str,
@@ -146,6 +205,13 @@ class FundamentalRepositoryPort(Protocol):
 
 class FilingCatalogPort(Protocol):
     def discover(self, symbol: str) -> list[FilingCandidate]: ...
+
+    def discover_corrections(
+        self,
+        periods: list[tuple[int, int]],
+    ) -> list[FilingCorrection]:
+        """Load market-wide filing corrections for the requested periods."""
+        ...
 
     def discover_announcements(
         self,

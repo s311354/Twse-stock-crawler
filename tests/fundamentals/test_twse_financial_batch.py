@@ -37,6 +37,10 @@ def test_financial_batch_fetches_two_endpoints_and_derives_safe_ratios() -> None
     assert fields["twse_roe_ytd_end_balance"] == pytest.approx(0.1)
     assert fields["twse_debt_ratio"] == pytest.approx(0.4)
     assert fields["twse_current_ratio"] == pytest.approx(2.0)
+    assert fields["twse_total_assets"] == 5000
+    assert fields["twse_total_liabilities"] == 2000
+    assert fields["twse_parent_equity"] == 2000
+    assert fields["twse_total_equity"] == 3000
 
 
 def test_financial_batch_rejects_missing_official_columns() -> None:
@@ -50,6 +54,24 @@ def test_financial_batch_rejects_missing_official_columns() -> None:
         client.load(
             observed_at=dt.datetime(2026, 7, 21, tzinfo=dt.timezone.utc),
         )
+
+
+def test_financial_batch_accepts_current_total_column_aliases() -> None:
+    balance = _balance_row()
+    balance["資產總計"] = balance.pop("資產總額")
+    balance["負債總計"] = balance.pop("負債總額")
+    balance["權益總計"] = balance.pop("權益總額")
+    client = TwseFinancialBatchClient(  # type: ignore[arg-type]
+        _FakeHttpClient(income=[_income_row()], balance=[balance])
+    )
+
+    snapshot = client.load(
+        observed_at=dt.datetime(2026, 8, 9, tzinfo=dt.timezone.utc),
+    )["2330"]
+
+    assert snapshot.total_assets == 5000
+    assert snapshot.total_liabilities == 2000
+    assert snapshot.total_equity == 3000
 
 
 def test_financial_hash_ignores_observation_time_but_detects_value_change() -> None:

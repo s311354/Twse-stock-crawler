@@ -94,6 +94,11 @@ def test_low_entry_score_v4_1_is_discoverable() -> None:
     assert LowEntryScoreV41Strategy().profile is LowEntryProfile.BALANCED
     assert LowEntryScoreV41Strategy()._standard_risk_thresholds == (1.8, 1.7)
     assert LowEntryScoreV41Strategy().config.lot_size == 1
+    assert (
+        LowEntryScoreV41Strategy()
+        .config.breadth_rally_initial_position_fraction
+        == 1 / 8
+    )
 
 
 def test_v4_1_component_weights_total_exactly_100() -> None:
@@ -1145,6 +1150,18 @@ def test_electronics_breadth_rally_below_relaxed_floor_does_not_buy() -> None:
     )
 
     assert state.iloc[0] == "AVOID"
+
+
+def test_zero_share_buy_is_downgraded_to_armed() -> None:
+    state = pd.Series(["BUY", "BUY_SMALL", "WATCH"])
+    suggested_shares = pd.Series([0.0, np.nan, 0.0])
+
+    executable = LowEntryScoreV41Strategy._enforce_executable_position(
+        state,
+        suggested_shares,
+    )
+
+    assert executable.tolist() == ["ARMED", "ARMED", "WATCH"]
 
 
 def test_electronics_recovery_state_expands_watchlist_without_buying() -> None:

@@ -23,6 +23,7 @@ from infrastructure.fundamentals.models import MopsCorrection
 from domain.fundamental_models import FilingAnnouncement
 from domain.fundamental_models import FilingDocument
 from infrastructure.fundamentals.models import MopsFilingCandidate
+from infrastructure.observability import structured_extra
 
 
 MOPS_BASE_URL = "https://mopsov.twse.com.tw"
@@ -221,7 +222,7 @@ class MopsClient:
                 selected_scopes = sorted(
                     {filing.statement_scope for filing in filings}
                 )
-                logging.info(
+                logging.debug(
                     "MOPS catalog symbol=%s detected_scopes=%s "
                     "filing_link_rows=%s selected_filings=%s "
                     "selected_scopes=%s policy=CONSOLIDATED_FIRST",
@@ -230,6 +231,13 @@ class MopsClient:
                     parse_result.filing_link_rows,
                     len(filings),
                     ",".join(selected_scopes),
+                    extra=structured_extra(
+                        symbol=normalized_symbol,
+                        source="MOPS",
+                        status="CATALOG_OK",
+                        attempt=attempt,
+                        cache_hit=False,
+                    ),
                 )
                 individual_periods = [
                     "{}Q{}".format(filing.fiscal_year, filing.quarter)
@@ -237,7 +245,7 @@ class MopsClient:
                     if filing.statement_scope == "individual"
                 ]
                 if individual_periods:
-                    logging.warning(
+                    logging.debug(
                         "MOPS catalog symbol=%s detected_scopes=%s "
                         "fallback_scope=individual period_count=%s "
                         "first_period=%s latest_period=%s "
@@ -247,6 +255,13 @@ class MopsClient:
                         len(individual_periods),
                         individual_periods[0],
                         individual_periods[-1],
+                        extra=structured_extra(
+                            symbol=normalized_symbol,
+                            source="MOPS",
+                            status="INDIVIDUAL_SCOPE_FALLBACK",
+                            attempt=attempt,
+                            cache_hit=False,
+                        ),
                     )
                 return filings
 
@@ -454,9 +469,51 @@ class MopsClient:
             fetched_at=fetched_at,
         )
 
+    def discover_corrections(
+        self,
+        periods: list[tuple[int, int]],
+    ) -> list[MopsCorrection]:
+        """Load each market-wide correction period once per client run."""
+
+        corrections: dict[tuple[str, int, int, str], MopsCorrection] = {}
+        for period in sorted(set(periods)):
+            for correction in self._load_corrections(period):
+                key = (
+                    correction.symbol,
+                    correction.fiscal_year,
+                    correction.quarter,
+                    correction.announced_on,
+                )
+                corrections[key] = correction
+        logging.debug(
+            "MOPS correction scan periods=%s events=%s scope=ALL_MARKET",
+            ",".join("{}Q{}".format(*period) for period in sorted(set(periods))),
+            len(corrections),
+            extra=structured_extra(
+                source="MOPS",
+                status="CORRECTION_SCAN_COMPLETE",
+                cache_hit=False,
+            ),
+        )
+        return [corrections[key] for key in sorted(corrections)]
+
     def latest_correction(self, candidate: MopsFilingCandidate) -> MopsCorrection | None:
         key = (candidate.fiscal_year, candidate.quarter)
+        corrections = [
+            correction
+            for correction in self._load_corrections(key)
+            if correction.symbol == candidate.symbol
+        ]
+        if not corrections:
+            return None
+        return max(corrections, key=lambda correction: correction.announced_on)
+
+    def _load_corrections(
+        self,
+        key: tuple[int, int],
+    ) -> list[MopsCorrection]:
         if key not in self._correction_cache:
+            fiscal_year, quarter = key
             response, _ = self._request_bytes(
                 "POST",
                 MOPS_CORRECTION_URL,
@@ -466,36 +523,30 @@ class MopsClient:
                     "off": "1",
                     "isQuery": "Y",
                     "TYPEK": "sii",
-                    "year": str(candidate.fiscal_year - 1911),
-                    "season": "{:02d}".format(candidate.quarter),
+                    "year": str(fiscal_year - 1911),
+                    "season": "{:02d}".format(quarter),
                 },
-                context="MOPS corrections {}Q{}".format(candidate.fiscal_year, candidate.quarter),
+                context="MOPS corrections {}Q{}".format(fiscal_year, quarter),
             )
             corrections: list[MopsCorrection] = []
             for row in _parse_table(response.content).rows:
                 if len(row.cells) < 5 or not re.fullmatch(r"\d{4}", row.cells[0]):
                     continue
-                if "合併" not in row.cells[3] or not re.fullmatch(r"\d{8}", row.cells[2]):
+                if not any(
+                    scope in row.cells[3] for scope in ("合併", "個別")
+                ) or not re.fullmatch(r"\d{8}", row.cells[2]):
                     continue
                 corrections.append(
                     MopsCorrection(
                         symbol=row.cells[0],
-                        fiscal_year=candidate.fiscal_year,
-                        quarter=candidate.quarter,
+                        fiscal_year=fiscal_year,
+                        quarter=quarter,
                         announced_on=row.cells[2],
                         description=row.cells[4],
                     )
                 )
             self._correction_cache[key] = corrections
-
-        corrections = [
-            correction
-            for correction in self._correction_cache[key]
-            if correction.symbol == candidate.symbol
-        ]
-        if not corrections:
-            return None
-        return max(corrections, key=lambda correction: correction.announced_on)
+        return list(self._correction_cache[key])
 
     def _request_bytes(
         self,

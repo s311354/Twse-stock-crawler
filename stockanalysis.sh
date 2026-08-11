@@ -16,7 +16,9 @@ if [ -n "$ENV_FILE" ]; then
   set -a
   . "$ENV_FILE"
   set +a
-  echo "Loaded environment variables from $ENV_FILE"
+  case "${TWSE_RUNTIME_MODE:-release}" in
+    debug|DEBUG) echo "Loaded environment variables from $ENV_FILE" ;;
+  esac
 fi
 
 if [ -n "${PYTHON:-}" ]; then

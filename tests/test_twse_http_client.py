@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import pytest
 from requests import exceptions as requests_exceptions
 
@@ -108,10 +110,11 @@ def test_http_retry_log_carries_structured_request_context(caplog) -> None:
         sleeper=lambda _: None,
     )
 
-    client.get_json(
-        "https://example.test",
-        context="MOPS iXBRL 2330 20260720",
-    )
+    with caplog.at_level(logging.DEBUG):
+        client.get_json(
+            "https://example.test",
+            context="MOPS iXBRL 2330 20260720",
+        )
 
     retry = next(
         record
@@ -124,6 +127,7 @@ def test_http_retry_log_carries_structured_request_context(caplog) -> None:
     assert retry.source == "MOPS"
     assert retry.status == "NETWORK_ERROR"
     assert retry.attempt == 1
+    assert retry.levelno == logging.DEBUG
     assert retry.cache_hit is None
 
 
@@ -264,7 +268,7 @@ def test_http_client_retries_malformed_json_before_schema_error() -> None:
     assert len(session.calls) == 2
 
 
-def test_http_client_retries_retryable_no_data_validation() -> None:
+def test_http_client_retries_retryable_no_data_validation(caplog) -> None:
     session = FakeSession([FakeResponse({}), FakeResponse({})])
     sleeps: list[float] = []
     client = TwseHttpClient(
@@ -276,15 +280,25 @@ def test_http_client_retries_retryable_no_data_validation() -> None:
     def reject_empty_payload(payload: object) -> None:
         raise TwseNoDataError("empty", retryable=True)
 
-    with pytest.raises(TwseNoDataError) as error:
-        client.get_json(
-            "https://example.test",
-            payload_validator=reject_empty_payload,
-        )
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(TwseNoDataError) as error:
+            client.get_json(
+                "https://example.test",
+                context="TWSE market data at 20251006",
+                payload_validator=reject_empty_payload,
+            )
 
     assert error.value.category is TwseErrorCategory.NO_DATA
     assert len(session.calls) == 2
     assert sleeps == [0.5]
+    retries = [
+        record
+        for record in caplog.records
+        if "retrying=true" in record.getMessage()
+    ]
+    assert len(retries) == 1
+    assert retries[0].levelno == logging.DEBUG
+    assert retries[0].status == "NO_DATA"
 
 
 def test_http_client_classifies_http_failure_as_network_error() -> None:

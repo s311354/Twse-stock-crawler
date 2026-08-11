@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import logging
+from collections.abc import Sequence
 from typing import Protocol
 
 import pandas as pd
@@ -12,6 +13,7 @@ from tabulate import tabulate
 from application.analysis_dataset import AnalysisDatasetBuilder
 from application.market_history import MarketHistoryInput
 from domain.features import FeatureFrame
+from domain.model_contracts import StrategyDecision
 from domain.models import ProfitRow
 from domain.models import SignalRow
 from domain.models import StockRows
@@ -100,12 +102,22 @@ class LegacyCrawlerFacade:
         stocktype: object,
         maxprofits: list[ProfitRow],
     ) -> None:
-        analysis_dataset = self.build_analysis_dataset(maxprofits)
-        stockprofittable = self.record_to_html_tablefmt(
-            analysis_dataset
+        self.smtp_strategy_email(
+            subject=subject,
+            ccreceiver=ccreceiver,
+            stocktype=stocktype,
+            decisions=self.build_strategy_decisions(maxprofits),
         )
+
+    def smtp_strategy_email(
+        self,
+        subject: str,
+        ccreceiver: str | None,
+        stocktype: object,
+        decisions: Sequence[StrategyDecision],
+    ) -> None:
         entryanalysis = self.build_entry_signal_analysis(
-            analysis_dataset
+            decisions
         )
         smtpemail = SMTPEmail(
             subject,
@@ -117,7 +129,7 @@ class LegacyCrawlerFacade:
             iso_scheduled_times=self.iso_scheduled_times,
             transactiondays=self.transactiondays,
             stocktype=stocktype,
-            stockprofittable=stockprofittable,
+            stockprofittable="",
             entryanalysis=entryanalysis,
         )
 
@@ -305,9 +317,25 @@ class LegacyCrawlerFacade:
         self,
         maxprofits: list[ProfitRow],
     ) -> pd.DataFrame:
-        return self._analysis_dataset_builder.build(
+        return self.project_strategy_decisions(
+            self.build_strategy_decisions(maxprofits)
+        )
+
+    def build_strategy_decisions(
+        self,
+        maxprofits: list[ProfitRow],
+    ) -> tuple[StrategyDecision, ...]:
+        return self._analysis_dataset_builder.build_decisions(
             self._market_history_input(),
             maxprofits,
+        )
+
+    def project_strategy_decisions(
+        self,
+        decisions: Sequence[StrategyDecision],
+    ) -> pd.DataFrame:
+        return self._analysis_dataset_builder.project_decisions(
+            decisions
         )
 
     def cal_max_profit_ratio_data(self) -> list[list[float]]:
@@ -325,12 +353,12 @@ class LegacyCrawlerFacade:
                 )
             )
             self.stocksprice.append(round(daily_stock[-1], 2))
-        logging.info("Max Profit Ratio: %s", ratios)
+        logging.debug("Max Profit Ratio: %s", ratios)
         return ratios
 
     @staticmethod
     def record_to_html_tablefmt(
-        analysis_dataset: pd.DataFrame,
+        decisions: Sequence[StrategyDecision],
     ) -> str:
         max_profit_columns = [
             "日期",
@@ -342,10 +370,12 @@ class LegacyCrawlerFacade:
             "利潤比",
         ]
         return tabulate(
-            analysis_dataset[max_profit_columns],
-            headers="keys",
+            [
+                [decision.value(column) for column in max_profit_columns]
+                for decision in decisions
+            ],
+            headers=max_profit_columns,
             tablefmt="html",
-            showindex=False,
         )
 
     @staticmethod
@@ -361,21 +391,31 @@ class LegacyCrawlerFacade:
 
     @staticmethod
     def build_entry_signal_analysis(
-        analysis_dataset: pd.DataFrame,
+        decisions: Sequence[StrategyDecision],
     ) -> str:
         renderer = RendererFactory.get_renderer(
-            "low_entry_score_v4_1"
+            "low_entry_score_v5"
         )
-        return renderer.render(analysis_dataset)
+        return renderer.render(decisions)
+
+    def record_strategy_decisions(
+        self,
+        file_name: str,
+        decisions: Sequence[StrategyDecision],
+    ) -> None:
+        self.csv_repository.write_analysis_dataset(
+            file_name,
+            self.project_strategy_decisions(decisions),
+        )
 
     def record_analysis_dataset(
         self,
         file_name: str,
         maxprofits: list[ProfitRow],
     ) -> None:
-        self.csv_repository.write_analysis_dataset(
+        self.record_strategy_decisions(
             file_name,
-            self.build_analysis_dataset(maxprofits),
+            self.build_strategy_decisions(maxprofits),
         )
 
     def record(

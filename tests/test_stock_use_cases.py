@@ -80,6 +80,8 @@ def test_fetch_market_data_preserves_closed_market_context(capsys) -> None:
             return False
 
     class MarketData:
+        include_reference = None
+
         def fetch(
             self,
             analysis_request,
@@ -87,7 +89,9 @@ def test_fetch_market_data_preserves_closed_market_context(capsys) -> None:
             calendar,
             market_date,
             is_trading_day,
+            include_reference,
         ):
+            self.include_reference = include_reference
             return AnalysisContext(
                 resource="history",
                 market_date=market_date,
@@ -98,13 +102,56 @@ def test_fetch_market_data_preserves_closed_market_context(capsys) -> None:
                 ),
             )
 
-    result = FetchMarketData(MarketData(), Calendar(), lambda: TODAY).execute(
+    market_data = MarketData()
+    result = FetchMarketData(market_data, Calendar(), lambda: TODAY).execute(
         request()
     )
 
     assert result.market_status is MarketStatus.CLOSED
     assert result.resource == "history"
+    assert market_data.include_reference is True
     assert "TWSE market status for 2026-07-20: CLOSED" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("analysis_time", "expected"),
+    [
+        (datetime.time(13, 44, 59), False),
+        (datetime.time(13, 45), True),
+    ],
+)
+def test_fetch_market_data_waits_for_daily_publication_buffer(
+    analysis_time,
+    expected,
+) -> None:
+    captured: list[bool] = []
+
+    class Calendar:
+        def is_trading_day(self, target_date):
+            return True
+
+    class MarketData:
+        def fetch(self, analysis_request, **kwargs):
+            captured.append(kwargs["include_reference"])
+            return AnalysisContext(
+                resource="history",
+                market_date=kwargs["market_date"],
+                market_status=MarketStatus.OPEN,
+            )
+
+    now = datetime.datetime.combine(
+        TODAY,
+        analysis_time,
+        tzinfo=datetime.timezone(datetime.timedelta(hours=8)),
+    )
+    FetchMarketData(
+        MarketData(),
+        Calendar(),
+        lambda: TODAY,
+        lambda: now,
+    ).execute(request())
+
+    assert captured == [expected]
 
 
 def test_optional_ports_are_not_called_when_disabled() -> None:

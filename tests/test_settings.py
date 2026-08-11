@@ -5,6 +5,7 @@ import pytest
 from config.settings import AppSettings
 from config.settings import SettingsError
 from infrastructure.bootstrap import build_stock_analysis_runtime
+from infrastructure.storage.market_history_cache import SQLiteMarketHistoryCache
 
 
 def test_app_settings_are_immutable_and_redact_smtp_password(tmp_path) -> None:
@@ -26,6 +27,9 @@ def test_app_settings_validate_and_normalize_all_runtime_groups(tmp_path) -> Non
             "TWSE_HTTP_TIMEOUT_SECONDS": "12.5",
             "TWSE_HTTP_MAX_ATTEMPTS": "4",
             "TWSE_ALLOW_INSECURE_SSL_FALLBACK": "false",
+            "TWSE_MARKET_HISTORY_CACHE_PATH": str(
+                tmp_path / "market_history.sqlite3"
+            ),
             "MOPS_CACHE_DIR": str(tmp_path / "mops"),
             "MOPS_SQLITE_CONNECT_ATTEMPTS": "5",
             "MOPS_HISTORY_YEARS": "6",
@@ -34,6 +38,7 @@ def test_app_settings_validate_and_normalize_all_runtime_groups(tmp_path) -> Non
             "TWSE_SMTP_PASSWORD": "app-password",
             "TWSE_SMTP_RECEIVERS": "one@example.com,two@example.com",
             "TWSE_SMTP_PORT": "2525",
+            "TWSE_RUNTIME_MODE": "debug",
             "TWSE_LOG_LEVEL": "debug",
         },
         mail_enabled=True,
@@ -42,6 +47,9 @@ def test_app_settings_validate_and_normalize_all_runtime_groups(tmp_path) -> Non
     assert settings.http_timeout_seconds == 12.5
     assert settings.http_max_attempts == 4
     assert settings.allow_insecure_ssl_fallback is False
+    assert settings.market_history_cache_path == (
+        tmp_path / "market_history.sqlite3"
+    )
     assert settings.mops_sqlite_connect_attempts == 5
     assert settings.mops_history_years == 6
     assert settings.account_equity == 2_500_000
@@ -51,8 +59,36 @@ def test_app_settings_validate_and_normalize_all_runtime_groups(tmp_path) -> Non
     )
     assert settings.smtp_server_host == "smtp.gmail.com"
     assert settings.smtp_port == 2525
+    assert settings.runtime_mode == "DEBUG"
     assert settings.log_level == "DEBUG"
+    assert settings.effective_log_level == "DEBUG"
     assert settings.mops_cache_dir.is_dir()
+
+
+def test_release_mode_suppresses_debug_even_with_legacy_debug_level(tmp_path) -> None:
+    settings = AppSettings.from_env(
+        {
+            "MOPS_CACHE_DIR": str(tmp_path),
+            "TWSE_RUNTIME_MODE": "release",
+            "TWSE_LOG_LEVEL": "debug",
+        }
+    )
+
+    assert settings.runtime_mode == "RELEASE"
+    assert settings.effective_log_level == "INFO"
+
+
+def test_runtime_mode_argument_overrides_environment(tmp_path) -> None:
+    settings = AppSettings.from_env(
+        {
+            "MOPS_CACHE_DIR": str(tmp_path),
+            "TWSE_RUNTIME_MODE": "release",
+        },
+        runtime_mode="debug",
+    )
+
+    assert settings.runtime_mode == "DEBUG"
+    assert settings.effective_log_level == "DEBUG"
 
 
 @pytest.mark.parametrize(
@@ -63,6 +99,7 @@ def test_app_settings_validate_and_normalize_all_runtime_groups(tmp_path) -> Non
         ({"TWSE_ALLOW_INSECURE_SSL_FALLBACK": "maybe"}, "must be one of"),
         ({"TWSE_ACCOUNT_EQUITY": "-1"}, "must be greater than zero"),
         ({"MOPS_HISTORY_YEARS": "2"}, "must be at least 3"),
+        ({"TWSE_RUNTIME_MODE": "verbose"}, "must be release or debug"),
     ],
 )
 def test_app_settings_reject_invalid_values(
@@ -108,6 +145,9 @@ def test_composition_uses_the_validated_http_and_mops_settings(tmp_path) -> None
             "TWSE_HTTP_TIMEOUT_SECONDS": "7",
             "TWSE_HTTP_MAX_ATTEMPTS": "3",
             "TWSE_ALLOW_INSECURE_SSL_FALLBACK": "0",
+            "TWSE_MARKET_HISTORY_CACHE_PATH": str(
+                tmp_path / "market_history.sqlite3"
+            ),
         }
     )
 
@@ -123,3 +163,25 @@ def test_composition_uses_the_validated_http_and_mops_settings(tmp_path) -> None
         runtime.fundamental_service.repository.root
         == settings.mops_cache_dir
     )
+    crawler = runtime.crawler_factory(1)
+    assert isinstance(crawler.market_history_cache, SQLiteMarketHistoryCache)
+    assert (
+        crawler.market_history_cache.database_path
+        == settings.market_history_cache_path
+    )
+
+
+def test_market_history_cache_path_must_be_writable(tmp_path) -> None:
+    invalid_path = tmp_path / "cache-directory"
+    invalid_path.mkdir()
+
+    with pytest.raises(
+        SettingsError,
+        match="TWSE_MARKET_HISTORY_CACHE_PATH is not writable",
+    ):
+        AppSettings.from_env(
+            {
+                "MOPS_CACHE_DIR": str(tmp_path / "mops"),
+                "TWSE_MARKET_HISTORY_CACHE_PATH": str(invalid_path),
+            }
+        )

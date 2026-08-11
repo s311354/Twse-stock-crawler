@@ -24,8 +24,6 @@ class FilingRefreshPlan:
 class FilingRefreshPlanner:
     """Build a five-year seed and minimize subsequent MOPS downloads."""
 
-    DAILY_VERIFY_PERIODS = 2
-
     def plan(
         self,
         candidates: list[FilingCandidate],
@@ -39,10 +37,6 @@ class FilingRefreshPlanner:
 
         selected = self.select_required_filings(candidates, history_years)
         latest_cached = self._latest_by_period(cached_filings)
-        recent_periods = {
-            self._period(candidate)
-            for candidate in selected[-self.DAILY_VERIFY_PERIODS :]
-        }
         corrected = corrected_periods or set()
         reuse: list[FilingRecord] = []
         download: list[FilingCandidate] = []
@@ -53,7 +47,7 @@ class FilingRefreshPlanner:
             cached = latest_cached.get(period)
             if cached is None:
                 download.append(candidate)
-            elif period in recent_periods or period in corrected:
+            elif period in corrected:
                 verify_revision.append(candidate)
             else:
                 reuse.append(cached)
@@ -80,6 +74,23 @@ class FilingRefreshPlanner:
         return last_refresh.astimezone(taipei).strftime("%Y-%m") != signal_time.astimezone(
             taipei
         ).strftime("%Y-%m")
+
+    @staticmethod
+    def is_daily_revision_check_due(
+        last_check_epoch: int | None,
+        signal_time: dt.datetime,
+    ) -> bool:
+        """Return true at most once per Taipei calendar day."""
+
+        if signal_time.tzinfo is None:
+            raise ValueError("signal_time must be timezone-aware")
+        if last_check_epoch is None:
+            return True
+        taipei = dt.timezone(dt.timedelta(hours=8))
+        last_check = dt.datetime.fromtimestamp(last_check_epoch, dt.timezone.utc)
+        return last_check.astimezone(taipei).date() != signal_time.astimezone(
+            taipei
+        ).date()
 
     @staticmethod
     def select_required_filings(

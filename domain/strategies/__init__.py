@@ -10,6 +10,12 @@ from domain.strategies.low_entry_score_v4 import LowEntryScoreV4Strategy
 from domain.strategies.low_entry_score_v4_1 import LowEntryProfile
 from domain.strategies.low_entry_score_v4_1 import LowEntryScoreV41Config
 from domain.strategies.low_entry_score_v4_1 import LowEntryScoreV41Strategy
+from domain.strategies.low_entry_score_v5 import FallingKnifeState
+from domain.strategies.low_entry_score_v5 import LowEntryV5DecisionPipeline
+from domain.strategies.low_entry_score_v5 import LowEntryV5PipelineComponents
+from domain.strategies.low_entry_score_v5 import LowEntryScoreV5Config
+from domain.strategies.low_entry_score_v5 import LowEntryScoreV5Strategy
+from domain.strategies.low_entry_score_v5 import ValuationStatus
 
 __all__ = [
     "ExpectedReturnExitStrategy",
@@ -22,4 +28,10 @@ __all__ = [
     "LowEntryProfile",
     "LowEntryScoreV41Config",
     "LowEntryScoreV41Strategy",
+    "FallingKnifeState",
+    "LowEntryV5DecisionPipeline",
+    "LowEntryV5PipelineComponents",
+    "LowEntryScoreV5Config",
+    "LowEntryScoreV5Strategy",
+    "ValuationStatus",
 ]

@@ -9,6 +9,7 @@ from typing import Any
 
 from domain.models import ProfitRow
 from domain.models import StockSelector
+from domain.model_contracts import StrategyDecision
 
 
 class MarketStatus(str, enum.Enum):
@@ -45,3 +46,4 @@ class AnalysisContext:
 @dataclass(frozen=True)
 class StrategyEvaluation:
     maxprofits: list[ProfitRow]
+    decisions: tuple[StrategyDecision, ...] = ()

@@ -25,6 +25,7 @@ from infrastructure.fundamentals.mops_client import MopsClient
 from infrastructure.fundamentals.mops_repository import MopsRepository
 from infrastructure.fundamentals.twse_financial_batch import TwseFinancialBatchClient
 from infrastructure.observability import StructuredRunObserver
+from infrastructure.storage.market_history_cache import SQLiteMarketHistoryCache
 from infrastructure.stock_analysis_adapters import CrawlerFundamentalAdapter
 from infrastructure.stock_analysis_adapters import CrawlerLineChartAdapter
 from infrastructure.stock_analysis_adapters import CrawlerMarketDataAdapter
@@ -79,6 +80,7 @@ def build_stock_analysis_runtime(
         "runtime_configuration_validated",
         source="CONFIG",
         status="SUCCESS",
+        runtime_mode=effective_settings.runtime_mode,
         http_timeout_seconds=effective_settings.http_timeout_seconds,
         http_max_attempts=effective_settings.http_max_attempts,
         ssl_fallback_enabled=(
@@ -114,10 +116,15 @@ def build_stock_analysis_runtime(
     if crawler_factory is None:
         from stockanalysis import TwseCrawker
 
+        market_history_cache = SQLiteMarketHistoryCache(
+            effective_settings.market_history_cache_path
+        )
+
         effective_crawler_factory = lambda size: TwseCrawker(
             size,
             http_client=shared_http_client,
             app_settings=effective_settings,
+            market_history_cache=market_history_cache,
         )
     else:
         effective_crawler_factory = crawler_factory
@@ -175,6 +182,7 @@ def build_stock_analysis_runtime(
             market_data_adapter,
             effective_calendar,
             effective_today_provider,
+            effective_now_provider,
         ),
         refresh_fundamentals=RefreshFundamentals(
             fundamental_adapter,

@@ -20,6 +20,10 @@ class DataSourceError(RuntimeError):
         self.retryable = retryable
 
 
+class MarketClosedError(DataSourceError):
+    category = DataErrorCategory.MARKET_CLOSED
+
+
 class NoDataError(DataSourceError):
     category = DataErrorCategory.NO_DATA
 

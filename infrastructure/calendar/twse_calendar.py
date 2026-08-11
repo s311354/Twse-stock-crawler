@@ -1,4 +1,4 @@
-"""TWSE OpenAPI-backed trading calendar."""
+"""Year-aware trading calendar backed by the official TWSE schedule."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from infrastructure.crawler.twse_http_client import TwseNetworkError
 from infrastructure.crawler.twse_http_client import TwseSchemaChangedError
 
 
-TWSE_CALENDAR_URL = "https://openapi.twse.com.tw/v1/holidaySchedule/holidaySchedule"
+TWSE_CALENDAR_URL = "https://www.twse.com.tw/holidaySchedule/holidaySchedule"
 TAIPEI_TIMEZONE = ZoneInfo("Asia/Taipei")
 REGULAR_MARKET_OPEN = datetime.time(9, 0)
 REGULAR_MARKET_CLOSE = datetime.time(13, 30)
@@ -60,8 +60,9 @@ class TwseCalendar:
     ) -> None:
         self._fetcher = fetcher
         self._http_client = http_client or TwseHttpClient()
-        self._schedule: dict[datetime.date, bool] | None = None
+        self._schedule: dict[datetime.date, bool] = {}
         self._covered_years: set[int] = set()
+        self._legacy_schedule_loaded = False
 
     def is_trading_day(self, target_date: datetime.date) -> bool:
         """Return whether the date trades, or raise when it cannot be known."""
@@ -71,13 +72,13 @@ class TwseCalendar:
         if not isinstance(target_date, datetime.date):
             raise TypeError("target_date must be a datetime.date")
 
-        self._ensure_schedule()
+        self._ensure_year_schedule(target_date.year)
         if target_date.year not in self._covered_years:
             raise TwseCalendarUnavailableError(
                 f"TWSE calendar does not cover year {target_date.year}"
             )
 
-        scheduled_state = self._schedule.get(target_date) if self._schedule is not None else None
+        scheduled_state = self._schedule.get(target_date)
         if scheduled_state is not None:
             return scheduled_state
 
@@ -108,34 +109,56 @@ class TwseCalendar:
 
         return self.is_trading_day(local_datetime.date())
 
-    def _ensure_schedule(self) -> None:
-        if self._schedule is not None:
+    def _ensure_year_schedule(self, year: int) -> None:
+        if year in self._covered_years:
             return
 
-        payload = self._fetch_json()
-        self._schedule, self._covered_years = self._parse_schedule(payload)
+        if self._fetcher is not None:
+            if not self._legacy_schedule_loaded:
+                payload = self._fetch_json()
+                schedule, covered_years = self._parse_schedule(payload)
+                self._schedule.update(schedule)
+                self._covered_years.update(covered_years)
+                self._legacy_schedule_loaded = True
+        else:
+            payload = self._fetch_year_json(year)
+            schedule, covered_years = self._parse_schedule(payload)
+            if year not in covered_years:
+                raise TwseCalendarUnavailableError(
+                    f"TWSE calendar response does not cover requested year {year}"
+                )
+            self._schedule.update(schedule)
+            self._covered_years.update(covered_years)
 
     def _fetch_json(self) -> object:
-        if self._fetcher is not None:
-            try:
-                return self._fetcher()
-            except Exception as error:
-                raise TwseCalendarUnavailableError(
-                    "TWSE calendar fetcher failed"
-                ) from error
+        if self._fetcher is None:
+            raise TwseCalendarUnavailableError("TWSE calendar fetcher is not configured")
+        try:
+            return self._fetcher()
+        except Exception as error:
+            raise TwseCalendarUnavailableError(
+                "TWSE calendar fetcher failed"
+            ) from error
+
+    def _fetch_year_json(self, year: int) -> object:
+        """Fetch one Gregorian year's official schedule through the shared client."""
 
         try:
             return self._http_client.get_json(
                 TWSE_CALENDAR_URL,
-                context="TWSE calendar",
+                params={
+                    "response": "json",
+                    "date": f"{year:04d}0101",
+                },
+                context=f"TWSE calendar {year}",
             ).payload
         except TwseNetworkError as error:
             raise TwseCalendarUnavailableError(
-                f"TWSE calendar API unavailable: {error}"
+                f"TWSE calendar API unavailable for {year}: {error}"
             ) from error
         except TwseSchemaChangedError as error:
             raise TwseCalendarSchemaError(
-                f"TWSE calendar API schema changed: {error}"
+                f"TWSE calendar API schema changed for {year}: {error}"
             ) from error
 
     @classmethod
@@ -143,7 +166,20 @@ class TwseCalendar:
         cls,
         payload: object,
     ) -> tuple[dict[datetime.date, bool], set[int]]:
-        if not isinstance(payload, list) or not payload:
+        if isinstance(payload, list):
+            return cls._parse_openapi_schedule(payload)
+        if isinstance(payload, dict):
+            return cls._parse_historical_schedule(payload)
+        raise TwseCalendarSchemaError(
+            "TWSE calendar payload must be a list or object"
+        )
+
+    @classmethod
+    def _parse_openapi_schedule(
+        cls,
+        payload: list[object],
+    ) -> tuple[dict[datetime.date, bool], set[int]]:
+        if not payload:
             raise TwseCalendarSchemaError("TWSE calendar payload must be a non-empty list")
 
         schedule: dict[datetime.date, bool] = {}
@@ -180,6 +216,69 @@ class TwseCalendar:
 
         return schedule, covered_years
 
+    @classmethod
+    def _parse_historical_schedule(
+        cls,
+        payload: dict[object, object],
+    ) -> tuple[dict[datetime.date, bool], set[int]]:
+        stat = payload.get("stat")
+        if not isinstance(stat, str) or stat.lower() != "ok":
+            raise TwseCalendarSchemaError(
+                f"TWSE historical calendar returned invalid status: {stat!r}"
+            )
+
+        fields = payload.get("fields")
+        rows = payload.get("data")
+        if not isinstance(fields, list) or not all(
+            isinstance(field, str) for field in fields
+        ):
+            raise TwseCalendarSchemaError(
+                "TWSE historical calendar fields must be a string list"
+            )
+        if not isinstance(rows, list) or not rows:
+            raise TwseCalendarSchemaError(
+                "TWSE historical calendar data must be a non-empty list"
+            )
+
+        required_fields = ("日期", "名稱", "說明")
+        missing_fields = [field for field in required_fields if field not in fields]
+        if missing_fields:
+            raise TwseCalendarSchemaError(
+                f"TWSE historical calendar is missing fields: {missing_fields}"
+            )
+        date_index, name_index, description_index = (
+            fields.index(field) for field in required_fields
+        )
+        minimum_width = max(date_index, name_index, description_index) + 1
+
+        schedule: dict[datetime.date, bool] = {}
+        covered_years: set[int] = set()
+        for index, row in enumerate(rows):
+            if not isinstance(row, list) or len(row) < minimum_width:
+                raise TwseCalendarSchemaError(
+                    f"TWSE historical calendar row {index} has invalid width"
+                )
+
+            date_value = row[date_index]
+            name = row[name_index]
+            description = row[description_index]
+            if not all(isinstance(value, str) for value in (date_value, name, description)):
+                raise TwseCalendarSchemaError(
+                    f"TWSE historical calendar row {index} has invalid values"
+                )
+
+            target_date = cls._parse_iso_date(date_value)
+            is_open = cls._parse_open_state(name, description)
+            previous = schedule.get(target_date)
+            if previous is not None and previous != is_open:
+                raise TwseCalendarSchemaError(
+                    f"TWSE calendar has conflicting states for {target_date.isoformat()}"
+                )
+            schedule[target_date] = is_open
+            covered_years.add(target_date.year)
+
+        return schedule, covered_years
+
     @staticmethod
     def _parse_roc_date(value: str) -> datetime.date:
         normalized = value.strip()
@@ -194,6 +293,15 @@ class TwseCalendar:
             )
         except ValueError as error:
             raise TwseCalendarSchemaError(f"Invalid TWSE ROC date: {value!r}") from error
+
+    @staticmethod
+    def _parse_iso_date(value: str) -> datetime.date:
+        try:
+            return datetime.date.fromisoformat(value.strip())
+        except ValueError as error:
+            raise TwseCalendarSchemaError(
+                f"Invalid TWSE Gregorian date: {value!r}"
+            ) from error
 
     @classmethod
     def _parse_open_state(cls, name: str, description: str) -> bool:

@@ -9,9 +9,11 @@ from collections.abc import Callable
 from typing import Any, NamedTuple, TypeAlias
 from config.settings import AppSettings
 from infrastructure.crawler.twse_http_client import TwseHttpClient
+from infrastructure.crawler.twse_http_client import TwseMarketClosedError
 from infrastructure.crawler.twse_http_client import TwseNetworkError
 from infrastructure.crawler.twse_http_client import TwseNoDataError
 from infrastructure.crawler.twse_http_client import TwseSchemaChangedError
+from infrastructure.observability import structured_extra
 from textmewhenitsdone import TextMeWhenItsDone
 from twse.parser import clean_cell, parse_price
 
@@ -146,6 +148,8 @@ class SMTPEmail(object):
 
 class TwStockCrawler(object):
     TAIEX_INDEX_NAME = "發行量加權股價指數"
+    FULL_MARKET_TYPE = "ALLBUT0999"
+    NO_DATA_MARKERS = ("沒有符合條件", "查無資料", "無資料")
     MARKET_DATA_FALLBACK_URL = (
         "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
     )
@@ -175,17 +179,75 @@ class TwStockCrawler(object):
                 ).payload
             except TwseNetworkError as error:
                 if endpoint_index == len(endpoints) - 1:
+                    logging.error(
+                        "TWSE status=NETWORK_ERROR date=%s endpoint=%s "
+                        "final_failure=true detail=%s",
+                        date_time,
+                        endpoint,
+                        error,
+                        extra=structured_extra(
+                            trade_date=date_time,
+                            source="TWSE",
+                            status="NETWORK_ERROR",
+                        ),
+                    )
                     raise
-                logging.warning(
+                logging.debug(
                     "TWSE status=NETWORK_ERROR date=%s endpoint=%s "
                     "failover_endpoint=%s detail=%s",
                     date_time,
                     endpoint,
                     endpoints[endpoint_index + 1],
                     error,
+                    extra=structured_extra(
+                        trade_date=date_time,
+                        source="TWSE",
+                        status="ENDPOINT_FAILOVER",
+                    ),
                 )
 
         raise AssertionError("TWSE market-data endpoint list cannot be empty")
+
+    def _raise_if_unscheduled_market_closed(self, date_time: str) -> None:
+        """Confirm an empty sector table against the full TWSE market."""
+
+        query_params = {
+            "date": date_time,
+            "response": "json",
+            "type": self.FULL_MARKET_TYPE,
+            "_": str(round(time.time() * 1000) - 500),
+        }
+
+        def validate_full_market(payload: object) -> None:
+            if not isinstance(payload, dict):
+                raise TwseSchemaChangedError(
+                    "TWSE full-market data at {} is not an object".format(
+                        date_time
+                    )
+                )
+            status = payload.get("stat")
+            if isinstance(status, str) and any(
+                marker in status for marker in self.NO_DATA_MARKERS
+            ):
+                raise TwseMarketClosedError(
+                    "TWSE full market at {} explicitly returned no data".format(
+                        date_time
+                    )
+                )
+            try:
+                self._extract_stock_rows(payload, date_time)
+            except TwseNoDataError as error:
+                raise TwseMarketClosedError(
+                    "TWSE full market at {} contains no trading rows".format(
+                        date_time
+                    )
+                ) from error
+
+        self._request_stocktype_data(
+            query_params=query_params,
+            date_time=date_time,
+            payload_validator=validate_full_market,
+        )
 
 
     def _extract_stock_rows(self, content: JsonPayload, date_time: str) -> StockRows:
@@ -302,14 +364,26 @@ class TwStockCrawler(object):
                 payload_validator=validate_stock_payload,
             )
         except TwseNoDataError as error:
-            logging.warning(
+            if str(stocktype) == self.FULL_MARKET_TYPE:
+                raise TwseMarketClosedError(
+                    "TWSE full market at {} contains no trading rows".format(
+                        date_time
+                    )
+                ) from error
+            self._raise_if_unscheduled_market_closed(date_time)
+            logging.debug(
                 "TWSE status=NO_DATA date=%s detail=%s",
                 date_time,
                 error,
+                extra={
+                    "trade_date": date_time,
+                    "source": "TWSE",
+                    "status": "NO_DATA",
+                },
             )
             return []
 
-        print(date_time)
+        logging.debug("TWSE market data date=%s", date_time)
         if not isinstance(content, dict):
             raise TwseSchemaChangedError(
                 "TWSE market data at {} is not an object".format(date_time)
@@ -317,16 +391,26 @@ class TwStockCrawler(object):
         try:
             row = self._extract_stock_rows(content=content, date_time=date_time)
         except TwseNoDataError as error:
-            logging.warning(
+            logging.debug(
                 "TWSE status=NO_DATA date=%s keys=%s stat=%s detail=%s",
                 date_time,
                 self._get_content_keys(content),
                 content.get('stat'),
                 error,
+                extra={
+                    "trade_date": date_time,
+                    "source": "TWSE",
+                    "status": "NO_DATA",
+                },
             )
             return []
 
-        logging.info('Date: {}, Stock number: {}, Stock price: {}'.format(date_time, row[0][0], row[0][5]))
+        logging.debug(
+            "TWSE sample row date=%s stock_number=%s open=%s",
+            date_time,
+            row[0][0],
+            row[0][5],
+        )
         return row
 
 
@@ -353,10 +437,15 @@ class TwStockCrawler(object):
                 payload_validator=validate_taiex_payload,
             )
         except TwseNoDataError as error:
-            logging.warning(
+            logging.debug(
                 "TWSE status=NO_DATA date=%s dataset=TAIEX detail=%s",
                 date_time,
                 error,
+                extra={
+                    "trade_date": date_time,
+                    "source": "TWSE",
+                    "status": "NO_DATA",
+                },
             )
             return None
 
@@ -368,10 +457,15 @@ class TwStockCrawler(object):
         try:
             return self._extract_taiex_close(content=content, date_time=date_time)
         except TwseNoDataError as error:
-            logging.warning(
+            logging.debug(
                 "TWSE status=NO_DATA date=%s dataset=TAIEX detail=%s",
                 date_time,
                 error,
+                extra={
+                    "trade_date": date_time,
+                    "source": "TWSE",
+                    "status": "NO_DATA",
+                },
             )
             return None
 

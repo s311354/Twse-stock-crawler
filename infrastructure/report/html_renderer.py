@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import html
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import pandas as pd
 from tabulate import tabulate
+
+from domain.model_contracts import StrategyDecision
 
 
 @dataclass(frozen=True)
@@ -21,7 +24,10 @@ class HtmlRenderer(ABC):
     """Base renderer for strategy output embedded in email reports."""
 
     @abstractmethod
-    def render(self, result: pd.DataFrame) -> str:
+    def render(
+        self,
+        decisions: Sequence[StrategyDecision],
+    ) -> str:
         pass
 
 
@@ -43,38 +49,56 @@ class LowEntryHtmlRenderer(HtmlRenderer):
             "風控採 ATR14：策略停損 = 收盤 - 2*ATR14；策略停利 = 收盤 + 3*ATR14。"
         )
 
-    def render(self, result: pd.DataFrame) -> str:
-        rows = []
+    def render(
+        self,
+        decisions: Sequence[StrategyDecision],
+    ) -> str:
+        rows: list[list[str]] = []
 
-        for _, stock in result.iterrows():
+        for decision in decisions:
+            if not isinstance(decision, StrategyDecision):
+                raise TypeError(
+                    "HtmlRenderer accepts StrategyDecision objects only"
+                )
             row = [
-                "{} {}".format(html.escape(str(stock["證券代號"])), html.escape(str(stock["證券名稱"]))),
-                self._format_value(stock["收盤"], 2),
+                "{} {}".format(
+                    html.escape(str(decision.value("證券代號", "N/A"))),
+                    html.escape(str(decision.value("證券名稱", "N/A"))),
+                ),
+                self._format_value(decision.value("收盤"), 2),
             ]
-            row.extend(self._format_value(stock.get(metric.column), metric.precision) for metric in self.metrics)
+            row.extend(
+                self._format_value(
+                    decision.value(metric.column),
+                    metric.precision,
+                )
+                for metric in self.metrics
+            )
             row.extend([
-                html.escape(str(stock.get("低點決策", "N/A"))),
-                html.escape(str(stock.get("EREM 決策訊號", "N/A"))),
-                self._format_low_entry_reason(stock.get("低點理由", "N/A")),
-                html.escape(str(stock.get("EREM 理由", "N/A"))),
+                html.escape(str(decision.value("低點決策", "N/A"))),
+                html.escape(str(decision.value("EREM 決策訊號", "N/A"))),
+                self._format_low_entry_reason(
+                    decision.value("低點理由", "N/A")
+                ),
+                html.escape(str(decision.value("EREM 理由", "N/A"))),
             ])
             rows.append(row)
 
-        df_entry = pd.DataFrame(
-            rows,
-            columns=["股票", "現價"] + [metric.label for metric in self.metrics] + [
+        headers = (
+            ["股票", "現價"]
+            + [metric.label for metric in self.metrics]
+            + [
                 "低點進場判斷決策",
                 "預期報酬出場判斷決策",
                 "低點理由",
                 "EREM理由",
-            ],
+            ]
         )
 
         table_html = tabulate(
-            df_entry,
-            headers="keys",
+            rows,
+            headers=headers,
             tablefmt="html",
-            showindex=False,
         ).replace(
             self._REASON_SECTION_BREAK,
             '<br><span style="display:inline-block;margin-top:4px">&#8226; </span>',
@@ -109,6 +133,11 @@ class LowEntryHtmlRenderer(HtmlRenderer):
         formatted = html.escape(str(value))
         section_labels = (
             "分數",
+            "Valuation",
+            "Penalty",
+            "Falling",
+            "Panic/Reversal",
+            "Required",
             "Profile",
             "ProvisionalEligible",
             "Veto",
@@ -348,6 +377,468 @@ class LowEntryV41Renderer(LowEntryHtmlRenderer):
         )
 
 
+class LowEntryV5Renderer(LowEntryHtmlRenderer):
+    _ENTRY_DECISIONS = frozenset({"BUY", "BUY_SMALL"})
+
+    def __init__(self) -> None:
+        super().__init__(
+            title=(
+                "低點進場判斷（Low-Entry Model v5）"
+                "+ 預期報酬出場判斷（EREM v3）"
+            ),
+            description=(
+                '<section data-section="model-guide" style="margin:10px 0">'
+                '<div style="border-left:5px solid #176b4d;background:#f3faf7;'
+                'padding:10px 12px;margin-bottom:8px">'
+                '<strong>Low-Entry Model v5｜進場模式</strong>'
+                '<span style="color:#52665f">（Quality-First Panic Reversal）</span><br>'
+                "品質與估值先過關，再等待恐慌賣壓後的反轉確認。"
+                "只有 Trigger、Risk、流動性與市場資料 Gate 全部通過，"
+                "才產生 BUY／BUY_SMALL；高分不能抵銷 Hard Reject 或 Falling-Knife Veto。"
+                "</div>"
+                '<div style="border-left:5px solid #356a9a;background:#f3f7fb;'
+                'padding:10px 12px">'
+                '<strong>EREM v3｜出場模式</strong><br>'
+                "評估趨勢、動能、波動、籌碼與剩餘報酬，目的是讓強勢部位續抱、"
+                "避免因正常回檔過度交易。85–100 STRONG HOLD；70–84 HOLD；"
+                "55–69 HOLD；40–54 REDUCE 25%；低於 40 EXIT。"
+                "</div></section>"
+            ),
+            metrics=[],
+            decision_note=(
+                '<div style="margin:8px 0;padding:9px 11px;background:#fff8e8;'
+                'border:1px solid #ead7aa">'
+                "<strong>執行重點</strong>：LES &lt;60 AVOID；60–69 WATCH；"
+                "70 起 ARMED；正式 BUY 依 Quality 狀態要求 75 或 80 分，且 RR≥1.7。"
+                "訊號於收盤確認，下一交易日突破訊號日最高價才考慮成交；"
+                "若風控失效則取消，不追價。"
+                "</div>"
+            ),
+        )
+
+    def render(
+        self,
+        decisions: Sequence[StrategyDecision],
+    ) -> str:
+        for decision in decisions:
+            if not isinstance(decision, StrategyDecision):
+                raise TypeError(
+                    "HtmlRenderer accepts StrategyDecision objects only"
+                )
+
+        summary_rows = "".join(
+            self._render_summary_row(decision) for decision in decisions
+        )
+        entry_summary = self._render_entry_decision_summary(decisions)
+        detail_cards = "".join(
+            self._render_detail_card(decision) for decision in decisions
+        )
+        return """
+        <h3>{}</h3>
+        <div>{}</div>
+        {}
+        <div>{}</div>
+        <h4 style="margin:16px 0 6px">決策總覽</h4>
+        <div style="overflow-x:auto">
+          <table style="border-collapse:collapse;width:100%;font-size:13px" border="1" cellpadding="6">
+            <thead style="background:#eaf2ef">
+              <tr>
+                <th>股票</th><th>現價</th><th>品質</th><th>估值</th>
+                <th>反轉狀態</th><th>LES v5</th><th>Trigger／Risk</th>
+                <th>部位與價格</th><th>進場決策</th><th>EREM 決策</th>
+              </tr>
+            </thead>
+            <tbody>{}</tbody>
+          </table>
+        </div>
+        <h4 style="margin:18px 0 6px">個股依據與 QA</h4>
+        <div>{}</div>
+        """.format(
+            html.escape(self.title),
+            self.description,
+            entry_summary,
+            self.decision_note,
+            summary_rows,
+            detail_cards,
+        )
+
+    def _render_entry_decision_summary(
+        self,
+        decisions: Sequence[StrategyDecision],
+    ) -> str:
+        selected = sorted(
+            (
+                decision
+                for decision in decisions
+                if self._entry_decision(decision) in self._ENTRY_DECISIONS
+            ),
+            key=lambda decision: (
+                0 if self._entry_decision(decision) == "BUY" else 1,
+                str(decision.value("證券代號", "")),
+            ),
+        )
+        if not selected:
+            return """
+            <section data-section="entry-decisions" style="margin:14px 0;padding:12px;border:1px solid #d7dfdc;border-left:5px solid #6f7f79;background:#f7f9f8">
+              <h4 style="margin:0 0 6px;color:#174f43">進場決策彙整（BUY / BUY_SMALL）</h4>
+              <div>本次沒有 BUY / BUY_SMALL 可執行訊號。</div>
+            </section>
+            """
+
+        buy_count = sum(
+            self._entry_decision(decision) == "BUY"
+            for decision in selected
+        )
+        buy_small_count = len(selected) - buy_count
+        rows = "".join(
+            self._render_entry_decision_row(decision)
+            for decision in selected
+        )
+        return """
+        <section data-section="entry-decisions" style="margin:14px 0;padding:12px;border:1px solid #b9d8cc;border-left:5px solid #176b4d;background:#f3faf7">
+          <h4 style="margin:0 0 5px;color:#174f43">進場決策彙整（BUY / BUY_SMALL）</h4>
+          <div style="margin-bottom:8px;color:#38554b">
+            共 <strong>{}</strong> 檔｜BUY <strong>{}</strong>｜BUY_SMALL <strong>{}</strong>；僅列正式進場訊號。
+          </div>
+          <div style="overflow-x:auto">
+            <table style="border-collapse:collapse;width:100%;font-size:13px;background:#fff" border="1" cellpadding="6">
+              <thead style="background:#dcefe7">
+                <tr>
+                  <th>股票</th><th>進場決策</th><th>執行價格</th>
+                  <th>部位</th><th>風控</th><th>訊號確認</th>
+                </tr>
+              </thead>
+              <tbody>{}</tbody>
+            </table>
+          </div>
+          <div style="margin-top:7px;font-size:12px;color:#52665f">
+            BUY_SMALL 為縮小部位訊號；實際成交仍依 Entry Rule 與下一交易日價格確認。
+          </div>
+        </section>
+        """.format(len(selected), buy_count, buy_small_count, rows)
+
+    def _render_entry_decision_row(
+        self,
+        decision: StrategyDecision,
+    ) -> str:
+        stock = "<strong>{}</strong><br><small>{}</small>".format(
+            self._safe_text(decision.value("證券代號")),
+            self._safe_text(decision.value("證券名稱")),
+        )
+        prices = "現價 {}<br><strong>觸發 {}</strong><br><small>{}</small>".format(
+            self._format_money(decision.value("收盤")),
+            self._format_money(decision.value("Entry Candidate")),
+            self._safe_text(decision.value("Entry Rule")),
+        )
+        position = "{}<br><small>{} 股</small>".format(
+            self._format_percent(decision.value("Position Fraction")),
+            self._format_shares(decision.value("建議股數")),
+        )
+        risk = "停損 {}<br>目標 {}<br><small>RR {}</small>".format(
+            self._format_money(decision.value("策略停損")),
+            self._format_money(decision.value("策略停利")),
+            self._format_value(decision.value("RewardRisk"), 2),
+        )
+        confirmation = (
+            "LES {} / 門檻 {}<br>Trigger {} / {}<br><small>EREM {}</small>"
+        ).format(
+            self._format_value(decision.value("低點分數"), 0),
+            self._format_value(
+                decision.value("Required Technical Score"),
+                0,
+            ),
+            self._format_flag(decision.value("LES v5 Trigger")),
+            self._badge(decision.value("Risk Gate")),
+            self._safe_text(decision.value("EREM 決策訊號")),
+        )
+        cells = (
+            stock,
+            self._entry_decision_badge(self._entry_decision(decision)),
+            prices,
+            position,
+            risk,
+            confirmation,
+        )
+        return "<tr>{}</tr>".format(
+            "".join(
+                '<td style="vertical-align:top">{}</td>'.format(cell)
+                for cell in cells
+            )
+        )
+
+    @staticmethod
+    def _entry_decision(decision: StrategyDecision) -> str:
+        return str(decision.value("低點決策", "")).strip().upper()
+
+    @staticmethod
+    def _entry_decision_badge(decision: str) -> str:
+        colors = (
+            ("#176b4d", "#dff3e9")
+            if decision == "BUY"
+            else ("#8a5700", "#fff0c2")
+        )
+        return (
+            '<span style="display:inline-block;padding:3px 8px;'
+            'border-radius:10px;font-weight:700;color:{};background:{}">{}</span>'
+        ).format(colors[0], colors[1], html.escape(decision))
+
+    def _format_shares(self, value: object) -> str:
+        if self._is_missing(value):
+            return "N/A"
+        try:
+            return "{:,.0f}".format(float(value))
+        except (TypeError, ValueError):
+            return html.escape(str(value))
+
+    def _render_summary_row(self, decision: StrategyDecision) -> str:
+        stock = "{} {}".format(
+            html.escape(str(decision.value("證券代號", "N/A"))),
+            html.escape(str(decision.value("證券名稱", "N/A"))),
+        )
+        quality = "{}<br><small>QS {}</small>".format(
+            self._badge(decision.value("LES v5 Final Quality Status")),
+            self._format_value(
+                decision.value("LES v5 Final Quality Score"),
+                0,
+            ),
+        )
+        valuation = "{}<br><small>Base FV {}<br>CAGR {}</small>".format(
+            self._badge(decision.value("Valuation Gate")),
+            self._format_money(decision.value("Base Case Fair Value")),
+            self._format_percent(decision.value("Base Case Expected CAGR")),
+        )
+        reversal = "{}<br><small>Panic {}／Reversal {}</small>".format(
+            self._badge(decision.value("Falling Knife State")),
+            self._format_value(decision.value("Panic Condition Count"), 0),
+            self._format_value(
+                decision.value("Reversal Confirmation Count"),
+                0,
+            ),
+        )
+        les_score = "<strong>{}</strong><br><small>門檻 {}</small>".format(
+            self._format_value(decision.value("低點分數"), 0),
+            self._format_value(
+                decision.value("Required Technical Score"),
+                0,
+            ),
+        )
+        trigger_risk = "Trigger {}<br>{}<br><small>RR {}</small>".format(
+            self._format_flag(decision.value("LES v5 Trigger")),
+            self._badge(decision.value("Risk Gate")),
+            self._format_value(decision.value("RewardRisk"), 2),
+        )
+        position = "部位 {}<br><small>停損 {}<br>目標 {}</small>".format(
+            self._format_percent(decision.value("Position Fraction")),
+            self._format_money(decision.value("策略停損")),
+            self._format_money(decision.value("策略停利")),
+        )
+        cells = (
+            stock,
+            self._format_money(decision.value("收盤")),
+            quality,
+            valuation,
+            reversal,
+            les_score,
+            trigger_risk,
+            position,
+            self._badge(decision.value("低點決策")),
+            self._badge(decision.value("EREM 決策訊號")),
+        )
+        return "<tr>{}</tr>".format(
+            "".join(
+                '<td style="vertical-align:top">{}</td>'.format(cell)
+                for cell in cells
+            )
+        )
+
+    def _render_detail_card(self, decision: StrategyDecision) -> str:
+        stock = "{} {}".format(
+            html.escape(str(decision.value("證券代號", "N/A"))),
+            html.escape(str(decision.value("證券名稱", "N/A"))),
+        )
+        rows = [
+            self._detail_row(
+                "品質證據",
+                "Base {}｜QS {}｜DC {}<br>Extended {}｜QS {}｜DC {}"
+                "<br>Critical Coverage {}".format(
+                    self._badge(decision.value("Base Quality Status")),
+                    self._format_value(decision.value("Base Quality Score"), 0),
+                    self._format_value(decision.value("Base Data Confidence"), 0),
+                    self._badge(decision.value("Extended Quality Status")),
+                    self._format_value(
+                        decision.value("Extended Quality Score"),
+                        0,
+                    ),
+                    self._format_value(
+                        decision.value("Extended Data Confidence"),
+                        0,
+                    ),
+                    self._format_percent(
+                        decision.value("Critical Field Coverage"),
+                        whole_number=True,
+                    ),
+                ),
+            ),
+            self._detail_row(
+                "品質 QA",
+                "Warnings：{}<br>Hard Rejects：{}".format(
+                    self._safe_text(decision.value("Quality Warnings")),
+                    self._safe_text(decision.value("Quality Hard Rejects")),
+                ),
+            ),
+            self._detail_row(
+                "估值依據",
+                "資料 {}｜Base FV {}｜Bear FV {}｜Bull FV {}｜Bear Loss {}"
+                "<br>Valuation QA：{}".format(
+                    self._badge(decision.value("Valuation Model Status")),
+                    self._format_money(decision.value("Base Case Fair Value")),
+                    self._format_money(decision.value("Bear Case Fair Value")),
+                    self._format_money(decision.value("Bull Case Fair Value")),
+                    self._format_percent(
+                        decision.value("Bear Case Permanent Loss")
+                    ),
+                    self._safe_text(decision.value("Valuation Reasons")),
+                ),
+            ),
+        ]
+        security_type = self._safe_text(decision.value("Security Type"))
+        if security_type not in {"N/A", "COMMON"}:
+            rows.insert(
+                0,
+                self._detail_row(
+                    "證券身分",
+                    "市場代號 {}｜發行人 {}｜類型 {}".format(
+                        self._safe_text(decision.value("證券代號")),
+                        self._safe_text(decision.value("Issuer Symbol")),
+                        security_type,
+                    ),
+                ),
+            )
+        breadth = self._breadth_summary(decision)
+        if breadth:
+            rows.append(self._detail_row("市場廣度", breadth))
+        rows.extend([
+            self._detail_row(
+                "進場規則",
+                self._safe_text(decision.value("Entry Rule")),
+            ),
+            self._detail_row(
+                "低點理由",
+                self._format_reason(decision.value("低點理由")),
+            ),
+            self._detail_row(
+                "EREM 理由",
+                self._format_reason(decision.value("EREM 理由")),
+            ),
+        ])
+        return """
+        <section style="border:1px solid #d7dfdc;border-radius:6px;margin:8px 0 14px;padding:10px;background:#fbfcfb">
+          <h4 style="margin:0 0 8px;color:#174f43">{}</h4>
+          <table style="border-collapse:collapse;width:100%;font-size:13px" cellpadding="5">
+            {}
+          </table>
+        </section>
+        """.format(stock, "".join(rows))
+
+    @staticmethod
+    def _detail_row(label: str, value: str) -> str:
+        return (
+            '<tr><th style="width:120px;text-align:left;vertical-align:top;'
+            'border-top:1px solid #e5e9e7">{}</th>'
+            '<td style="border-top:1px solid #e5e9e7">{}</td></tr>'
+        ).format(html.escape(label), value)
+
+    def _breadth_summary(self, decision: StrategyDecision) -> str:
+        fields = (
+            ("Regime", "Broad Rally Regime"),
+            ("Trigger", "Broad Rally Trigger"),
+            ("Full BUY", "Broad Rally Full BUY Trigger"),
+            ("Absorption", "Broad Rally Absorption Trigger"),
+            ("Risk", "Broad Rally Risk Gate"),
+        )
+        values = []
+        for label, field_name in fields:
+            value = decision.value(field_name)
+            if self._is_missing(value):
+                continue
+            values.append("{} {}".format(html.escape(label), self._safe_text(value)))
+        return "｜".join(values)
+
+    def _badge(self, value: object) -> str:
+        text = self._safe_text(value)
+        normalized = text.upper().replace(" ", "_")
+        if any(
+            token in normalized
+            for token in ("REJECT", "NO_BUY", "EXIT", "FAILED", "BLOCK")
+        ):
+            colors = ("#8f1d1d", "#fdecec")
+        elif any(
+            token in normalized
+            for token in ("UNKNOWN", "INSUFFICIENT", "N/A", "BASE_ONLY")
+        ):
+            colors = ("#5f6368", "#eef0f2")
+        elif any(
+            token in normalized
+            for token in ("WATCH", "ARMED", "PANIC", "REDUCE")
+        ):
+            colors = ("#8a5700", "#fff4d6")
+        else:
+            colors = ("#176b4d", "#e7f5ee")
+        return (
+            '<span style="display:inline-block;padding:2px 6px;border-radius:10px;'
+            'font-weight:600;color:{};background:{}">{}</span>'
+        ).format(colors[0], colors[1], text)
+
+    def _format_flag(self, value: object) -> str:
+        if self._is_missing(value):
+            return "N/A"
+        normalized = str(value).strip().upper()
+        return "YES" if normalized in {"1", "TRUE", "YES", "PASS"} else "NO"
+
+    def _format_money(self, value: object) -> str:
+        if self._is_missing(value):
+            return "N/A"
+        try:
+            return "{:,.2f}".format(float(value)).rstrip("0").rstrip(".")
+        except (TypeError, ValueError):
+            return html.escape(str(value))
+
+    def _format_percent(
+        self,
+        value: object,
+        *,
+        whole_number: bool = False,
+    ) -> str:
+        if self._is_missing(value):
+            return "N/A"
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return html.escape(str(value))
+        percent = numeric if whole_number or abs(numeric) > 1 else numeric * 100
+        return "{:.1f}%".format(percent)
+
+    def _format_reason(self, value: object) -> str:
+        text = self._safe_text(value)
+        if text == "N/A":
+            return text
+        return "&#8226; {}".format(text.replace("；", "<br>&#8226; "))
+
+    def _safe_text(self, value: object) -> str:
+        if self._is_missing(value):
+            return "N/A"
+        return html.escape(str(value))
+
+    @staticmethod
+    def _is_missing(value: object) -> bool:
+        if value is None:
+            return True
+        try:
+            return bool(pd.isna(value))
+        except (TypeError, ValueError):
+            return False
+
+
 class RendererFactory:
     _renderers: dict[str, HtmlRenderer] = {
         "low_entry_score": LowEntryV1Renderer(),
@@ -355,6 +846,7 @@ class RendererFactory:
         "low_entry_score_v3": LowEntryV3Renderer(),
         "low_entry_score_v4": LowEntryV4Renderer(),
         "low_entry_score_v4_1": LowEntryV41Renderer(),
+        "low_entry_score_v5": LowEntryV5Renderer(),
         "expected_return_exit_v3": ExpectedReturnExitV3Renderer(),
     }
 

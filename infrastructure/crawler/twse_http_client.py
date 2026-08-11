@@ -14,6 +14,7 @@ from requests import exceptions as requests_exceptions
 from config.settings import AppSettings
 from domain.errors import DataErrorCategory
 from domain.errors import DataSourceError
+from domain.errors import MarketClosedError
 from domain.errors import NetworkError
 from domain.errors import NoDataError
 from domain.errors import SchemaChangedError
@@ -21,6 +22,7 @@ from infrastructure.observability import structured_extra
 
 TwseErrorCategory = DataErrorCategory
 TwseClientError = DataSourceError
+TwseMarketClosedError = MarketClosedError
 TwseNoDataError = NoDataError
 TwseSchemaChangedError = SchemaChangedError
 TwseNetworkError = NetworkError
@@ -155,7 +157,8 @@ class TwseHttpClient:
                 last_error = error
                 if not error.retryable or attempt >= self.config.max_attempts:
                     raise
-                logging.warning(
+                logging.log(
+                    self._retry_log_level(error),
                     "TWSE status=%s context=%s attempt=%s/%s retrying=true detail=%s",
                     error.category.value.upper(),
                     context,
@@ -213,7 +216,8 @@ class TwseHttpClient:
                 last_error = error
                 if not error.retryable or attempt >= self.config.max_attempts:
                     raise
-                logging.warning(
+                logging.log(
+                    self._retry_log_level(error),
                     "TWSE status=%s context=%s attempt=%s/%s retrying=true detail=%s",
                     error.category.value.upper(),
                     context,
@@ -320,6 +324,12 @@ class TwseHttpClient:
         remaining = self.config.min_request_interval_seconds - elapsed
         if remaining > 0:
             self._sleep(remaining)
+
+    @staticmethod
+    def _retry_log_level(error: TwseClientError) -> int:
+        """Keep all intermediate retry details in debug mode."""
+
+        return logging.DEBUG
 
     @staticmethod
     def _request_log_extra(

@@ -17,10 +17,14 @@ from application.observability import NullRunObserver
 from application.ports import MarketCalendarPort
 from application.ports import RunObserverPort
 from config.settings import QUERY_WAIT_SECONDS
+from domain.fundamental_derivation import FundamentalBundle
+from domain.security_identity import SecurityIdentity
+from domain.security_identity import resolve_security_identity
 from infrastructure.crawler.twse_http_client import TwseClientError
 from infrastructure.crawler.twse_http_client import TwseNetworkError
 from infrastructure.crawler.twse_http_client import TwseSchemaChangedError
 from infrastructure.fundamentals.mops_repository import MopsStorageError
+from infrastructure.observability import structured_extra
 
 
 TAIPEI_TIMEZONE = ZoneInfo("Asia/Taipei")
@@ -44,6 +48,7 @@ class CrawlerMarketDataAdapter:
         calendar: MarketCalendarPort,
         market_date: datetime.date,
         is_trading_day: bool,
+        include_reference: bool,
     ) -> AnalysisContext:
         trade_date = market_date.isoformat()
         self._observer.record(
@@ -59,13 +64,53 @@ class CrawlerMarketDataAdapter:
             end_backtrack=request.endbacktrack,
             calendar=calendar,
             reference_date=market_date,
-            include_reference=True,
+            include_reference=include_reference,
         )
-        crawler.get_twse_daily_stocks(
-            file_name=request.output_file_names,
-            stocktype=request.stocktype,
-            stocks=request.stocklist,
-        )
+        try:
+            crawler.get_twse_daily_stocks(
+                file_name=request.output_file_names,
+                stocktype=request.stocktype,
+                stocks=request.stocklist,
+            )
+        finally:
+            no_data_dates = sorted(
+                getattr(crawler, "twse_no_data_dates", ())
+            )
+            if no_data_dates:
+                self._observer.record(
+                    "market_data_no_data_dates_collected",
+                    level=logging.DEBUG,
+                    source="TWSE",
+                    status="NO_DATA",
+                    no_data_dates=no_data_dates,
+                    no_data_date_count=len(no_data_dates),
+                )
+            closed_unscheduled_dates = sorted(
+                getattr(crawler, "twse_closed_unscheduled_dates", ())
+            )
+            if closed_unscheduled_dates:
+                self._observer.record(
+                    "market_closed_unscheduled_dates_collected",
+                    level=logging.DEBUG,
+                    source="TWSE",
+                    status="CLOSED_UNSCHEDULED",
+                    closed_unscheduled_dates=closed_unscheduled_dates,
+                    closed_unscheduled_date_count=len(
+                        closed_unscheduled_dates
+                    ),
+                )
+            missing_tracked_stocks = dict(
+                getattr(crawler, "missing_tracked_stock_first_dates", {})
+            )
+            if missing_tracked_stocks:
+                self._observer.record(
+                    "market_data_missing_tracked_stocks_collected",
+                    level=logging.DEBUG,
+                    source="TWSE",
+                    status="TRACKED_STOCK_MISSING",
+                    missing_tracked_stocks=missing_tracked_stocks,
+                    missing_tracked_stock_count=len(missing_tracked_stocks),
+                )
         self._observer.record(
             "market_data_fetch_completed",
             trade_date=trade_date,
@@ -104,6 +149,7 @@ class CrawlerFundamentalAdapter:
     ) -> None:
         crawler = context.resource
         stocknumbers = getattr(crawler, "stocknumbers", [])
+        stocknames = getattr(crawler, "stocknames", [])
         daily_dates = getattr(crawler, "daily_dates", [])
         setter = getattr(crawler, "set_low_entry_v4_fundamentals", None)
         if not callable(setter):
@@ -119,6 +165,14 @@ class CrawlerFundamentalAdapter:
         consecutive_network_failures = 0
         consecutive_storage_failures = 0
         consecutive_schema_failures = 0
+        bundles_by_issuer: dict[str, FundamentalBundle] = {}
+        reset_scope_fallbacks = getattr(
+            self.fundamental_service,
+            "reset_scope_fallback_diagnostics",
+            None,
+        )
+        if callable(reset_scope_fallbacks):
+            reset_scope_fallbacks()
 
         prepare_daily_batch = getattr(
             self.fundamental_service,
@@ -150,16 +204,102 @@ class CrawlerFundamentalAdapter:
                     error,
                 )
 
+        prepare_daily_revisions = getattr(
+            self.fundamental_service,
+            "prepare_daily_revisions",
+            None,
+        )
+        if callable(prepare_daily_revisions):
+            try:
+                correction_count = prepare_daily_revisions(localized_time)
+                self._observer.record(
+                    "fundamental_revision_scan_completed",
+                    trade_date=context.market_date.isoformat(),
+                    source="MOPS",
+                    status="SUCCESS",
+                    correction_count=correction_count,
+                )
+            except TwseClientError as error:
+                self._observer.record(
+                    "fundamental_revision_scan_unavailable",
+                    level=logging.WARNING,
+                    trade_date=context.market_date.isoformat(),
+                    source="MOPS",
+                    status=error.category.value.upper(),
+                )
+                logging.warning(
+                    "MOPS daily correction scan status=%s unavailable; "
+                    "complete filing caches remain usable: %s",
+                    error.category.value.upper(),
+                    error,
+                )
+
+        issuer_symbols = []
         for item, stock_no in enumerate(stocknumbers):
             if not stock_no or item >= len(daily_dates) or not daily_dates[item]:
                 continue
+            stock_name = stocknames[item] if item < len(stocknames) else ""
+            issuer_symbols.append(
+                resolve_security_identity(stock_no, stock_name).issuer_symbol
+            )
+        preloaded_bundles: dict[str, FundamentalBundle] = {}
+        preload_cached_bundles = getattr(
+            self.fundamental_service,
+            "load_cached_bundles",
+            None,
+        )
+        if callable(preload_cached_bundles):
             try:
-                bundle = self.fundamental_service.load(
-                    stock_no,
+                preloaded_bundles = preload_cached_bundles(
+                    list(dict.fromkeys(issuer_symbols)),
                     signal_date=analysis_signal_date,
                     sector=str(request.stocktype),
                     history_years=request.mops_history_years,
                 )
+            except (MopsStorageError, TwseClientError) as error:
+                logging.debug(
+                    "MOPS snapshot bulk preload unavailable; falling back to "
+                    "per-symbol refresh: %s",
+                    error,
+                    extra={
+                        "source": "MOPS_CACHE",
+                        "status": "BULK_PRELOAD_FAILED",
+                        "cache_hit": False,
+                    },
+                )
+
+        for item, stock_no in enumerate(stocknumbers):
+            if not stock_no or item >= len(daily_dates) or not daily_dates[item]:
+                continue
+            stock_name = stocknames[item] if item < len(stocknames) else ""
+            identity = resolve_security_identity(stock_no, stock_name)
+            issuer_symbol = identity.issuer_symbol
+            if issuer_symbol != stock_no:
+                logging.debug(
+                    "Fundamental identity market_symbol=%s issuer_symbol=%s "
+                    "security_type=%s",
+                    stock_no,
+                    issuer_symbol,
+                    identity.security_type.value,
+                    extra={
+                        "symbol": stock_no,
+                        "source": "TWSE_SECURITY_MASTER",
+                        "status": "IDENTITY_MAPPED",
+                    },
+                )
+            try:
+                bundle = bundles_by_issuer.get(issuer_symbol)
+                if bundle is None:
+                    bundle = preloaded_bundles.get(issuer_symbol)
+                    if bundle is None:
+                        bundle = self.fundamental_service.load(
+                            issuer_symbol,
+                            signal_date=analysis_signal_date,
+                            sector=str(request.stocktype),
+                            history_years=request.mops_history_years,
+                        )
+                    bundles_by_issuer[issuer_symbol] = bundle
+                bundle = self._attach_security_identity(bundle, identity)
             except TwseNetworkError as error:
                 self._observer.record(
                     "fundamental_refresh_failed",
@@ -178,10 +318,17 @@ class CrawlerFundamentalAdapter:
                     account_equity=request.account_equity,
                 )
                 logging.error(
-                    "MOPS status=%s symbol=%s detail=%s; LES v4 remains WATCH_ONLY.",
+                    "MOPS status=%s market_symbol=%s issuer_symbol=%s detail=%s; "
+                    "LES v5 formal BUY disabled.",
                     error.category.value.upper(),
                     stock_no,
+                    issuer_symbol,
                     error,
+                    extra={
+                        "symbol": stock_no,
+                        "source": "MOPS",
+                        "status": error.category.value.upper(),
+                    },
                 )
                 consecutive_storage_failures = 0
                 consecutive_schema_failures = 0
@@ -192,7 +339,7 @@ class CrawlerFundamentalAdapter:
                 ):
                     logging.error(
                         "MOPS circuit open after %s consecutive network failures; "
-                        "skipping remaining symbols and keeping LES v4 WATCH_ONLY.",
+                        "skipping remaining symbols; LES v5 formal BUY disabled.",
                         consecutive_network_failures,
                     )
                     self._observer.record(
@@ -229,10 +376,17 @@ class CrawlerFundamentalAdapter:
                     account_equity=request.account_equity,
                 )
                 logging.error(
-                    "MOPS status=%s symbol=%s detail=%s; LES v4 remains WATCH_ONLY.",
+                    "MOPS status=%s market_symbol=%s issuer_symbol=%s detail=%s; "
+                    "LES v5 formal BUY disabled.",
                     error.category.value.upper(),
                     stock_no,
+                    issuer_symbol,
                     error,
+                    extra={
+                        "symbol": stock_no,
+                        "source": "MOPS",
+                        "status": error.category.value.upper(),
+                    },
                 )
                 consecutive_network_failures = 0
                 consecutive_storage_failures = 0
@@ -247,7 +401,7 @@ class CrawlerFundamentalAdapter:
                 ):
                     logging.error(
                         "MOPS schema circuit open after %s consecutive failures; "
-                        "skipping remaining symbols and keeping LES v4 WATCH_ONLY.",
+                        "skipping remaining symbols; LES v5 formal BUY disabled.",
                         consecutive_schema_failures,
                     )
                     self._observer.record(
@@ -284,9 +438,16 @@ class CrawlerFundamentalAdapter:
                     account_equity=request.account_equity,
                 )
                 logging.error(
-                    "MOPS storage symbol=%s unavailable; LES v4 remains WATCH_ONLY: %s",
+                    "MOPS storage market_symbol=%s issuer_symbol=%s unavailable; "
+                    "LES v5 formal BUY disabled: %s",
                     stock_no,
+                    issuer_symbol,
                     error,
+                    extra={
+                        "symbol": stock_no,
+                        "source": "MOPS_CACHE",
+                        "status": "STORAGE_ERROR",
+                    },
                 )
                 consecutive_network_failures = 0
                 consecutive_schema_failures = 0
@@ -297,7 +458,7 @@ class CrawlerFundamentalAdapter:
                 ):
                     logging.error(
                         "MOPS storage circuit open after %s consecutive failures; "
-                        "skipping remaining symbols and keeping LES v4 WATCH_ONLY.",
+                        "skipping remaining symbols; LES v5 formal BUY disabled.",
                         consecutive_storage_failures,
                     )
                     self._observer.record(
@@ -326,12 +487,15 @@ class CrawlerFundamentalAdapter:
             )
             self._observer.record(
                 "fundamental_refresh_completed",
+                level=logging.DEBUG,
                 symbol=stock_no,
                 trade_date=context.market_date.isoformat(),
                 source="MOPS_CACHE" if cache_hit else "MOPS",
                 status="SUCCESS",
                 cache_hit=cache_hit,
                 available_at=bundle.as_of,
+                issuer_symbol=issuer_symbol,
+                security_type=identity.security_type.value,
             )
             setter(
                 stock_no,
@@ -340,6 +504,48 @@ class CrawlerFundamentalAdapter:
                 account_equity=request.account_equity,
                 signal_date=bundle.as_of or analysis_signal_date,
             )
+
+        consume_scope_fallbacks = getattr(
+            self.fundamental_service,
+            "consume_scope_fallback_symbols",
+            None,
+        )
+        if callable(consume_scope_fallbacks):
+            fallback_symbols = tuple(consume_scope_fallbacks())
+            if fallback_symbols:
+                logging.warning(
+                    "MOPS individual scope fallback summary stocks=%s "
+                    "symbols=%s; consolidated filing was unavailable for "
+                    "one or more selected periods. Use debug mode for "
+                    "per-symbol details.",
+                    len(fallback_symbols),
+                    ",".join(fallback_symbols),
+                    extra=structured_extra(
+                        source="MOPS",
+                        status="INDIVIDUAL_SCOPE_FALLBACK_SUMMARY",
+                    ),
+                )
+                self._observer.record(
+                    "fundamental_individual_scope_fallback_summary",
+                    level=logging.DEBUG,
+                    source="MOPS",
+                    status="INDIVIDUAL_SCOPE_FALLBACK_SUMMARY",
+                    fallback_symbols=list(fallback_symbols),
+                    fallback_symbol_count=len(fallback_symbols),
+                )
+
+    @staticmethod
+    def _attach_security_identity(
+        bundle: FundamentalBundle,
+        identity: SecurityIdentity,
+    ) -> FundamentalBundle:
+        snapshot = dict(bundle.snapshot)
+        snapshot.update(identity.snapshot_fields())
+        return FundamentalBundle(
+            annual_fundamentals=bundle.annual_fundamentals,
+            snapshot=snapshot,
+            as_of=bundle.as_of,
+        )
 
     @staticmethod
     def _mark_unavailable(
@@ -394,7 +600,21 @@ class CrawlerStrategyAdapter:
 
     def evaluate(self, context: AnalysisContext) -> StrategyEvaluation:
         crawler = context.resource
-        evaluation = StrategyEvaluation(maxprofits=crawler.cal_max_profit())
+        maxprofits = crawler.cal_max_profit()
+        decision_builder = getattr(
+            crawler,
+            "build_strategy_decisions",
+            None,
+        )
+        decisions = (
+            tuple(decision_builder(maxprofits))
+            if callable(decision_builder)
+            else ()
+        )
+        evaluation = StrategyEvaluation(
+            maxprofits=maxprofits,
+            decisions=decisions,
+        )
         self._observer.record(
             "strategy_evaluation_completed",
             trade_date=context.market_date.isoformat(),
@@ -416,10 +636,21 @@ class CrawlerReportAdapter:
         evaluation: StrategyEvaluation,
     ) -> None:
         crawler = context.resource
-        crawler.record_analysis_dataset(
-            file_name=request.output_file_names,
-            maxprofits=evaluation.maxprofits,
+        decision_recorder = getattr(
+            crawler,
+            "record_strategy_decisions",
+            None,
         )
+        if evaluation.decisions and callable(decision_recorder):
+            decision_recorder(
+                file_name=request.output_file_names,
+                decisions=evaluation.decisions,
+            )
+        else:
+            crawler.record_analysis_dataset(
+                file_name=request.output_file_names,
+                maxprofits=evaluation.maxprofits,
+            )
         self._observer.record(
             "report_generated",
             trade_date=context.market_date.isoformat(),
@@ -440,12 +671,25 @@ class CrawlerNotificationAdapter:
         evaluation: StrategyEvaluation,
     ) -> None:
         crawler = context.resource
-        crawler.smtp_email(
-            subject=request.subject,
-            ccreceiver=request.ccreceiver,
-            stocktype=request.stocktype,
-            maxprofits=evaluation.maxprofits,
+        strategy_mailer = getattr(
+            crawler,
+            "smtp_strategy_email",
+            None,
         )
+        if evaluation.decisions and callable(strategy_mailer):
+            strategy_mailer(
+                subject=request.subject,
+                ccreceiver=request.ccreceiver,
+                stocktype=request.stocktype,
+                decisions=evaluation.decisions,
+            )
+        else:
+            crawler.smtp_email(
+                subject=request.subject,
+                ccreceiver=request.ccreceiver,
+                stocktype=request.stocktype,
+                maxprofits=evaluation.maxprofits,
+            )
         self._observer.record(
             "notification_sent",
             trade_date=context.market_date.isoformat(),
@@ -489,7 +733,7 @@ class CrawlerLineChartAdapter:
 
         for back in range(startofbacktrack):
             crawler = self._crawler_factory(len(request.stocklist))
-            print("Back {}".format(back))
+            logging.debug("Line-chart backtrack iteration=%s", back)
             crawler.get_date_times(
                 begin_backtrack=startofbacktrack - back,
                 end_backtrack=request.endbacktrack - back,
@@ -519,7 +763,7 @@ class CrawlerLineChartAdapter:
                 continue
             self._sleep(QUERY_WAIT_SECONDS)
 
-        logging.info(
+        logging.debug(
             "The trend of performance indicators for TWSE stock market: %s",
             maxprofitratios,
         )

@@ -13,6 +13,7 @@ from domain.features import SharedFeaturePipeline
 from domain.strategy import Strategy
 
 EXPECTED_RETURN_EXIT_STRATEGY_NAME = "expected_return_exit_v3"
+EREM_V3_MODEL_VERSION = "3.0.0"
 EREM_V3_MAX_RAW_SCORE = 105.0
 
 EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS = [
@@ -97,6 +98,8 @@ class ExpectedReturnExitV3Strategy(Strategy):
     """
 
     name = EXPECTED_RETURN_EXIT_STRATEGY_NAME
+    description = "Holding confidence scoring with trend, momentum, volatility, distribution, relative strength, and entry quality components"
+    version = EREM_V3_MODEL_VERSION
 
     def __init__(self, config: ExpectedReturnExitV3Config | None = None) -> None:
         self.config = config or ExpectedReturnExitV3Config()

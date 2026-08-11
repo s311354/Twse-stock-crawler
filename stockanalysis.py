@@ -18,6 +18,9 @@ import datetime
 import logging
 
 from application.analysis_dataset import AnalysisDatasetBuilder
+from application.market_history_cache import CachedMarketDay
+from application.market_history_cache import MarketHistoryCacheError
+from application.market_history_cache import MarketHistoryCachePort
 from domain.models import Stocktype
 from domain.models import Ohlc
 from domain.models import StockSelector
@@ -31,6 +34,7 @@ from infrastructure.calendar.twse_calendar import TradingDayStatus
 from infrastructure.calendar.twse_calendar import TwseCalendar
 from infrastructure.crawler.twse_client import TwseClient
 from infrastructure.crawler.twse_http_client import TwseHttpClient
+from infrastructure.crawler.twse_http_client import TwseMarketClosedError
 from infrastructure.legacy_crawler_facade import CsvRepositoryPort
 from infrastructure.legacy_crawler_facade import LegacyCrawlerFacade
 from twse.parser import clean_cell
@@ -44,8 +48,6 @@ class QUERY(enum.Enum):
     CRETACEOUS = 30
 
 class TwseCrawker(LegacyCrawlerFacade):
-    _logged_missing_price_warnings: set[tuple[str, str, str, str, str, str]] = set()
-
     def __init__(
         self,
         stocklistsize: int,
@@ -54,11 +56,13 @@ class TwseCrawker(LegacyCrawlerFacade):
         http_client: TwseHttpClient | None = None,
         app_settings: object | None = None,
         analysis_dataset_builder: AnalysisDatasetBuilder | None = None,
+        market_history_cache: MarketHistoryCachePort | None = None,
     ) -> None:
         if twse_client is not None and http_client is not None:
             raise ValueError("Pass either twse_client or http_client, not both")
         self.stocklistsize: int = stocklistsize
         self.twse_client = twse_client or TwseClient(http_client=http_client)
+        self.market_history_cache = market_history_cache
         self._initialize_legacy_facade(
             csv_repository=csv_repository,
             app_settings=app_settings,
@@ -69,6 +73,7 @@ class TwseCrawker(LegacyCrawlerFacade):
         self.stocknames: list[str] = ['' for _ in range(self.stocklistsize)]
         self.tracked_stock_numbers: list[str | None] = [None for _ in range(self.stocklistsize)]
         self.missing_tracked_stock_numbers: set[str] = set()
+        self.missing_tracked_stock_first_dates: dict[str, str] = {}
         self.stocksprice: list[float | None] = list()
         self.daily_highs: list[list[float]] = [[] for _ in range(self.stocklistsize)]
         self.daily_lows: list[list[float]] = [[] for _ in range(self.stocklistsize)]
@@ -93,6 +98,13 @@ class TwseCrawker(LegacyCrawlerFacade):
         self.low_entry_v4_account_equity: float | None = None
         self.iso_scheduled_times: list[str] = list()
         self.transactiondays: int = 0
+        self._missing_ohlc_records: dict[
+            tuple[str, str],
+            tuple[object, object, object, object],
+        ] = {}
+        self.twse_no_data_dates: set[str] = set()
+        self.twse_closed_unscheduled_dates: set[str] = set()
+        self._market_history_refresh_dates: set[str] = set()
 
 
     def __del__(self) -> None:
@@ -102,6 +114,7 @@ class TwseCrawker(LegacyCrawlerFacade):
         self.stocksprice = list()
         self.tracked_stock_numbers = [None for _ in range(self.stocklistsize)]
         self.missing_tracked_stock_numbers = set()
+        self.missing_tracked_stock_first_dates = {}
         self.daily_highs = [[] for _ in range(self.stocklistsize)]
         self.daily_lows = [[] for _ in range(self.stocklistsize)]
         self.daily_closes = [[] for _ in range(self.stocklistsize)]
@@ -119,6 +132,10 @@ class TwseCrawker(LegacyCrawlerFacade):
         self.fundamental_status_by_stock = {}
         self.fundamental_status_detail_by_stock = {}
         self.low_entry_v4_signal_dates_by_stock = {}
+        self._missing_ohlc_records = {}
+        self.twse_no_data_dates = set()
+        self.twse_closed_unscheduled_dates = set()
+        self._market_history_refresh_dates = set()
 
 
     def clean_data(self, row: StockRow) -> StockRow:
@@ -225,11 +242,21 @@ class TwseCrawker(LegacyCrawlerFacade):
         if tracked_stock_no:
             stock_row = stock_lookup.get(tracked_stock_no)
             if stock_row is None:
+                self.missing_tracked_stock_first_dates.setdefault(
+                    tracked_stock_no,
+                    scheduled_time,
+                )
                 if tracked_stock_no not in self.missing_tracked_stock_numbers:
-                    logging.warning(
+                    logging.debug(
                         "Skipping tracked stock %s starting at %s because it is missing from the TWSE response.",
                         tracked_stock_no,
                         scheduled_time,
+                        extra={
+                            "symbol": tracked_stock_no,
+                            "trade_date": scheduled_time,
+                            "source": "TWSE",
+                            "status": "TRACKED_STOCK_MISSING",
+                        },
                     )
                     self.missing_tracked_stock_numbers.add(tracked_stock_no)
                 else:
@@ -237,12 +264,24 @@ class TwseCrawker(LegacyCrawlerFacade):
                         "Tracked stock %s remains missing from the TWSE response at %s.",
                         tracked_stock_no,
                         scheduled_time,
+                        extra={
+                            "symbol": tracked_stock_no,
+                            "trade_date": scheduled_time,
+                            "source": "TWSE",
+                            "status": "TRACKED_STOCK_STILL_MISSING",
+                        },
                     )
             elif tracked_stock_no in self.missing_tracked_stock_numbers:
-                logging.info(
+                logging.debug(
                     "Tracked stock %s returned to the TWSE response at %s.",
                     tracked_stock_no,
                     scheduled_time,
+                    extra={
+                        "symbol": tracked_stock_no,
+                        "trade_date": scheduled_time,
+                        "source": "TWSE",
+                        "status": "TRACKED_STOCK_RECOVERED",
+                    },
                 )
                 self.missing_tracked_stock_numbers.remove(tracked_stock_no)
             return stock_row
@@ -251,7 +290,7 @@ class TwseCrawker(LegacyCrawlerFacade):
         stock_row = stock_lookup.get(selector_text)
         if stock_row is not None:
             self.tracked_stock_numbers[item] = selector_text
-            logging.info("Tracking stock %s from stock-number selector at %s.", selector_text, scheduled_time)
+            logging.debug("Tracking stock %s from stock-number selector at %s.", selector_text, scheduled_time)
             return stock_row
 
         if selector_text.isdigit() and selector_text != str(int(selector_text)):
@@ -277,7 +316,7 @@ class TwseCrawker(LegacyCrawlerFacade):
 
         resolved_stock_no = clean_cell(stock_row[TwseColumns.STOCK_NO])
         self.tracked_stock_numbers[item] = resolved_stock_no
-        logging.info(
+        logging.debug(
             "Resolved legacy row index %s to stock %s at %s; future dates will use stock-number lookup.",
             stock_index,
             resolved_stock_no,
@@ -326,25 +365,28 @@ class TwseCrawker(LegacyCrawlerFacade):
         pe_ratio = self.parse_price(stock_row[TwseColumns.PE])
 
         if None in (open_price, high_price, low_price, close_price):
-            warning_key = (
+            self._missing_ohlc_records[(stock_no, scheduled_time)] = (
+                stock_row[TwseColumns.OPEN],
+                stock_row[TwseColumns.HIGH],
+                stock_row[TwseColumns.LOW],
+                stock_row[TwseColumns.CLOSE],
+            )
+            logging.debug(
+                "Skipping stock %s at %s because OHLC data is unavailable: "
+                "open=%s high=%s low=%s close=%s",
                 stock_no,
                 scheduled_time,
                 stock_row[TwseColumns.OPEN],
                 stock_row[TwseColumns.HIGH],
                 stock_row[TwseColumns.LOW],
                 stock_row[TwseColumns.CLOSE],
+                extra={
+                    "symbol": stock_no,
+                    "trade_date": scheduled_time,
+                    "source": "TWSE",
+                    "status": "OHLC_MISSING",
+                },
             )
-            if warning_key not in TwseCrawker._logged_missing_price_warnings:
-                logging.warning(
-                    "Skipping stock %s at %s because OHLC data is unavailable: open=%s high=%s low=%s close=%s",
-                    stock_no,
-                    scheduled_time,
-                    stock_row[TwseColumns.OPEN],
-                    stock_row[TwseColumns.HIGH],
-                    stock_row[TwseColumns.LOW],
-                    stock_row[TwseColumns.CLOSE],
-                )
-                TwseCrawker._logged_missing_price_warnings.add(warning_key)
             return None
 
         return TWSEStock(
@@ -439,20 +481,28 @@ class TwseCrawker(LegacyCrawlerFacade):
         include_reference: bool = False,
     ) -> None:
         self.iso_scheduled_times = []
+        self._market_history_refresh_dates = set()
         effective_reference_date = reference_date or datetime.datetime.now().date()
 
-        for candidate in build_backtrack_dates(
+        status_counts = {status: 0 for status in TradingDayStatus}
+        candidates = build_backtrack_dates(
             reference_date=effective_reference_date,
             begin_backtrack=begin_backtrack,
             end_backtrack=end_backtrack,
             include_reference=include_reference,
-        ):
+        )
+        for candidate in candidates:
             status = (
                 calendar.trading_day_status(candidate)
                 if calendar is not None
                 else TradingDayStatus.UNKNOWN
             )
-            print(f"TWSE backtrack date {candidate.isoformat()}: {status.value.upper()}")
+            status_counts[status] += 1
+            logging.debug(
+                "TWSE backtrack date %s: %s",
+                candidate.isoformat(),
+                status.value.upper(),
+            )
 
             if status is TradingDayStatus.CLOSED:
                 continue
@@ -460,6 +510,22 @@ class TwseCrawker(LegacyCrawlerFacade):
                 continue
 
             self.iso_scheduled_times.append(candidate.isoformat())
+
+        reference_iso = effective_reference_date.isoformat()
+        if include_reference and reference_iso in self.iso_scheduled_times:
+            self._market_history_refresh_dates.add(
+                effective_reference_date.strftime("%Y%m%d")
+            )
+
+        logging.info(
+            "TWSE backtrack calendar candidates=%s open=%s closed=%s "
+            "unknown=%s selected=%s",
+            len(candidates),
+            status_counts[TradingDayStatus.OPEN],
+            status_counts[TradingDayStatus.CLOSED],
+            status_counts[TradingDayStatus.UNKNOWN],
+            len(self.iso_scheduled_times),
+        )
 
         if self.iso_scheduled_times:
             self.transactiondays = self.days_between_isodates(
@@ -489,29 +555,145 @@ class TwseCrawker(LegacyCrawlerFacade):
     def get_twse_daily_stocks(self, file_name: str, stocktype: Stocktype, stocks: list[StockSelector]) -> None:
         valid_iso_scheduled_times: list[str] = []
         previous_taiex_close: float | None = None
+        self._missing_ohlc_records = {}
+        self.twse_no_data_dates = set()
+        self.twse_closed_unscheduled_dates = set()
+        self.missing_tracked_stock_numbers = set()
+        self.missing_tracked_stock_first_dates = {}
+        market_type = str(stocktype.value[0])
+        scheduled_dates = [
+            iso_date.replace("-", "") for iso_date in self.iso_scheduled_times
+        ]
+        cache_days: dict[str, CachedMarketDay] = {}
+        cache_usable = self.market_history_cache is not None
+        cache_hits = 0
+        cache_writes = 0
+        cache_invalid = 0
+        network_days = 0
+        if self.market_history_cache is not None:
+            cache_query_dates = [
+                trade_date
+                for trade_date in scheduled_dates
+                if trade_date not in self._market_history_refresh_dates
+            ]
+            try:
+                cache_days = self.market_history_cache.load_many(
+                    cache_query_dates,
+                    market_type=market_type,
+                )
+            except MarketHistoryCacheError as error:
+                cache_usable = False
+                logging.warning(
+                    "TWSE market history cache status=READ_ERROR; "
+                    "falling back to HTTP for this run: %s",
+                    error,
+                    extra={
+                        "source": "TWSE_MARKET_CACHE",
+                        "status": "READ_ERROR",
+                        "cache_hit": False,
+                    },
+                )
     
         # Crawing daily TWSE Stock data
         for iso_scheduled_time in self.iso_scheduled_times:
 
-            scheduled_time = ''.join(iso_scheduled_time.split('-'))              
-            # Get TWSE information of stock price
-            row = self.twse_client.get_daily_stock_rows(scheduled_time, stocktype.value[0])
-            if not row:
-                logging.warning("Skipping %s because TWSE returned no stock rows.", scheduled_time)
-                continue
+            scheduled_time = iso_scheduled_time.replace("-", "")
+            cached_day = cache_days.get(scheduled_time)
+            row: StockRows
+            taiex_close: float
+            stock_lookup: dict[str, StockRow]
+            if cached_day is not None:
+                row = cached_day.stock_rows
+                taiex_close = cached_day.taiex_close
+                stock_lookup = self.build_stock_lookup(row, scheduled_time)
+                if stock_lookup:
+                    cache_hits += 1
+                else:
+                    cached_day = None
+                    cache_invalid += 1
 
-            stock_lookup = self.build_stock_lookup(row, scheduled_time)
-            if not stock_lookup:
-                logging.warning("Skipping %s because no TWSE rows passed schema validation.", scheduled_time)
-                continue
+            if cached_day is None:
+                network_days += 1
+                try:
+                    row = self.twse_client.get_daily_stock_rows(
+                        scheduled_time,
+                        stocktype.value[0],
+                    )
+                except TwseMarketClosedError as error:
+                    self.twse_closed_unscheduled_dates.add(iso_scheduled_time)
+                    logging.debug(
+                        "TWSE status=CLOSED_UNSCHEDULED date=%s detail=%s",
+                        scheduled_time,
+                        error,
+                        extra={
+                            "trade_date": scheduled_time,
+                            "source": "TWSE",
+                            "status": "CLOSED_UNSCHEDULED",
+                        },
+                    )
+                    continue
+                if not row:
+                    self.twse_no_data_dates.add(iso_scheduled_time)
+                    logging.debug(
+                        "TWSE status=NO_DATA date=%s dataset=STOCK_TABLE "
+                        "retries_exhausted=true; date skipped.",
+                        scheduled_time,
+                        extra={
+                            "trade_date": scheduled_time,
+                            "source": "TWSE",
+                            "status": "NO_DATA",
+                        },
+                    )
+                    continue
 
-            taiex_close = self.twse_client.get_daily_taiex_close(scheduled_time)
-            if taiex_close is None:
-                logging.warning(
-                    "Skipping %s because no valid TAIEX close was available for date alignment.",
-                    scheduled_time,
+                stock_lookup = self.build_stock_lookup(row, scheduled_time)
+                if not stock_lookup:
+                    logging.warning(
+                        "Skipping %s because no TWSE rows passed schema validation.",
+                        scheduled_time,
+                    )
+                    continue
+
+                loaded_taiex = self.twse_client.get_daily_taiex_close(
+                    scheduled_time
                 )
-                continue
+                if loaded_taiex is None:
+                    self.twse_no_data_dates.add(iso_scheduled_time)
+                    logging.debug(
+                        "TWSE status=NO_DATA date=%s dataset=TAIEX "
+                        "retries_exhausted=true; date skipped.",
+                        scheduled_time,
+                        extra={
+                            "trade_date": scheduled_time,
+                            "source": "TWSE",
+                            "status": "NO_DATA",
+                        },
+                    )
+                    continue
+                taiex_close = loaded_taiex
+                if cache_usable and self.market_history_cache is not None:
+                    try:
+                        self.market_history_cache.upsert_day(
+                            CachedMarketDay(
+                                trade_date=scheduled_time,
+                                stock_rows=row,
+                                taiex_close=taiex_close,
+                            ),
+                            market_type=market_type,
+                        )
+                        cache_writes += 1
+                    except (MarketHistoryCacheError, ValueError) as error:
+                        cache_usable = False
+                        logging.warning(
+                            "TWSE market history cache status=WRITE_ERROR; "
+                            "cache writes disabled for this run: %s",
+                            error,
+                            extra={
+                                "source": "TWSE_MARKET_CACHE",
+                                "status": "WRITE_ERROR",
+                                "cache_hit": False,
+                            },
+                        )
 
             breadth = derive_twse_market_breadth(
                 row,
@@ -569,13 +751,103 @@ class TwseCrawker(LegacyCrawlerFacade):
                 valid_iso_scheduled_times.append(iso_scheduled_time)
                 self.record(file_name = file_name, scheduled_time = scheduled_time, row_data = row_data)
             else:
-                logging.warning(
+                logging.debug(
                     "Skipping CSV write for %s because none of the requested stocks had valid TWSE rows.",
                     scheduled_time,
+                    extra={
+                        "trade_date": scheduled_time,
+                        "source": "TWSE",
+                        "status": "CSV_WRITE_SKIPPED",
+                    },
                 )
 
+        if self.market_history_cache is not None:
+            logging.info(
+                "TWSE market history cache requested=%s hits=%s "
+                "network_days=%s writes=%s invalid=%s refreshed=%s",
+                len(scheduled_dates),
+                cache_hits,
+                network_days,
+                cache_writes,
+                cache_invalid,
+                len(
+                    self._market_history_refresh_dates.intersection(
+                        scheduled_dates
+                    )
+                ),
+                extra={
+                    "source": "TWSE_MARKET_CACHE",
+                    "status": "CACHE_SUMMARY",
+                    "cache_hit": network_days == 0,
+                },
+            )
+
+        self._log_no_data_summary()
+        self._log_unscheduled_closed_summary()
+        self._log_missing_ohlc_summary()
         if not valid_iso_scheduled_times:
             raise RuntimeError("No valid TWSE daily stock rows were collected for the requested date range.")
 
         self.iso_scheduled_times = valid_iso_scheduled_times
         self.transactiondays = self.days_between_isodates(self.iso_scheduled_times[0], self.iso_scheduled_times[-1])
+
+
+    def _log_no_data_summary(self) -> None:
+        if not self.twse_no_data_dates:
+            return
+
+        dates = sorted(self.twse_no_data_dates)
+        logging.warning(
+            "TWSE NO_DATA summary dates=%s first_date=%s last_date=%s; "
+            "dates were skipped. Use debug mode for per-date details.",
+            len(dates),
+            dates[0].replace("-", ""),
+            dates[-1].replace("-", ""),
+            extra={
+                "source": "TWSE",
+                "status": "NO_DATA_SUMMARY",
+            },
+        )
+
+
+    def _log_unscheduled_closed_summary(self) -> None:
+        if not self.twse_closed_unscheduled_dates:
+            return
+
+        dates = sorted(self.twse_closed_unscheduled_dates)
+        logging.info(
+            "TWSE CLOSED_UNSCHEDULED summary dates=%s first_date=%s "
+            "last_date=%s; full-market probes confirmed no trading rows.",
+            len(dates),
+            dates[0].replace("-", ""),
+            dates[-1].replace("-", ""),
+            extra={
+                "source": "TWSE",
+                "status": "CLOSED_UNSCHEDULED_SUMMARY",
+            },
+        )
+
+
+    def _log_missing_ohlc_summary(self) -> None:
+        if not self._missing_ohlc_records:
+            return
+
+        symbols = {
+            symbol for symbol, _ in self._missing_ohlc_records
+        }
+        dates = sorted(
+            trade_date for _, trade_date in self._missing_ohlc_records
+        )
+        logging.warning(
+            "TWSE OHLC unavailable summary records=%s stocks=%s "
+            "first_date=%s last_date=%s; invalid rows were skipped. "
+            "Use debug mode for per-record details.",
+            len(self._missing_ohlc_records),
+            len(symbols),
+            dates[0],
+            dates[-1],
+            extra={
+                "source": "TWSE",
+                "status": "OHLC_MISSING_SUMMARY",
+            },
+        )

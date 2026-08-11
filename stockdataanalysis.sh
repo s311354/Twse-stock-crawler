@@ -4,9 +4,7 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
 
-if [ -f "$SCRIPT_DIR/.env" ]; then
-  ENV_FILE="$SCRIPT_DIR/.env"
-elif [ -f "$SCRIPT_DIR/.env.example" ]; then
+if [ -f "$SCRIPT_DIR/.env.example" ]; then
   ENV_FILE="$SCRIPT_DIR/.env.example"
 else
   ENV_FILE=""
@@ -16,7 +14,9 @@ if [ -n "$ENV_FILE" ]; then
   set -a
   . "$ENV_FILE"
   set +a
-  echo "Loaded environment variables from $ENV_FILE"
+  case "${TWSE_RUNTIME_MODE:-release}" in
+    debug|DEBUG) echo "Loaded environment variables from $ENV_FILE" ;;
+  esac
 fi
 
 if [ -n "${PYTHON:-}" ]; then
@@ -41,11 +41,22 @@ if ! "$PYTHON_BIN" -c "import requests, pandas, tabulate, xlsxwriter, matplotlib
   exit 1
 fi
 
-"$PYTHON_BIN" "$SCRIPT_DIR/main.py" -o shirong  \
-                                             -e 500 \
-                                             -b 0 \
-                                             -t ELEC \
-                                             --mops-history-years "${MOPS_HISTORY_YEARS:-5}" \
-                                             --account-equity "${TWSE_ACCOUNT_EQUITY:-1000000}" \
-                                             -m \
-                                             "$SCRIPT_DIR/stocklist_elec"
+STOCKLIST="$SCRIPT_DIR/stocklist_elec"
+if [ ! -r "$STOCKLIST" ]; then
+  echo "Stock list is not readable: $STOCKLIST" >&2
+  exit 1
+fi
+
+# Build argv without fragile multiline continuations; the stock list is data,
+# never a shell command.
+set -- "$SCRIPT_DIR/main.py"
+set -- "$@" -o shirong
+set -- "$@" -e 500
+set -- "$@" -b 0
+set -- "$@" -t ELEC
+set -- "$@" --mops-history-years "${MOPS_HISTORY_YEARS:-5}"
+set -- "$@" --account-equity "${TWSE_ACCOUNT_EQUITY:-1000000}"
+set -- "$@" -m
+set -- "$@" "$STOCKLIST"
+
+exec "$PYTHON_BIN" "$@"

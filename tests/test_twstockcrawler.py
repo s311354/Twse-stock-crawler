@@ -1,8 +1,11 @@
+import logging
+
 import pytest
 
 from infrastructure.crawler.twse_http_client import TwseErrorCategory
 from infrastructure.crawler.twse_http_client import TwseHttpConfig
 from infrastructure.crawler.twse_http_client import TwseHttpResponse
+from infrastructure.crawler.twse_http_client import TwseMarketClosedError
 from infrastructure.crawler.twse_http_client import TwseNetworkError
 from infrastructure.crawler.twse_http_client import TwseNoDataError
 from infrastructure.crawler.twse_http_client import TwseSchemaChangedError
@@ -65,16 +68,50 @@ class EndpointStubClient:
         return outcome
 
 
-def test_get_stocktype_data_returns_empty_list_when_twse_tables_have_no_rows(monkeypatch) -> None:
+def test_get_stocktype_data_classifies_full_market_empty_as_unscheduled_closed(
+    monkeypatch,
+) -> None:
     crawler = TwStockCrawler()
 
     def request_empty(query_params, date_time, payload_validator=None):
-        payload = EmptyPayloadResponse().json()
+        payload = (
+            {"stat": "很抱歉，沒有符合條件的資料!", "type": "ALLBUT0999"}
+            if query_params["type"] == crawler.FULL_MARKET_TYPE
+            else EmptyPayloadResponse().json()
+        )
         if payload_validator is not None:
             payload_validator(payload)
         return payload
 
     monkeypatch.setattr(crawler, "_request_stocktype_data", request_empty)
+
+    with pytest.raises(TwseMarketClosedError):
+        crawler.get_stocktype_data("20260515", 13)
+
+
+def test_get_stocktype_data_keeps_sector_only_empty_as_no_data(monkeypatch) -> None:
+    crawler = TwStockCrawler()
+    stock_row = ["2330", "台積電", "1,000", "1", "1", "100", "102", "99", "101"]
+
+    def request_by_scope(query_params, date_time, payload_validator=None):
+        payload = (
+            {
+                "stat": "OK",
+                "tables": [
+                    {
+                        "fields": ["證券代號", "證券名稱"],
+                        "data": [stock_row],
+                    }
+                ],
+            }
+            if query_params["type"] == crawler.FULL_MARKET_TYPE
+            else EmptyPayloadResponse().json()
+        )
+        if payload_validator is not None:
+            payload_validator(payload)
+        return payload
+
+    monkeypatch.setattr(crawler, "_request_stocktype_data", request_by_scope)
 
     assert crawler.get_stocktype_data("20260515", 13) == []
 
@@ -122,7 +159,9 @@ def test_get_stocktype_data_raises_schema_changed_for_unknown_payload(monkeypatc
     assert error.value.category is TwseErrorCategory.SCHEMA_CHANGED
 
 
-def test_market_data_network_error_fails_over_to_official_rwd_endpoint() -> None:
+def test_market_data_network_error_fails_over_to_official_rwd_endpoint(
+    caplog,
+) -> None:
     stock_row = ["2330", "台積電", "1,000", "1", "1", "100", "102", "99", "101"]
     payload = {
         "stat": "OK",
@@ -136,10 +175,43 @@ def test_market_data_network_error_fails_over_to_official_rwd_endpoint() -> None
     )
     crawler = TwStockCrawler(http_client=client)  # type: ignore[arg-type]
 
-    result = crawler.get_stocktype_data("20260402", 13)
+    with caplog.at_level(logging.DEBUG):
+        result = crawler.get_stocktype_data("20260402", 13)
 
     assert result == [stock_row]
     assert client.urls == [crawler.url, crawler.fallback_url]
+    failover = next(
+        record
+        for record in caplog.records
+        if getattr(record, "status", None) == "ENDPOINT_FAILOVER"
+    )
+    assert failover.levelno == logging.DEBUG
+    assert failover.source == "TWSE"
+    assert failover.trade_date == "20260402"
+
+
+def test_market_data_logs_only_final_endpoint_failure_in_release(caplog) -> None:
+    client = EndpointStubClient(
+        [
+            TwseNetworkError("primary unavailable", retryable=True),
+            TwseNetworkError("fallback unavailable", retryable=True),
+        ]
+    )
+    crawler = TwStockCrawler(http_client=client)  # type: ignore[arg-type]
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(TwseNetworkError):
+            crawler.get_stocktype_data("20260409", 13)
+
+    failures = [
+        record
+        for record in caplog.records
+        if getattr(record, "status", None) == "NETWORK_ERROR"
+    ]
+    assert len(failures) == 1
+    assert failures[0].levelno == logging.ERROR
+    assert failures[0].source == "TWSE"
+    assert failures[0].trade_date == "20260409"
 
 
 @pytest.mark.parametrize(

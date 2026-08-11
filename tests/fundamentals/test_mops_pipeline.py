@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import sqlite3
 from dataclasses import replace
 from urllib.parse import urlsplit
@@ -245,7 +246,8 @@ def test_mops_repository_repairs_only_orphaned_empty_state(tmp_path) -> None:
     )
     with sqlite3.connect(repository.database_path) as connection:
         connection.executemany(
-            "INSERT INTO refresh_state VALUES (?, ?)",
+            "INSERT INTO refresh_state "
+            "(symbol, full_catalog_checked_at_epoch) VALUES (?, ?)",
             [("1471", 1), ("2330", 1)],
         )
         connection.executemany(
@@ -310,6 +312,50 @@ def test_mops_repository_migrates_legacy_rows_as_unverified(tmp_path) -> None:
 
     assert filing is not None
     assert filing.availability_source == LEGACY_UNVERIFIED
+
+
+def test_refresh_state_migration_backfills_daily_revision_check(tmp_path) -> None:
+    root = tmp_path / "mops"
+    root.mkdir()
+    checked_at = int(
+        dt.datetime(2026, 8, 2, 1, 0, tzinfo=dt.timezone.utc).timestamp()
+    )
+    with sqlite3.connect(root / "mops.sqlite3") as connection:
+        connection.executescript(
+            """
+            CREATE TABLE refresh_state (
+                symbol TEXT PRIMARY KEY,
+                full_catalog_checked_at_epoch INTEGER NOT NULL
+            );
+            CREATE TABLE fundamental_snapshots (
+                symbol TEXT NOT NULL,
+                filing_set_sha256 TEXT NOT NULL,
+                sector TEXT NOT NULL,
+                annual_json TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                created_at_epoch INTEGER NOT NULL,
+                PRIMARY KEY(symbol, filing_set_sha256, sector)
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO refresh_state VALUES (?, ?)",
+            ("2330", checked_at),
+        )
+        connection.execute(
+            "INSERT INTO fundamental_snapshots VALUES (?, ?, ?, ?, ?, ?)",
+            ("2330", "non-empty", "24", "[]", "{}", checked_at),
+        )
+
+    repository = MopsRepository(root)
+
+    assert repository.last_recent_revision_check_epoch("2330") == checked_at
+    with sqlite3.connect(repository.database_path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(refresh_state)")
+        }
+    assert "recent_revision_checked_at_epoch" in columns
 
 
 def test_first_ixbrl_observation_does_not_backdate_to_board_announcement(tmp_path) -> None:
@@ -414,6 +460,46 @@ def test_mops_client_loads_company_sectors_through_twse_openapi() -> None:
     assert http_client.urls == [TWSE_COMPANY_PROFILE_URL]
 
 
+def test_mops_client_discovers_market_wide_corrections_once_per_period() -> None:
+    correction_html = """
+    <table>
+      <tr><td>2330</td><td>台積電</td><td>20260301</td><td>合併</td>
+          <td>更正財務報告</td></tr>
+      <tr><td>6281</td><td>啟碁</td><td>20260302</td><td>個別</td>
+          <td>更正附註</td></tr>
+    </table>
+    """.encode()
+
+    class FakeHttpClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def request_bytes(self, *args, **kwargs):
+            self.calls += 1
+            return type("Response", (), {"content": correction_html})()
+
+    http_client = FakeHttpClient()
+    client = MopsClient(
+        http_client=http_client,  # type: ignore[arg-type]
+        min_request_interval_seconds=0,
+    )
+    corrections = client.discover_corrections([(2025, 4), (2025, 4)])
+    candidate = MopsFilingCandidate(
+        symbol="2330",
+        fiscal_year=2025,
+        quarter=4,
+        report_id="C",
+        source_url="https://example.test/2330-2025Q4.html",
+    )
+
+    assert [(item.symbol, item.announced_on) for item in corrections] == [
+        ("2330", "20260301"),
+        ("6281", "20260302"),
+    ]
+    assert client.latest_correction(candidate) == corrections[0]
+    assert http_client.calls == 1
+
+
 def test_mops_client_prefers_consolidated_and_falls_back_to_individual(
     caplog,
 ) -> None:
@@ -436,7 +522,7 @@ def test_mops_client_prefers_consolidated_and_falls_back_to_individual(
         def request_bytes(self, *args, **kwargs):
             return type("Response", (), {"content": catalog})()
 
-    caplog.set_level("INFO")
+    caplog.set_level("DEBUG")
     client = MopsClient(
         http_client=FakeHttpClient(),
         min_request_interval_seconds=0,
@@ -465,6 +551,23 @@ def test_mops_client_prefers_consolidated_and_falls_back_to_individual(
     assert "detected_scopes=consolidated:1,individual:2" in caplog.text
     assert "fallback_scope=individual period_count=1" in caplog.text
     assert "first_period=2025Q3 latest_period=2025Q3" in caplog.text
+    fallback_record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "status", None)
+        == "INDIVIDUAL_SCOPE_FALLBACK"
+    )
+    assert fallback_record.levelno == logging.DEBUG
+    catalog_record = next(
+        record
+        for record in caplog.records
+        if "selected_filings=2" in record.getMessage()
+    )
+    assert catalog_record.symbol == "6281"
+    assert catalog_record.source == "MOPS"
+    assert catalog_record.status == "CATALOG_OK"
+    assert catalog_record.attempt == 1
+    assert catalog_record.cache_hit is False
 
 
 def test_mops_client_rechecks_explicit_no_data_with_fresh_session() -> None:

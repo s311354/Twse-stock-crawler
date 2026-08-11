@@ -122,6 +122,9 @@ class StructuredRunObserver:
         self._cache_hits = 0
         self._cache_misses = 0
         self._requested_symbols = 0
+        self._no_data_dates: set[str] = set()
+        self._closed_unscheduled_dates: set[str] = set()
+        self._missing_tracked_stocks: dict[str, str] = {}
         self._lock = Lock()
 
     def start(self, request: StockAnalysisRequest) -> None:
@@ -162,6 +165,34 @@ class StructuredRunObserver:
                 self._cache_hits += 1
             elif cache_hit is False:
                 self._cache_misses += 1
+            if source == "TWSE" and status == "NO_DATA":
+                if trade_date:
+                    self._no_data_dates.add(str(trade_date))
+                observed_dates = metrics.get("no_data_dates", ())
+                if isinstance(observed_dates, (list, tuple, set)):
+                    self._no_data_dates.update(
+                        str(value) for value in observed_dates if value
+                    )
+            if source == "TWSE" and status == "CLOSED_UNSCHEDULED":
+                if trade_date:
+                    self._closed_unscheduled_dates.add(str(trade_date))
+                observed_dates = metrics.get(
+                    "closed_unscheduled_dates",
+                    (),
+                )
+                if isinstance(observed_dates, (list, tuple, set)):
+                    self._closed_unscheduled_dates.update(
+                        str(value) for value in observed_dates if value
+                    )
+            if source == "TWSE" and status == "TRACKED_STOCK_MISSING":
+                observed_stocks = metrics.get("missing_tracked_stocks", {})
+                if isinstance(observed_stocks, dict):
+                    for stock_no, first_date in observed_stocks.items():
+                        symbol_text = str(stock_no)
+                        date_text = str(first_date)
+                        previous = self._missing_tracked_stocks.get(symbol_text)
+                        if previous is None or date_text < previous:
+                            self._missing_tracked_stocks[symbol_text] = date_text
 
         extra = structured_extra(
             run_id=self.run_id,
@@ -205,6 +236,20 @@ class StructuredRunObserver:
                 "observed_symbols": len(self._symbols),
                 "cache_hits": self._cache_hits,
                 "cache_misses": self._cache_misses,
+                "no_data_date_count": len(self._no_data_dates),
+                "no_data_dates": sorted(self._no_data_dates),
+                "closed_unscheduled_date_count": len(
+                    self._closed_unscheduled_dates
+                ),
+                "closed_unscheduled_dates": sorted(
+                    self._closed_unscheduled_dates
+                ),
+                "missing_tracked_stock_count": len(
+                    self._missing_tracked_stocks
+                ),
+                "missing_tracked_stocks": dict(
+                    sorted(self._missing_tracked_stocks.items())
+                ),
                 "events": dict(sorted(self._events.items())),
                 "statuses": dict(sorted(self._statuses.items())),
                 "sources": dict(sorted(self._sources.items())),

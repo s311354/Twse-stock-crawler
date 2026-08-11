@@ -29,11 +29,13 @@ _INCOME_COLUMNS = _IDENTITY_COLUMNS | {
 }
 _BALANCE_COLUMNS = _IDENTITY_COLUMNS | {
     "流動資產",
-    "資產總額",
     "流動負債",
-    "負債總額",
     "歸屬於母公司業主之權益合計",
-    "權益總額",
+}
+_BALANCE_ALIASES = {
+    "資產總額": ("資產總額", "資產總計"),
+    "負債總額": ("負債總額", "負債總計"),
+    "權益總額": ("權益總額", "權益總計"),
 }
 
 
@@ -70,6 +72,7 @@ class TwseFinancialBatchClient:
                 payload,
                 _BALANCE_COLUMNS,
                 "balance sheet",
+                aliases=_BALANCE_ALIASES,
             ),
         ).payload
 
@@ -101,6 +104,8 @@ class TwseFinancialBatchClient:
         payload: object,
         required_columns: frozenset[str],
         label: str,
+        *,
+        aliases: dict[str, tuple[str, ...]] | None = None,
     ) -> None:
         if not isinstance(payload, list):
             raise TwseSchemaChangedError(
@@ -119,6 +124,9 @@ class TwseFinancialBatchClient:
             )
         columns = set().union(*(row.keys() for row in payload if isinstance(row, dict)))
         missing = sorted(required_columns - columns)
+        for canonical, accepted in (aliases or {}).items():
+            if not any(column in columns for column in accepted):
+                missing.append("{} ({})".format(canonical, " or ".join(accepted)))
         if missing:
             raise TwseSchemaChangedError(
                 "TWSE {} schema is missing columns={}".format(label, missing),
@@ -181,12 +189,21 @@ class TwseFinancialBatchClient:
             ),
             basic_eps_ytd=_number(income.get("基本每股盈餘（元）")),
             current_assets=_number(balance.get("流動資產")),
-            total_assets=_number(balance.get("資產總額")),
+            total_assets=_number(_first_value(balance, _BALANCE_ALIASES["資產總額"])),
             current_liabilities=_number(balance.get("流動負債")),
-            total_liabilities=_number(balance.get("負債總額")),
+            total_liabilities=_number(
+                _first_value(balance, _BALANCE_ALIASES["負債總額"])
+            ),
             parent_equity=_number(balance.get("歸屬於母公司業主之權益合計")),
-            total_equity=_number(balance.get("權益總額")),
+            total_equity=_number(_first_value(balance, _BALANCE_ALIASES["權益總額"])),
         )
+
+
+def _first_value(row: dict[str, Any], columns: tuple[str, ...]) -> object:
+    for column in columns:
+        if column in row:
+            return row[column]
+    return None
 
 
 def _number(value: object) -> float | None:

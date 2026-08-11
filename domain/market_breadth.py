@@ -15,6 +15,7 @@ from domain.models import TwseColumns
 
 
 MARKET_BREADTH_ATTR = "les_market_breadth"
+MARKET_BREADTH_HISTORY_ATTR = "les_market_breadth_history"
 MARKET_DATA_THROUGH_ATTR = "les_market_data_through"
 MARKET_SESSION_FINAL_ATTR = "les_market_session_final"
 
@@ -163,6 +164,7 @@ def _parse_number(value: object) -> float | None:
 
 __all__ = [
     "MARKET_BREADTH_ATTR",
+    "MARKET_BREADTH_HISTORY_ATTR",
     "MARKET_DATA_THROUGH_ATTR",
     "MARKET_SESSION_FINAL_ATTR",
     "MarketBreadthSnapshot",

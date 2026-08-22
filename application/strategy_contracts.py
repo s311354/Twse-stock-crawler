@@ -6,8 +6,6 @@ import datetime
 from collections.abc import Mapping
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
-
 import pandas as pd
 
 from application.market_history import MarketHistoryInput
@@ -46,7 +44,10 @@ class StrategyDecisionSchema:
         "EREM 決策訊號",
     )
     complete_valuation_fields: tuple[str, ...] = (
+        "Valuation Confidence",
+        "Bear Case Expected CAGR",
         "Base Case Expected CAGR",
+        "Bull Case Expected CAGR",
         "Base Case Fair Value",
         "Bear Case Fair Value",
         "Bear Case Permanent Loss",
@@ -121,7 +122,7 @@ class StrategyDecisionSchema:
     def _validate_valuation(self, decision: StrategyDecision) -> None:
         status = decision.value("Valuation Model Status")
         entry_decision = decision.value("低點決策")
-        if entry_decision in {"BUY", "EARLY_BUY"}:
+        if entry_decision == "BUY":
             if status != "COMPLETE":
                 raise StrategyContractError(
                     "BUY decisions require complete valuation evidence"
@@ -365,9 +366,11 @@ class StrategyDecisionAssembler:
             "Base Case Exit PE",
             "Base Case Expected CAGR",
             "Base Case Fair Value",
+            "Bear Case Expected CAGR",
             "Bear Case Fair Value",
             "Bear Case Permanent Loss",
             "Bear Case Permanent Loss Acceptable",
+            "Bull Case Expected CAGR",
             "Bull Case Fair Value",
         }:
             return FieldSource.LES_V5_VALUATION
@@ -534,12 +537,17 @@ class StrategyDecisionAssembler:
             "Take_Profit",
             "策略停損",
             "策略停利",
+            "EREM EMA20",
+            "EREM EMA50",
+            "EREM EMA200",
         } or "Fair Value" in name or "UpperBound" in name or "Highest" in name or "Lowest" in name or "VWAP" in name:
             return FieldUnit.TWD_SCALED_1000
         if "股數" in name:
             return FieldUnit.SHARES
-        if "Count" in name:
+        if "Count" in name or name == "EREM Holding Days":
             return FieldUnit.COUNT
+        if name == "EREM Entry Weight":
+            return FieldUnit.RATIO
         if "Trigger" in name or name in {
             "No Veto",
             "Entry Candidate",
@@ -559,6 +567,7 @@ class StrategyDecisionAssembler:
                 "RS20",
                 "MOM",
                 "CS",
+                "Slope",
             )
         ):
             return FieldUnit.RATIO

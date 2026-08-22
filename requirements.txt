@@ -6,4 +6,3 @@ pytest==9.0.2
 requests==2.33.1
 tabulate==0.10.0
 XlsxWriter==3.2.9
-pytest

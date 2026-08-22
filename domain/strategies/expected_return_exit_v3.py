@@ -13,7 +13,7 @@ from domain.features import SharedFeaturePipeline
 from domain.strategy import Strategy
 
 EXPECTED_RETURN_EXIT_STRATEGY_NAME = "expected_return_exit_v3"
-EREM_V3_MODEL_VERSION = "3.0.0"
+EREM_V3_MODEL_VERSION = "3.1.0"
 EREM_V3_MAX_RAW_SCORE = 105.0
 
 EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS = [
@@ -21,6 +21,9 @@ EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS = [
     "EREM Raw Score",
     "EREM Holding Confidence",
     "EREM Entry LES",
+    "EREM Holding Days",
+    "EREM Entry Weight",
+    "EREM Exit Streak Count",
     "EREM 決策訊號",
     "EREM Trend Score",
     "EREM Momentum Score",
@@ -32,7 +35,9 @@ EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS = [
     "EREM Entry Quality Score",
     "EREM Turnover Score",
     "EREM VWAP Score",
+    "EREM VWAP State",
     "EREM EMA20",
+    "EREM EMA20 Slope",
     "EREM EMA50",
     "EREM EMA200",
     "EREM RSI14",
@@ -86,7 +91,20 @@ class ExpectedReturnExitV3Config:
     vwap_window: int = 60
     turnover_strength_threshold: float = 1.2
     excessive_atr_ratio: float = 1.2
+    entry_weight_initial: float = 0.40
+    entry_weight_floor: float = 0.10
+    entry_weight_decay_days: float = 20.0
+    exit_confidence_threshold: float = 40.0
+    ema_slope_lookback: int = 5
     epsilon: float = 1e-9
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.entry_weight_floor <= self.entry_weight_initial <= 1:
+            raise ValueError(
+                "entry weights must satisfy 0 <= floor <= initial <= 1"
+            )
+        if self.entry_weight_decay_days <= 0:
+            raise ValueError("entry_weight_decay_days must be positive")
 
 
 class ExpectedReturnExitV3Strategy(Strategy):
@@ -98,7 +116,10 @@ class ExpectedReturnExitV3Strategy(Strategy):
     """
 
     name = EXPECTED_RETURN_EXIT_STRATEGY_NAME
-    description = "Holding confidence scoring with trend, momentum, volatility, distribution, relative strength, and entry quality components"
+    description = (
+        "Holding confidence with decaying Entry LES memory, three-state VWAP, "
+        "trend, momentum, volatility, distribution, and relative strength"
+    )
     version = EREM_V3_MODEL_VERSION
 
     def __init__(self, config: ExpectedReturnExitV3Config | None = None) -> None:
@@ -287,6 +308,33 @@ class ExpectedReturnExitV3Strategy(Strategy):
             ("Entry LES", "Entry_LES", "進場 LES", "進場LES", "低點分數"),
         ).ffill().clip(lower=0, upper=100)
         entry_les_available = entry_les.notna()
+        holding_days = self._numeric_column(
+            df,
+            ("Holding Days", "Holding_Days", "持有天數"),
+        ).clip(lower=0)
+        holding_days_available = holding_days.notna()
+        decayed_entry_weight = self.config.entry_weight_initial * np.exp(
+            -holding_days / self.config.entry_weight_decay_days
+        )
+        entry_weight = pd.Series(
+            np.where(
+                entry_les_available,
+                np.where(
+                    holding_days_available,
+                    np.maximum(
+                        self.config.entry_weight_floor,
+                        decayed_entry_weight,
+                    ),
+                    self.config.entry_weight_floor,
+                ),
+                0.0,
+            ),
+            index=df.index,
+            dtype="float64",
+        ).clip(
+            lower=0,
+            upper=self.config.entry_weight_initial,
+        )
         entry_quality_score = pd.Series(
             np.select([entry_les >= 75, entry_les >= 60], [5, 3], default=0),
             index=df.index,
@@ -304,12 +352,7 @@ class ExpectedReturnExitV3Strategy(Strategy):
         )
 
         vwap60 = feature_data["vwap60_close"]
-        vwap_safety = vwap60.notna() & (close < vwap60)
-        vwap_score = pd.Series(
-            np.where(vwap_safety, 5, 0),
-            index=df.index,
-            dtype="float64",
-        )
+        vwap_score, vwap_state = self._vwap_assessment(close, vwap60)
 
         raw_score = (
             trend_score
@@ -324,15 +367,18 @@ class ExpectedReturnExitV3Strategy(Strategy):
             + vwap_score
         ).clip(lower=0, upper=EREM_V3_MAX_RAW_SCORE)
         current_score = (raw_score * 100 / EREM_V3_MAX_RAW_SCORE).clip(lower=0, upper=100)
-        holding_confidence = pd.Series(
-            np.where(
-                entry_les_available,
-                (0.6 * current_score) + (0.4 * entry_les),
-                current_score,
-            ),
-            index=df.index,
-            dtype="float64",
+        entry_anchor = entry_les.where(entry_les_available, current_score)
+        holding_confidence = (
+            (1 - entry_weight) * current_score
+            + entry_weight * entry_anchor
         ).clip(lower=0, upper=100)
+        exit_streak = self._consecutive_true(
+            holding_confidence < self.config.exit_confidence_threshold
+        )
+        ema20_slope = (
+            (ema20 - ema20.shift(self.config.ema_slope_lookback))
+            / (self.config.ema_slope_lookback * atr14)
+        ).where(atr14.abs() > self.config.epsilon)
         decision = self._decision(holding_confidence)
 
         result = pd.DataFrame(
@@ -341,6 +387,9 @@ class ExpectedReturnExitV3Strategy(Strategy):
                 "EREM Raw Score": raw_score.round(2),
                 "EREM Holding Confidence": holding_confidence.round(2),
                 "EREM Entry LES": entry_les.round(2),
+                "EREM Holding Days": holding_days.round(0),
+                "EREM Entry Weight": entry_weight.round(4),
+                "EREM Exit Streak Count": exit_streak,
                 "EREM 決策訊號": decision,
                 "EREM Trend Score": trend_score.round(2),
                 "EREM Momentum Score": momentum_score.round(2),
@@ -352,7 +401,9 @@ class ExpectedReturnExitV3Strategy(Strategy):
                 "EREM Entry Quality Score": entry_quality_score.round(2),
                 "EREM Turnover Score": turnover_score.round(2),
                 "EREM VWAP Score": vwap_score.round(2),
+                "EREM VWAP State": vwap_state,
                 "EREM EMA20": ema20.round(2),
+                "EREM EMA20 Slope": ema20_slope.round(4),
                 "EREM EMA50": ema50.round(2),
                 "EREM EMA200": ema200.round(2),
                 "EREM RSI14": rsi.round(2),
@@ -388,7 +439,12 @@ class ExpectedReturnExitV3Strategy(Strategy):
                     raw_score=raw_score,
                     current_score=current_score,
                     holding_confidence=holding_confidence,
+                    exit_streak=exit_streak,
+                    ema20_slope=ema20_slope,
                     entry_les_available=entry_les_available,
+                    holding_days=holding_days,
+                    holding_days_available=holding_days_available,
+                    entry_weight=entry_weight,
                     relative_strength_available=relative_strength_available,
                     trend_score=trend_score,
                     momentum_score=momentum_score,
@@ -400,6 +456,7 @@ class ExpectedReturnExitV3Strategy(Strategy):
                     entry_quality_score=entry_quality_score,
                     turnover_score=turnover_score,
                     vwap_score=vwap_score,
+                    vwap_state=vwap_state,
                     decision=decision,
                 ),
             },
@@ -434,6 +491,63 @@ class ExpectedReturnExitV3Strategy(Strategy):
                 return pd.to_numeric(df[name], errors="coerce"), name
         return volume, "Volume/VolumeMA20 proxy"
 
+    @staticmethod
+    def _consecutive_true(condition: pd.Series) -> pd.Series:
+        """Count consecutive true sessions without carrying across a reset."""
+        mask = condition.fillna(False).astype(bool)
+        groups = (~mask).cumsum()
+        return mask.groupby(groups).cumsum().astype("int64")
+
+    @staticmethod
+    def _vwap_assessment(
+        close: pd.Series,
+        vwap60: pd.Series,
+    ) -> tuple[pd.Series, pd.Series]:
+        """Score VWAP support, recovery, or continued weakness."""
+        available = close.notna() & vwap60.notna()
+        above_or_equal = available & (close >= vwap60)
+        below = available & (close < vwap60)
+        gap = vwap60 - close
+        recovering = (
+            below
+            & (close > close.shift(1))
+            & (gap < gap.shift(1))
+        )
+        synchronous_decline = (
+            below
+            & (close < close.shift(1))
+            & (vwap60 < vwap60.shift(1))
+        )
+        score = pd.Series(
+            np.select(
+                [above_or_equal, recovering],
+                [5.0, 2.0],
+                default=0.0,
+            ),
+            index=close.index,
+            dtype="float64",
+        )
+        state = pd.Series(
+            np.select(
+                [
+                    ~available,
+                    above_or_equal,
+                    recovering,
+                    synchronous_decline,
+                ],
+                [
+                    "UNAVAILABLE",
+                    "ABOVE_OR_EQUAL",
+                    "RECOVERING",
+                    "BELOW_SYNCHRONOUS_DECLINE",
+                ],
+                default="BELOW_NOT_RECOVERING",
+            ),
+            index=close.index,
+            dtype="object",
+        )
+        return score, state
+
     def _decision(self, score: pd.Series) -> pd.Series:
         return pd.Series(
             np.select(
@@ -449,7 +563,12 @@ class ExpectedReturnExitV3Strategy(Strategy):
         raw_score: pd.Series,
         current_score: pd.Series,
         holding_confidence: pd.Series,
+        exit_streak: pd.Series,
+        ema20_slope: pd.Series,
         entry_les_available: pd.Series,
+        holding_days: pd.Series,
+        holding_days_available: pd.Series,
+        entry_weight: pd.Series,
         relative_strength_available: pd.Series,
         trend_score: pd.Series,
         momentum_score: pd.Series,
@@ -461,6 +580,7 @@ class ExpectedReturnExitV3Strategy(Strategy):
         entry_quality_score: pd.Series,
         turnover_score: pd.Series,
         vwap_score: pd.Series,
+        vwap_state: pd.Series,
         decision: pd.Series,
     ) -> pd.Series:
         score_frame = pd.DataFrame(
@@ -468,7 +588,12 @@ class ExpectedReturnExitV3Strategy(Strategy):
                 "raw": raw_score,
                 "current": current_score,
                 "holding": holding_confidence,
+                "exit_streak": exit_streak,
+                "ema20_slope": ema20_slope,
                 "entry_available": entry_les_available,
+                "holding_days": holding_days,
+                "holding_days_available": holding_days_available,
+                "entry_weight": entry_weight,
                 "rs_available": relative_strength_available,
                 "trend": trend_score,
                 "momentum": momentum_score,
@@ -480,6 +605,7 @@ class ExpectedReturnExitV3Strategy(Strategy):
                 "entry": entry_quality_score,
                 "turnover": turnover_score,
                 "vwap": vwap_score,
+                "vwap_state": vwap_state,
                 "decision": decision,
             }
         )
@@ -490,14 +616,27 @@ class ExpectedReturnExitV3Strategy(Strategy):
                 missing.append("TAIEX")
             if not bool(row["entry_available"]):
                 missing.append("Entry LES")
+            if bool(row["entry_available"]) and not bool(
+                row["holding_days_available"]
+            ):
+                missing.append("Holding Days")
             missing_note = "；缺少=" + ",".join(missing) if missing else ""
             values = row.to_dict()
             values["missing_note"] = missing_note
+            values["holding_days_text"] = (
+                "{:.0f}".format(row["holding_days"])
+                if bool(row["holding_days_available"])
+                else "N/A"
+            )
             return (
                 "原始{raw:.0f}/105→EREM{current:.2f}；趨勢{trend:+.0f}；動能{momentum:+.0f}；"
                 "波動{volatility:+.0f}；籌碼{distribution:+.0f}；剩餘報酬{remaining:+.0f}；"
                 "相對強弱{relative:+.0f}；結構{structure:+.0f}；進場品質{entry:+.0f}；"
-                "週轉{turnover:+.0f}；VWAP{vwap:+.0f}；持有信心{holding:.2f}；決策={decision}{missing_note}"
+                "週轉{turnover:+.0f}；VWAP{vwap:+.0f}({vwap_state})；"
+                "HoldingDays={holding_days_text}；EntryWeight={entry_weight:.4f}；"
+                "持有信心{holding:.2f}；"
+                "ExitStreak={exit_streak:.0f}；EMA20Slope={ema20_slope:.4f}；"
+                "決策={decision}{missing_note}"
             ).format(**values)
 
         return score_frame.apply(format_reason, axis=1)
@@ -509,6 +648,9 @@ class ExpectedReturnExitV3Strategy(Strategy):
                 "EREM 分數": 0,
                 "EREM Raw Score": 0,
                 "EREM Holding Confidence": 0,
+                "EREM Holding Days": np.nan,
+                "EREM Entry Weight": 0,
+                "EREM Exit Streak Count": 0,
                 "EREM 決策訊號": "EXIT",
                 "EREM Trend Score": 0,
                 "EREM Momentum Score": 0,
@@ -520,6 +662,7 @@ class ExpectedReturnExitV3Strategy(Strategy):
                 "EREM Entry Quality Score": 0,
                 "EREM Turnover Score": 0,
                 "EREM VWAP Score": 0,
+                "EREM VWAP State": "UNAVAILABLE",
                 "EREM MACD Histogram Rising": 0,
                 "EREM MACD Histogram Falling 2D": 0,
                 "EREM Bearish Divergence": 0,

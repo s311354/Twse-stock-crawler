@@ -88,6 +88,16 @@ class LegacyCrawlerFacade:
                 if self.iso_scheduled_times
                 else ""
             ),
+            entry_les_by_stock=getattr(
+                self,
+                "portfolio_entry_les_by_stock",
+                {},
+            ),
+            entry_dates_by_stock=getattr(
+                self,
+                "portfolio_entry_dates_by_stock",
+                {},
+            ),
             market_breadth_snapshots=getattr(
                 self,
                 "market_breadth_snapshots_by_date",
@@ -266,20 +276,6 @@ class LegacyCrawlerFacade:
                 raise ValueError("account_equity must be positive")
             self.low_entry_v4_account_equity = float(account_equity)
 
-    def _strategy_inputs(
-        self,
-        histories: list[pd.DataFrame] | None = None,
-        feature_frames: list[FeatureFrame] | None = None,
-    ) -> tuple[list[pd.DataFrame], list[FeatureFrame]]:
-        prepared = (
-            self._analysis_dataset_builder.prepare_strategy_inputs(
-                self._market_history_input(),
-                histories,
-                feature_frames,
-            )
-        )
-        return list(prepared.histories), list(prepared.feature_frames)
-
     def cal_low_entry_strategy(
         self,
         histories: list[pd.DataFrame] | None = None,
@@ -394,7 +390,7 @@ class LegacyCrawlerFacade:
         decisions: Sequence[StrategyDecision],
     ) -> str:
         renderer = RendererFactory.get_renderer(
-            "low_entry_score_v5"
+            "daily_strategy_email"
         )
         return renderer.render(decisions)
 

@@ -14,10 +14,13 @@ from application.contracts import MarketStatus
 from application.contracts import StockAnalysisRequest
 from application.contracts import StrategyEvaluation
 from application.observability import NullRunObserver
+from application.portfolio_allocation import PortfolioAllocationPipeline
+from application.portfolio_allocation import PortfolioRuntimeContext
 from application.ports import MarketCalendarPort
 from application.ports import RunObserverPort
 from config.settings import QUERY_WAIT_SECONDS
 from domain.fundamental_derivation import FundamentalBundle
+from domain.models import PortfolioPosition
 from domain.security_identity import SecurityIdentity
 from domain.security_identity import resolve_security_identity
 from infrastructure.crawler.twse_http_client import TwseClientError
@@ -59,6 +62,7 @@ class CrawlerMarketDataAdapter:
             symbol_count=len(request.stocklist),
         )
         crawler = self._crawler_factory(len(request.stocklist))
+        crawler.analysis_universe = str(request.stocktype)
         crawler.get_date_times(
             begin_backtrack=request.beginbacktrack,
             end_backtrack=request.endbacktrack,
@@ -595,11 +599,34 @@ class CrawlerFundamentalAdapter:
 
 
 class CrawlerStrategyAdapter:
-    def __init__(self, *, observer: RunObserverPort | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        observer: RunObserverPort | None = None,
+        portfolio_allocator: PortfolioAllocationPipeline | None = None,
+        portfolio_positions: tuple[PortfolioPosition, ...] = (),
+        portfolio_current_cash: float | None = None,
+        account_equity: float = 1_000_000.0,
+    ) -> None:
         self._observer = observer or NullRunObserver()
+        self._portfolio_allocator = portfolio_allocator
+        self._portfolio_positions = portfolio_positions
+        self._portfolio_current_cash = portfolio_current_cash
+        self._account_equity = account_equity
 
     def evaluate(self, context: AnalysisContext) -> StrategyEvaluation:
         crawler = context.resource
+        if self._portfolio_allocator is not None:
+            crawler.portfolio_entry_les_by_stock = {
+                position.symbol: position.entry_les
+                for position in self._portfolio_positions
+                if position.entry_les is not None
+            }
+            crawler.portfolio_entry_dates_by_stock = {
+                position.symbol: position.entry_date
+                for position in self._portfolio_positions
+                if position.entry_date is not None
+            }
         maxprofits = crawler.cal_max_profit()
         decision_builder = getattr(
             crawler,
@@ -611,6 +638,30 @@ class CrawlerStrategyAdapter:
             if callable(decision_builder)
             else ()
         )
+        if self._portfolio_allocator is not None and decisions:
+            snapshots = getattr(
+                crawler,
+                "fundamental_snapshots_by_stock",
+                {},
+            )
+            sector_by_symbol = {
+                str(symbol): str(snapshot.get("sector", "")).strip()
+                for symbol, snapshot in snapshots.items()
+                if isinstance(snapshot, dict)
+                and str(snapshot.get("sector", "")).strip()
+            }
+            decisions = self._portfolio_allocator.enrich(
+                decisions,
+                PortfolioRuntimeContext(
+                    account_equity=self._account_equity,
+                    positions=self._portfolio_positions,
+                    current_cash=self._portfolio_current_cash,
+                    sector_by_symbol=sector_by_symbol,
+                    default_sector=str(
+                        getattr(crawler, "analysis_universe", "UNKNOWN")
+                    ),
+                ),
+            )
         evaluation = StrategyEvaluation(
             maxprofits=maxprofits,
             decisions=decisions,
@@ -621,6 +672,16 @@ class CrawlerStrategyAdapter:
             source="STRATEGY",
             status="SUCCESS",
             result_count=len(evaluation.maxprofits),
+            pae_status=(
+                evaluation.decisions[0].value("PAE Status")
+                if evaluation.decisions
+                else None
+            ),
+            pae_mode=(
+                evaluation.decisions[0].value("PAE Mode")
+                if evaluation.decisions
+                else None
+            ),
         )
         return evaluation
 

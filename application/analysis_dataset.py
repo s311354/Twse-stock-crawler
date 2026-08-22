@@ -24,6 +24,9 @@ from domain.strategies.expected_return_exit_v3 import (
 )
 from domain.strategies.low_entry_score_v5 import LOW_ENTRY_OUTPUT_COLUMNS
 from domain.strategies.low_entry_score_v5 import LOW_ENTRY_STRATEGY_NAME
+from domain.strategies.portfolio_allocation_v1 import (
+    PORTFOLIO_ALLOCATION_OUTPUT_COLUMNS,
+)
 
 
 PROFIT_COLUMNS = [
@@ -52,10 +55,14 @@ BASE_COLUMNS = [
     "利潤比",
     *SIGNAL_COLUMNS,
 ]
-ANALYSIS_COLUMNS = (
+CORE_ANALYSIS_COLUMNS = (
     BASE_COLUMNS
     + LOW_ENTRY_OUTPUT_COLUMNS
     + EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS
+)
+ANALYSIS_COLUMNS = (
+    CORE_ANALYSIS_COLUMNS
+    + PORTFOLIO_ALLOCATION_OUTPUT_COLUMNS
 )
 
 
@@ -225,13 +232,14 @@ class AnalysisDatasetBuilder:
             values[-1] if values else None
             for values in market.closes
         ]
-        return analysis[ANALYSIS_COLUMNS]
+        return analysis[CORE_ANALYSIS_COLUMNS]
 
 
 __all__ = [
     "AnalysisDatasetBuilder",
     "ANALYSIS_COLUMNS",
     "BASE_COLUMNS",
+    "CORE_ANALYSIS_COLUMNS",
     "PROFIT_COLUMNS",
     "SIGNAL_COLUMNS",
 ]

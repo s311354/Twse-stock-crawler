@@ -1,0 +1,120 @@
+{
+  "analysis_columns": {
+    "count": 232,
+    "sha256": "b38e96377d7ba01f31c3cb0cd375a80e856beaf12bf316df43c44927d7a95a14"
+  },
+  "captured_on": "2026-08-22",
+  "cli": {
+    "actions": [
+      {"choices": null, "dest": "list_strategies", "nargs": 0, "options": ["--list-strategies"]},
+      {"choices": null, "dest": "check_config", "nargs": 0, "options": ["--check-config"]},
+      {"choices": null, "dest": "stocklist", "nargs": "*", "options": []},
+      {"choices": ["VEH", "ELEC", "BUI", "AIR", "CHEMI", "BIO", "SEMI", "COMP", "COMM"], "dest": "type", "nargs": null, "options": ["-t", "--type"]},
+      {"choices": ["SHIRONG", "shirong"], "dest": "output_file_names", "nargs": null, "options": ["-o", "--output_file_names"]},
+      {"choices": null, "dest": "endbacktrack", "nargs": null, "options": ["-e", "--endbacktrack"]},
+      {"choices": null, "dest": "beginbacktrack", "nargs": null, "options": ["-b", "--beginbacktrack"]},
+      {"choices": null, "dest": "subject", "nargs": null, "options": ["-s", "--subject"]},
+      {"choices": null, "dest": "ccreceiver", "nargs": null, "options": ["-cc", "--ccreceiver"]},
+      {"choices": null, "dest": "linechart", "nargs": 0, "options": ["-l", "--linechart"]},
+      {"choices": null, "dest": "period", "nargs": null, "options": ["-p", "--period"]},
+      {"choices": null, "dest": "mail", "nargs": 0, "options": ["-m", "--mail"]},
+      {"choices": null, "dest": "skip_mops", "nargs": 0, "options": ["--skip-mops"]},
+      {"choices": null, "dest": "mops_history_years", "nargs": null, "options": ["--mops-history-years"]},
+      {"choices": null, "dest": "account_equity", "nargs": null, "options": ["--account-equity"]},
+      {"choices": null, "dest": "pae_holdings_file", "nargs": null, "options": ["--pae-holdings-file"]},
+      {"choices": null, "dest": "pae_current_cash", "nargs": null, "options": ["--pae-current-cash"]},
+      {"choices": ["release", "debug"], "dest": "mode", "nargs": null, "options": ["--mode"]}
+    ],
+    "sha256": "afcb7379d85862e1a20624551ed13d2b13e7d1d4e007cca9b4e7e79cf6e46114"
+  },
+  "decision_schema_version": "1.0.0",
+  "daily_email": {
+    "headings": [
+      "今日決策卡",
+      "進場決策彙整（BUY / BUY_SMALL）",
+      "投資組合配置（PAE v1.1.5）",
+      "低點進場判斷（Low-Entry Model v5）+ 預期報酬出場判斷（EREM v3）"
+    ],
+    "normalized_sha256": "939065d3beed674092f713ae13d54275d3d73cc553fe00dbc81240704e02e778",
+    "sections": ["daily-decision-cards", "entry-decisions", "portfolio-allocation", "model-guide"]
+  },
+  "pae_decision": {
+    "best_executable_alternative": "2330",
+    "best_strategic_alternative": "2330",
+    "lines": [
+      {
+        "action": "ADD",
+        "cer": 0.174,
+        "executable": true,
+        "reason": "COLD_START_EXECUTABLE",
+        "role": "CANDIDATE",
+        "strategic": true,
+        "symbol": "2330",
+        "target_weight": 0.333333333333
+      }
+    ],
+    "mode": "COLD_START",
+    "model_version": "1.1.5",
+    "portfolio_expected_cer": 0.174,
+    "reason": "ALLOCATION_COMPLETE",
+    "required_return": 0.1,
+    "target_cash_weight": 0.666666666667
+  },
+  "public_imports": {
+    "application.stock_service": ["StockAnalysisRequest", "StockAnalysisService"],
+    "domain.model_contracts": ["DecisionField", "FieldSource", "FieldUnit", "StrategyDecision"],
+    "domain.strategy": ["Strategy", "StrategyRegistry", "available_strategies", "get_strategy", "register_strategy"],
+    "infrastructure.bootstrap": ["StockAnalysisRuntime", "build_stock_analysis_runtime", "build_stock_analysis_service"],
+    "interface.cli": ["build_preflight_summary", "build_request", "build_run_configuration", "create_parser", "load_pae_holdings_file", "main"],
+    "stockanalysis": ["TwseCrawker"],
+    "twstockcrawler": ["SMTPEmail", "TwStockCrawler"]
+  },
+  "renderers": [
+    "daily_strategy_email",
+    "expected_return_exit_v3",
+    "low_entry_score",
+    "low_entry_score_v2",
+    "low_entry_score_v3",
+    "low_entry_score_v4",
+    "low_entry_score_v4_1",
+    "low_entry_score_v5",
+    "portfolio_allocation_v1"
+  ],
+  "sqlite": {
+    "market_history": {
+      "indexes": ["market_history_cache_lookup"],
+      "tables": {
+        "market_history_cache": ["trade_date", "dataset", "market_type", "schema_version", "payload_json", "cached_at_epoch"]
+      }
+    },
+    "mops": {
+      "indexes": ["facts_filing_concept", "filings_symbol_available_epoch", "filings_symbol_period", "financial_batch_snapshots_point_in_time", "refresh_state_active_snapshot"],
+      "tables": {
+        "facts": ["id", "filing_id", "concept", "context_id", "unit", "numeric_value", "text_value", "start_date", "end_date", "instant", "dimensions_json"],
+        "filings": ["id", "symbol", "fiscal_year", "quarter", "report_id", "available_at", "available_at_epoch", "fetched_at", "revision_number", "content_sha256", "source_url", "raw_path", "period_end", "statement_scope", "audit_status", "correction_description", "availability_source", "correction_announced_on"],
+        "financial_batch_snapshots": ["id", "symbol", "fiscal_year", "quarter", "content_sha256", "observed_at", "observed_at_epoch", "snapshot_json"],
+        "financial_batch_state": ["symbol", "fiscal_year", "quarter", "content_sha256", "observed_at_epoch"],
+        "fundamental_snapshots": ["symbol", "filing_set_sha256", "sector", "annual_json", "snapshot_json", "created_at_epoch"],
+        "refresh_state": ["symbol", "full_catalog_checked_at_epoch", "recent_revision_checked_at_epoch", "active_filing_set_sha256", "active_snapshot_cache_key", "active_derivation_version", "active_snapshot_available_at_epoch", "active_latest_fiscal_year", "active_latest_quarter", "active_annual_history_years"]
+      }
+    },
+    "portfolio": {
+      "indexes": ["idx_pae_pair_date"],
+      "tables": {
+        "pae_opportunity_evidence": ["trade_date", "incumbent_symbol", "challenger_symbol", "excess_opportunity", "model_version"]
+      }
+    }
+  },
+  "strategies": {
+    "expected_return_exit": "",
+    "expected_return_exit_v2": "",
+    "expected_return_exit_v3": "3.1.0",
+    "low_entry_score": "",
+    "low_entry_score_v2": "",
+    "low_entry_score_v3": "",
+    "low_entry_score_v4": "",
+    "low_entry_score_v4_1": "4.1.0",
+    "low_entry_score_v5": "5.0.0",
+    "portfolio_allocation_v1": "1.1.5"
+  }
+}

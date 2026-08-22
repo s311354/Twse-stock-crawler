@@ -30,10 +30,19 @@ def test_app_settings_validate_and_normalize_all_runtime_groups(tmp_path) -> Non
             "TWSE_MARKET_HISTORY_CACHE_PATH": str(
                 tmp_path / "market_history.sqlite3"
             ),
+            "TWSE_RUN_LOCK_PATH": str(tmp_path / "analysis.lock"),
             "MOPS_CACHE_DIR": str(tmp_path / "mops"),
             "MOPS_SQLITE_CONNECT_ATTEMPTS": "5",
             "MOPS_HISTORY_YEARS": "6",
             "TWSE_ACCOUNT_EQUITY": "2500000",
+            "TWSE_PAE_HOLDINGS_JSON": (
+                '[{"symbol":"2330","shares":1000,'
+                '"average_cost":900,"entry_les":82,'
+                '"entry_date":"2026-08-05",'
+                '"sector":"24","correlation_cluster":"FOUNDRY"}]'
+            ),
+            "TWSE_PAE_CURRENT_CASH": "1500000",
+            "TWSE_PAE_PERSISTENCE_PATH": str(tmp_path / "pae.sqlite3"),
             "TWSE_SMTP_EMAIL": "investor@gmail.com",
             "TWSE_SMTP_PASSWORD": "app-password",
             "TWSE_SMTP_RECEIVERS": "one@example.com,two@example.com",
@@ -50,9 +59,15 @@ def test_app_settings_validate_and_normalize_all_runtime_groups(tmp_path) -> Non
     assert settings.market_history_cache_path == (
         tmp_path / "market_history.sqlite3"
     )
+    assert settings.run_lock_path == tmp_path / "analysis.lock"
     assert settings.mops_sqlite_connect_attempts == 5
     assert settings.mops_history_years == 6
     assert settings.account_equity == 2_500_000
+    assert settings.pae_positions[0].symbol == "2330"
+    assert settings.pae_positions[0].entry_les == 82
+    assert settings.pae_positions[0].entry_date.isoformat() == "2026-08-05"
+    assert settings.pae_current_cash == 1_500_000
+    assert settings.pae_persistence_path == tmp_path / "pae.sqlite3"
     assert settings.smtp_receivers == (
         "one@example.com",
         "two@example.com",
@@ -100,6 +115,16 @@ def test_runtime_mode_argument_overrides_environment(tmp_path) -> None:
         ({"TWSE_ACCOUNT_EQUITY": "-1"}, "must be greater than zero"),
         ({"MOPS_HISTORY_YEARS": "2"}, "must be at least 3"),
         ({"TWSE_RUNTIME_MODE": "verbose"}, "must be release or debug"),
+        ({"TWSE_PAE_HOLDINGS_JSON": "{}"}, "must be a JSON array"),
+        (
+            {
+                "TWSE_PAE_HOLDINGS_JSON": (
+                    '[{"symbol":"2330","shares":100},'
+                    '{"symbol":"2330","shares":200}]'
+                )
+            },
+            "duplicate symbols",
+        ),
     ],
 )
 def test_app_settings_reject_invalid_values(

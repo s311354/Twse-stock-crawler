@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 from collections.abc import Mapping
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -53,6 +54,11 @@ class MarketHistoryInput:
     signal_dates: Mapping[str, str]
     account_equity: float | None
     fallback_date: str = ""
+    entry_les_by_stock: Mapping[str, float] = field(default_factory=dict)
+    entry_dates_by_stock: Mapping[
+        str,
+        datetime.date | str,
+    ] = field(default_factory=dict)
     market_breadth_snapshots: Mapping[
         str,
         Mapping[str, object],
@@ -132,6 +138,28 @@ class MarketHistoryAssembler:
             }
         )
         stock_no = market.stock_numbers[item]
+        entry_les = market.entry_les_by_stock.get(stock_no)
+        entry_date = market.entry_dates_by_stock.get(stock_no)
+        if entry_date is not None:
+            parsed_entry_date = pd.to_datetime(entry_date, errors="coerce")
+            parsed_dates = pd.to_datetime(history["Date"], errors="coerce")
+            if pd.notna(parsed_entry_date):
+                holding_days = (
+                    parsed_dates.dt.normalize()
+                    - pd.Timestamp(parsed_entry_date).normalize()
+                ).dt.days
+                active_holding = holding_days >= 0
+                history["Holding Days"] = holding_days.where(active_holding)
+                if entry_les is not None:
+                    # Entry LES applies only from the declared entry date.
+                    history["Entry LES"] = pd.Series(
+                        float(entry_les),
+                        index=history.index,
+                    ).where(active_holding)
+        elif entry_les is not None:
+            # Missing entry date remains supported. EREM applies only its 10%
+            # floor so unknown recency cannot claim full new-entry protection.
+            history["Entry LES"] = float(entry_les)
         dates = market.dates[item]
         market_data_through = str(dates[-1]) if dates else None
         history.attrs[SIGNAL_DATE_ATTR] = market.signal_dates.get(

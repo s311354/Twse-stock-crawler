@@ -42,6 +42,8 @@ def market_history_input() -> MarketHistoryInput:
         signal_dates={"2330": "2026-07-25T13:30:00+08:00"},
         account_equity=1_000_000.0,
         fallback_date="2026-07-25",
+        entry_les_by_stock={"2330": 82.0},
+        entry_dates_by_stock={"2330": "2026-07-24"},
     )
 
 
@@ -66,6 +68,8 @@ def test_market_history_assembler_preserves_context_and_aligns_optional_data() -
     assert history.attrs[ANNUAL_FUNDAMENTALS_ATTR].equals(
         pd.DataFrame({"fiscal_year": [2025]})
     )
+    assert history["Entry LES"].tolist() == [82.0, 82.0]
+    assert history["Holding Days"].tolist() == [0, 1]
 
 
 def test_market_history_assembler_rejects_misaligned_required_data() -> None:

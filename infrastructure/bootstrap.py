@@ -10,6 +10,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from application.fundamental_service import MopsFundamentalService
+from application.portfolio_allocation import PortfolioAllocationPipeline
 from application.stock_service import StockAnalysisService
 from application.use_cases import EvaluateStrategies
 from application.use_cases import FetchMarketData
@@ -26,6 +27,9 @@ from infrastructure.fundamentals.mops_repository import MopsRepository
 from infrastructure.fundamentals.twse_financial_batch import TwseFinancialBatchClient
 from infrastructure.observability import StructuredRunObserver
 from infrastructure.storage.market_history_cache import SQLiteMarketHistoryCache
+from infrastructure.storage.portfolio_persistence import (
+    SQLitePortfolioPersistence,
+)
 from infrastructure.stock_analysis_adapters import CrawlerFundamentalAdapter
 from infrastructure.stock_analysis_adapters import CrawlerLineChartAdapter
 from infrastructure.stock_analysis_adapters import CrawlerMarketDataAdapter
@@ -93,6 +97,10 @@ def build_stock_analysis_runtime(
             and effective_settings.smtp_receivers
         ),
         account_equity_valid=effective_settings.account_equity > 0,
+        pae_holding_count=len(effective_settings.pae_positions),
+        pae_persistence_configured=bool(
+            effective_settings.pae_persistence_path
+        ),
     )
 
     if now_provider is not None:
@@ -189,7 +197,17 @@ def build_stock_analysis_runtime(
             effective_now_provider,
         ),
         evaluate_strategies=EvaluateStrategies(
-            CrawlerStrategyAdapter(observer=observer)
+            CrawlerStrategyAdapter(
+                observer=observer,
+                portfolio_allocator=PortfolioAllocationPipeline(
+                    persistence=SQLitePortfolioPersistence(
+                        effective_settings.pae_persistence_path
+                    )
+                ),
+                portfolio_positions=effective_settings.pae_positions,
+                portfolio_current_cash=effective_settings.pae_current_cash,
+                account_equity=effective_settings.account_equity,
+            )
         ),
         generate_report=GenerateReport(
             CrawlerReportAdapter(observer=observer)

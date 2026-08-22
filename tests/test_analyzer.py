@@ -6,6 +6,17 @@ from twse.analyzer import max_profit_unlimited
 from twse.analyzer import max_profit_with_fee
 
 
+def test_legacy_analyzer_exports_domain_services() -> None:
+    from domain import services
+
+    assert compute_signal_features is services.compute_signal_features
+    assert evaluate_low_entry is services.evaluate_low_entry
+    assert max_profit is services.max_profit
+    assert max_profit_k_transactions is services.max_profit_k_transactions
+    assert max_profit_unlimited is services.max_profit_unlimited
+    assert max_profit_with_fee is services.max_profit_with_fee
+
+
 def test_profit_calculations() -> None:
     prices = [100, 120, 90, 130]
 

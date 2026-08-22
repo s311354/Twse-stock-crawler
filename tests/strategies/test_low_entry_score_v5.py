@@ -1,4 +1,6 @@
+import json
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -13,6 +15,7 @@ from domain.strategies.low_entry_score_v4 import attach_low_entry_v4_context
 from domain.strategies.low_entry_score_v4 import ACCOUNT_EQUITY_ATTR
 from domain.strategies.low_entry_score_v4 import LowEntryScoreV4Strategy
 from domain.strategies.low_entry_score_v4 import PRICE_SCALE_ATTR
+from domain.strategies.low_entry_score_v5 import BroadRallyTier
 from domain.strategies.low_entry_score_v5 import FallingKnifeState
 from domain.strategies.low_entry_score_v5 import LowEntryScoreV5Config
 from domain.strategies.low_entry_score_v5 import LowEntryScoreV5Strategy
@@ -107,6 +110,32 @@ def _quality_snapshot(**overrides: object) -> dict[str, object]:
     return snapshot
 
 
+def _air_quality_snapshot(**overrides: object) -> dict[str, object]:
+    snapshot = _quality_snapshot(
+        sector="15",
+        twse_debt_ratio=0.7306,
+        twse_current_ratio=0.6684,
+        twse_roe_ytd_end_balance=0.0658,
+        twse_roa_ytd_end_balance=0.0197,
+        roe_ttm=0.1340,
+        roa_ttm=0.0355,
+        net_debt_to_equity=0.5621,
+        gross_margin_change=-0.0177,
+        asset_growth_supported=False,
+        audit_opinion="QUALIFIED_SCOPE_LIMITATION",
+    )
+    for key in (
+        "debt_to_equity_below_industry_median",
+        "positive_operating_quarters_8",
+        "net_margin_above_industry_median",
+        "revenue_growth_above_industry_median",
+        "eps_growth_ttm_yoy",
+    ):
+        snapshot.pop(key, None)
+    snapshot.update(overrides)
+    return snapshot
+
+
 def _panic_history() -> pd.DataFrame:
     size = 80
     close = np.linspace(110.0, 100.0, size)
@@ -139,6 +168,31 @@ def _panic_history() -> pd.DataFrame:
     )
 
 
+def test_v5_golden_dataset_preserves_score_decision_reason_and_columns() -> None:
+    fixture_path = (
+        Path(__file__).parents[1]
+        / "parity"
+        / "fixtures"
+        / "low_entry_v5_golden.json"
+    )
+    expected = json.loads(fixture_path.read_text(encoding="utf-8"))
+    data = attach_low_entry_v4_context(
+        _panic_history(),
+        annual_fundamentals=_annual_fundamentals(),
+        fundamental_snapshot=_quality_snapshot(),
+        signal_date=SIGNAL_DATE,
+    )
+
+    result = LowEntryScoreV5Strategy().run(data)
+    latest = result.iloc[-1]
+
+    assert len(data) == expected["input_rows"]
+    assert result.columns.tolist() == expected["output_columns"]
+    assert float(latest["低點分數"]) == expected["score"]
+    assert latest["低點決策"] == expected["decision"]
+    assert latest["低點理由"] == expected["reason"]
+
+
 def test_v5_quality_scores_only_available_metrics_and_confirms_full_evidence() -> None:
     full = evaluate_v5_quality(
         _annual_fundamentals(),
@@ -159,6 +213,46 @@ def test_v5_quality_scores_only_available_metrics_and_confirms_full_evidence() -
     assert missing_one.base_score == 100
     assert missing_one.base_available_weight == 95
     assert missing_one.base_data_confidence < full.base_data_confidence
+
+
+def test_air_quality_profile_uses_ttm_returns_and_sector_balance_thresholds() -> None:
+    air = evaluate_v5_quality(
+        _annual_fundamentals(),
+        _air_quality_snapshot(),
+        SIGNAL_DATE,
+    )
+    generic = evaluate_v5_quality(
+        _annual_fundamentals(),
+        _air_quality_snapshot(sector="24"),
+        SIGNAL_DATE,
+    )
+
+    air_base = {metric.name: metric for metric in air.base_metrics}
+    assert air.base_status is BaseQualityStatus.PASS
+    assert air.extended_status is ExtendedQualityStatus.PASS
+    assert air.final_status is FinalQualityStatus.CONFIRMED
+    assert "AIR_QUALITY_PROFILE_ACTIVE" in air.warnings
+    assert air_base["debt_ratio"].passed is True
+    assert air_base["current_ratio"].passed is True
+    assert air_base["roe"].value == pytest.approx(0.1340)
+    assert air_base["roa"].value == pytest.approx(0.0355)
+    assert generic.base_status is BaseQualityStatus.REJECT
+    assert generic.final_status is FinalQualityStatus.HARD_NO_BUY
+
+
+def test_air_quality_relaxation_does_not_bypass_falling_knife_veto() -> None:
+    data = attach_low_entry_v4_context(
+        _panic_history(),
+        annual_fundamentals=_annual_fundamentals(),
+        fundamental_snapshot=_air_quality_snapshot(),
+        signal_date=SIGNAL_DATE,
+    )
+
+    latest = LowEntryScoreV5Strategy().run(data).iloc[-1]
+
+    assert latest["LES v5 Final Quality Status"] == "QUALITY_CONFIRMED"
+    assert latest["Falling Knife State"] == FallingKnifeState.PANIC_WATCH.value
+    assert latest["低點決策"] == "PANIC_WATCH"
 
 
 def test_v5_quality_separates_twse_and_mops_point_in_time_clocks() -> None:
@@ -281,6 +375,9 @@ def test_low_entry_v5_is_discoverable_and_blocks_high_volume_weak_close() -> Non
     assert latest["Valuation Gate"] != "UNKNOWN"
     assert latest["Base Case Fair Value"] > 0
     assert latest["Valuation Model Version"].startswith("les-v5-valuation-")
+    assert latest["Cycle Valuation Review"] == "NOT_TRIGGERED"
+    assert latest["Normalized EPS Divergence Ratio"] < 3
+    assert "Cycle Composite Fair Value" in latest.index
     assert latest["Falling Knife State"] == FallingKnifeState.PANIC_WATCH.value
     assert "HIGH_VOLUME_WEAK_CLOSE" in latest["Temporary Falling Knife Blocks"]
     assert latest["低點決策"] == "PANIC_WATCH"
@@ -362,6 +459,48 @@ def test_next_day_confirmation_requires_price_risk_and_positive_clv() -> None:
     confirmed = strategy._next_day_confirmation(indicators, plan, state)
 
     assert confirmed.tolist() == [False, True]
+
+
+def test_next_day_confirmation_emits_buy_small_and_never_early_buy() -> None:
+    strategy = LowEntryScoreV5Strategy()
+    assert strategy.rule_engine is not None
+    quality = evaluate_v5_quality(
+        _annual_fundamentals(),
+        _quality_snapshot(),
+        SIGNAL_DATE,
+    )
+    index = pd.RangeIndex(2)
+
+    decision = strategy.rule_engine.resolve_decision(
+        score=pd.Series([60.0, 80.0], index=index),
+        quality=quality,
+        valuation=pd.Series(
+            [ValuationStatus.PASS.value, ValuationStatus.PASS.value],
+            index=index,
+        ),
+        falling_state=pd.Series(
+            [FallingKnifeState.CLEAR.value, FallingKnifeState.CLEAR.value],
+            index=index,
+        ),
+        next_day_confirmation=pd.Series([True, True], index=index),
+        trigger=pd.Series([False, True], index=index),
+        risk_gate=pd.Series(["PASS", "PASS"], index=index),
+        market_gate=pd.Series(["PASS", "PASS"], index=index),
+        required_score=pd.Series([75.0, 75.0], index=index),
+        broad_rally_trigger=pd.Series([False, False], index=index),
+        broad_rally_risk_gate=pd.Series(["PASS", "PASS"], index=index),
+        raw_score=pd.Series([60.0, 80.0], index=index),
+    )
+    fraction = strategy.rule_engine.position_fraction(
+        decision,
+        quality,
+        pd.Series([False, False], index=index),
+    )
+
+    assert decision.tolist() == ["BUY_SMALL", "BUY"]
+    assert "EARLY_BUY" not in set(decision)
+    assert fraction.iloc[0] == pytest.approx(1 / 8)
+    assert fraction.iloc[1] == pytest.approx(1 / 3)
 
 
 def test_v5_decision_component_can_be_replaced_independently() -> None:
@@ -712,6 +851,51 @@ def test_v5_elec_breadth_accepts_three_quarters_participation() -> None:
     assert not rejected.iloc[-1]
 
 
+def test_v5_broad_rally_tier_classifies_moderate_and_strong() -> None:
+    strategy = LowEntryScoreV5Strategy()
+    assert strategy.rule_engine is not None
+    data = pd.DataFrame({"Date": pd.to_datetime(["2026-08-12"])})
+
+    def evaluate(advancers: float, median: float) -> str:
+        indicators = pd.DataFrame({"taiex_r1": [0.0088]})
+        tier = strategy.rule_engine._evaluate_breadth_rally_tier(
+            data,
+            indicators,
+            breadth_snapshot={
+                "as_of": "2026-08-12",
+                "universe": "ELEC",
+                "coverage": 0.99,
+                "valid_return_count": 438,
+                "advancer_ratio": advancers,
+                "median_return": median,
+                "source_final": True,
+                "taiex_return": 0.0088,
+            },
+            market_data_through="2026-08-12",
+            market_session_final=True,
+        )
+        return str(tier.iloc[-1])
+
+    assert evaluate(0.6711, 0.0083) == BroadRallyTier.MODERATE.value
+    assert evaluate(0.76, 0.018) == BroadRallyTier.STRONG.value
+    assert evaluate(0.64, 0.0083) == BroadRallyTier.NONE.value
+
+
+def test_v5_quality_reject_does_not_overwrite_falling_knife_state() -> None:
+    data = attach_low_entry_v4_context(
+        _panic_history(),
+        annual_fundamentals=_annual_fundamentals(),
+        fundamental_snapshot=_quality_snapshot(audit_opinion="ADVERSE"),
+        signal_date=SIGNAL_DATE,
+    )
+
+    latest = LowEntryScoreV5Strategy().run(data).iloc[-1]
+
+    assert latest["LES v5 Final Quality Status"] == "HARD_NO_BUY"
+    assert latest["低點決策"] == "NO_BUY"
+    assert latest["Falling Knife State"] == FallingKnifeState.PANIC_WATCH.value
+
+
 def test_v5_recent_breadth_memory_separates_rally_and_selloff() -> None:
     strategy = LowEntryScoreV5Strategy()
     assert strategy.rule_engine is not None
@@ -1015,6 +1199,255 @@ def test_v5_balanced_profile_uses_75_point_entry_and_1_7_reward_risk() -> None:
     assert config.breadth_absorption_minimum_raw_score == 35
     assert config.breadth_absorption_minimum_cmf20 == pytest.approx(-0.45)
     assert config.breadth_absorption_minimum_volume_ratio == pytest.approx(0.40)
+    assert config.supportive_non_broad_minimum_quality_score == 80
+    assert config.supportive_non_broad_score_threshold == 75
+    assert config.quality_pullback_minimum_quality_score == 75
+    assert config.quality_pullback_score_threshold == 40
+    assert config.quality_pullback_minimum_raw_score == 50
+    assert config.quality_pullback_minimum_clv == pytest.approx(0.20)
+    assert config.quality_pullback_minimum_volume_ratio == pytest.approx(0.50)
+
+
+def test_v5_supportive_non_broad_path_emits_conditional_buy_small() -> None:
+    strategy = LowEntryScoreV5Strategy()
+    assert strategy.rule_engine is not None
+    confirmed = evaluate_v5_quality(
+        _annual_fundamentals(),
+        _quality_snapshot(),
+        SIGNAL_DATE,
+    )
+    quality = replace(
+        confirmed,
+        final_status=FinalQualityStatus.CONFIRMED,
+        final_score=85.0,
+        hard_rejects=(),
+    )
+    index = pd.RangeIndex(1)
+
+    decision = strategy.rule_engine.resolve_decision(
+        score=pd.Series([75.0], index=index),
+        quality=quality,
+        valuation=pd.Series(
+            [ValuationStatus.SUPPORTIVE.value], index=index
+        ),
+        falling_state=pd.Series(
+            [FallingKnifeState.CLEAR.value], index=index
+        ),
+        next_day_confirmation=pd.Series([False], index=index),
+        trigger=pd.Series([True], index=index),
+        risk_gate=pd.Series(["PASS"], index=index),
+        market_gate=pd.Series(["PASS"], index=index),
+        required_score=pd.Series([75.0], index=index),
+        broad_rally_trigger=pd.Series([False], index=index),
+        broad_rally_risk_gate=pd.Series(["PASS"], index=index),
+        raw_score=pd.Series([75.0], index=index),
+        broad_rally_active=pd.Series([False], index=index),
+    )
+    fraction = strategy.rule_engine.position_fraction(
+        decision,
+        quality,
+        pd.Series([False], index=index),
+    )
+
+    assert decision.loc[0] == "BUY_SMALL"
+    assert fraction.loc[0] == pytest.approx(1 / 8)
+
+
+def test_v5_supportive_non_broad_path_preserves_hard_gates() -> None:
+    strategy = LowEntryScoreV5Strategy()
+    assert strategy.rule_engine is not None
+    confirmed = evaluate_v5_quality(
+        _annual_fundamentals(),
+        _quality_snapshot(),
+        SIGNAL_DATE,
+    )
+    quality = replace(
+        confirmed,
+        final_status=FinalQualityStatus.CONFIRMED,
+        final_score=85.0,
+        hard_rejects=(),
+    )
+    index = pd.RangeIndex(1)
+    common = {
+        "score": pd.Series([75.0], index=index),
+        "quality": quality,
+        "valuation": pd.Series(
+            [ValuationStatus.SUPPORTIVE.value], index=index
+        ),
+        "falling_state": pd.Series(
+            [FallingKnifeState.CLEAR.value], index=index
+        ),
+        "next_day_confirmation": pd.Series([False], index=index),
+        "trigger": pd.Series([True], index=index),
+        "risk_gate": pd.Series(["PASS"], index=index),
+        "market_gate": pd.Series(["PASS"], index=index),
+        "required_score": pd.Series([75.0], index=index),
+        "broad_rally_trigger": pd.Series([False], index=index),
+        "broad_rally_risk_gate": pd.Series(["PASS"], index=index),
+        "raw_score": pd.Series([75.0], index=index),
+        "broad_rally_active": pd.Series([False], index=index),
+    }
+
+    risk_failed = strategy.rule_engine.resolve_decision(
+        **(common | {"risk_gate": pd.Series(["FAIL"], index=index)})
+    )
+    broad_risk_failed = strategy.rule_engine.resolve_decision(
+        **(
+            common
+            | {"broad_rally_risk_gate": pd.Series(["FAIL"], index=index)}
+        )
+    )
+    vetoed = strategy.rule_engine.resolve_decision(
+        **(
+            common
+            | {
+                "falling_state": pd.Series(
+                    [FallingKnifeState.PANIC_WATCH.value], index=index
+                )
+            }
+        )
+    )
+    active_breadth = strategy.rule_engine.resolve_decision(
+        **(
+            common
+            | {"broad_rally_active": pd.Series([True], index=index)}
+        )
+    )
+    low_quality = strategy.rule_engine.resolve_decision(
+        **(
+            common
+            | {
+                "quality": replace(quality, final_score=79.99),
+            }
+        )
+    )
+    low_score = strategy.rule_engine.resolve_decision(
+        **(
+            common
+            | {
+                "score": pd.Series([74.99], index=index),
+                "required_score": pd.Series([75.0], index=index),
+            }
+        )
+    )
+
+    assert risk_failed.loc[0] != "BUY_SMALL"
+    assert broad_risk_failed.loc[0] != "BUY_SMALL"
+    assert vetoed.loc[0] == FallingKnifeState.PANIC_WATCH.value
+    assert active_breadth.loc[0] != "BUY_SMALL"
+    assert low_quality.loc[0] != "BUY_SMALL"
+    assert low_score.loc[0] != "BUY_SMALL"
+
+
+def test_v5_quality_pullback_path_emits_only_conditional_buy_small() -> None:
+    strategy = LowEntryScoreV5Strategy()
+    assert strategy.rule_engine is not None
+    confirmed = evaluate_v5_quality(
+        _annual_fundamentals(),
+        _quality_snapshot(),
+        SIGNAL_DATE,
+    )
+    quality = replace(
+        confirmed,
+        final_status=FinalQualityStatus.CONFIRMED,
+        final_score=85.0,
+        hard_rejects=(),
+    )
+    index = pd.RangeIndex(1)
+    common = {
+        "score": pd.Series([60.0], index=index),
+        "quality": quality,
+        "valuation": pd.Series(
+            [ValuationStatus.SUPPORTIVE.value], index=index
+        ),
+        "falling_state": pd.Series(
+            [FallingKnifeState.CLEAR.value], index=index
+        ),
+        "next_day_confirmation": pd.Series([False], index=index),
+        "trigger": pd.Series([False], index=index),
+        "risk_gate": pd.Series(["PASS"], index=index),
+        "market_gate": pd.Series(["PASS"], index=index),
+        "required_score": pd.Series([75.0], index=index),
+        "broad_rally_trigger": pd.Series([False], index=index),
+        "broad_rally_risk_gate": pd.Series(["PASS"], index=index),
+        "raw_score": pd.Series([65.0], index=index),
+        "quality_pullback_trigger": pd.Series([True], index=index),
+        "broad_rally_active": pd.Series([False], index=index),
+    }
+
+    decision = strategy.rule_engine.resolve_decision(**common)
+    fraction = strategy.rule_engine.position_fraction(
+        decision,
+        quality,
+        pd.Series([False], index=index),
+    )
+
+    assert decision.loc[0] == "BUY_SMALL"
+    assert fraction.loc[0] == pytest.approx(1 / 8)
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [
+        ({"score": 39.99}, "AVOID"),
+        ({"raw_score": 49.99}, "WATCH"),
+        ({"risk_gate": "FAIL"}, "WATCH"),
+        ({"broad_rally_risk_gate": "FAIL"}, "WATCH"),
+        ({"valuation": ValuationStatus.FAIL.value}, "WATCH"),
+        (
+            {"falling_state": FallingKnifeState.PANIC_WATCH.value},
+            FallingKnifeState.PANIC_WATCH.value,
+        ),
+    ],
+)
+def test_v5_quality_pullback_path_preserves_every_hard_gate(
+    override: dict[str, object],
+    expected: str,
+) -> None:
+    strategy = LowEntryScoreV5Strategy()
+    assert strategy.rule_engine is not None
+    confirmed = evaluate_v5_quality(
+        _annual_fundamentals(),
+        _quality_snapshot(),
+        SIGNAL_DATE,
+    )
+    quality = replace(
+        confirmed,
+        final_status=FinalQualityStatus.CONFIRMED,
+        final_score=85.0,
+        hard_rejects=(),
+    )
+    index = pd.RangeIndex(1)
+    values: dict[str, object] = {
+        "score": 60.0,
+        "valuation": ValuationStatus.SUPPORTIVE.value,
+        "falling_state": FallingKnifeState.CLEAR.value,
+        "risk_gate": "PASS",
+        "broad_rally_risk_gate": "PASS",
+        "raw_score": 65.0,
+    }
+    values.update(override)
+
+    decision = strategy.rule_engine.resolve_decision(
+        score=pd.Series([values["score"]], index=index),
+        quality=quality,
+        valuation=pd.Series([values["valuation"]], index=index),
+        falling_state=pd.Series([values["falling_state"]], index=index),
+        next_day_confirmation=pd.Series([False], index=index),
+        trigger=pd.Series([False], index=index),
+        risk_gate=pd.Series([values["risk_gate"]], index=index),
+        market_gate=pd.Series(["PASS"], index=index),
+        required_score=pd.Series([75.0], index=index),
+        broad_rally_trigger=pd.Series([False], index=index),
+        broad_rally_risk_gate=pd.Series(
+            [values["broad_rally_risk_gate"]], index=index
+        ),
+        raw_score=pd.Series([values["raw_score"]], index=index),
+        quality_pullback_trigger=pd.Series([True], index=index),
+        broad_rally_active=pd.Series([False], index=index),
+    )
+
+    assert decision.loc[0] == expected
 
 
 def test_v5_balanced_trigger_accepts_price_and_obv_confirmation() -> None:
@@ -1214,12 +1647,20 @@ def test_v5_absorption_path_is_buy_small_and_never_bypasses_valuation() -> None:
         **common,
         valuation=pd.Series([ValuationStatus.PASS.value], index=index),
     )
+    supportive = strategy.rule_engine.resolve_decision(
+        **common,
+        valuation=pd.Series(
+            [ValuationStatus.SUPPORTIVE.value],
+            index=index,
+        ),
+    )
     valuation_failed = strategy.rule_engine.resolve_decision(
         **common,
         valuation=pd.Series([ValuationStatus.FAIL.value], index=index),
     )
 
     assert decision.loc[0] == "BUY_SMALL"
+    assert supportive.loc[0] == "BUY_SMALL"
     assert valuation_failed.loc[0] == "WATCH_ONLY"
 
 

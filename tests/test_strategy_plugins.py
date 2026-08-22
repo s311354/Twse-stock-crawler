@@ -39,6 +39,7 @@ def test_builtin_low_entry_strategy_is_discoverable() -> None:
     assert "low_entry_score_v3" in available_strategies()
     assert "low_entry_score_v4" in available_strategies()
     assert "low_entry_score_v4_1" in available_strategies()
+    assert "portfolio_allocation_v1" in available_strategies()
     assert get_strategy("expected_return_exit").name == "expected_return_exit"
     assert get_strategy("expected_return_exit_v2").name == "expected_return_exit_v2"
     assert get_strategy("expected_return_exit_v3").name == "expected_return_exit_v3"

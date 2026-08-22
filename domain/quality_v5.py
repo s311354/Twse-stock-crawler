@@ -81,6 +81,12 @@ class LowEntryV5QualityConfig:
     maximum_extended_weight: float = 0.40
     unsupported_sector_codes: frozenset[str] = frozenset({"17"})
     balance_error_limit: float = 0.01
+    air_sector_codes: frozenset[str] = frozenset({"15"})
+    air_max_debt_ratio: float = 0.80
+    air_min_current_ratio: float = 0.60
+    air_min_roe_ttm: float = 0.08
+    air_min_roa_ttm: float = 0.025
+    air_max_net_debt_to_equity: float = 0.80
 
 
 @dataclass(frozen=True)
@@ -151,6 +157,7 @@ def evaluate_v5_quality(
         return _insufficient_result("OFFICIAL_SECTOR_UNKNOWN")
     if sector in cfg.unsupported_sector_codes:
         return _unsupported_result()
+    air_profile = sector in cfg.air_sector_codes
 
     annual = _point_in_time_annual(annual_df, signal)
     base_evidence = _resolve_base_evidence(snapshot, signal)
@@ -164,6 +171,8 @@ def evaluate_v5_quality(
         not pd.isna(extended_available_at) and extended_available_at <= signal
     )
     warnings = list(base_evidence.warnings)
+    if air_profile:
+        warnings.append("AIR_QUALITY_PROFILE_ACTIVE")
     if not extended_point_in_time:
         warnings.append("MOPS_EXTENDED_NOT_POINT_IN_TIME")
 
@@ -173,8 +182,23 @@ def evaluate_v5_quality(
     if balance_valid is False:
         warnings.append("BALANCE_SHEET_NOT_BALANCED")
 
-    base_values = _base_values(base_snapshot)
-    base_metrics = _evaluate_rules(base_values, _base_rules())
+    base_values = _base_values(
+        base_snapshot,
+        prefer_ttm_returns=air_profile,
+    )
+    base_metrics = _evaluate_rules(
+        base_values,
+        _base_rules(
+            max_debt_ratio=(
+                cfg.air_max_debt_ratio if air_profile else 0.60
+            ),
+            min_current_ratio=(
+                cfg.air_min_current_ratio if air_profile else 1.20
+            ),
+            min_roe=(cfg.air_min_roe_ttm if air_profile else 0.10),
+            min_roa=(cfg.air_min_roa_ttm if air_profile else 0.05),
+        ),
+    )
     base_available = sum(item.maximum for item in base_metrics if item.available)
     if cfg.minimum_base_weight <= base_available < cfg.minimum_base_pass_weight:
         warnings.append(
@@ -207,7 +231,14 @@ def evaluate_v5_quality(
         extended_snapshot,
         extended_values,
     )
-    extended_metrics = _evaluate_rules(extended_values, _extended_rules())
+    extended_metrics = _evaluate_rules(
+        extended_values,
+        _extended_rules(
+            max_net_debt_to_equity=(
+                cfg.air_max_net_debt_to_equity if air_profile else 0.50
+            )
+        ),
+    )
     extended_available = sum(
         item.maximum for item in extended_metrics if item.available
     )
@@ -382,14 +413,20 @@ def _parse_evidence_pairs(value: object) -> dict[str, str]:
     return pairs
 
 
-def _base_rules() -> tuple[_Rule, ...]:
+def _base_rules(
+    *,
+    max_debt_ratio: float = 0.60,
+    min_current_ratio: float = 1.20,
+    min_roe: float = 0.10,
+    min_roa: float = 0.05,
+) -> tuple[_Rule, ...]:
     positive = lambda value: float(value) > 0
     non_negative = lambda value: float(value) >= 0
     true = lambda value: bool(value)
     return (
         _Rule("positive_equity", 7, "equity", positive),
-        _Rule("debt_ratio", 7, "debt_ratio", lambda value: float(value) <= 0.60),
-        _Rule("current_ratio", 6, "current_ratio", lambda value: float(value) >= 1.20),
+        _Rule("debt_ratio", 7, "debt_ratio", lambda value: float(value) <= max_debt_ratio),
+        _Rule("current_ratio", 6, "current_ratio", lambda value: float(value) >= min_current_ratio),
         _Rule("debt_to_equity_industry", 5, "debt_to_equity_below_industry_median", true),
         _Rule("equity_growth", 5, "equity_growth_yoy", positive),
         _Rule("capital_not_inflated", 5, "share_dilution_yoy", lambda value: float(value) <= 0.05),
@@ -398,8 +435,8 @@ def _base_rules() -> tuple[_Rule, ...]:
         _Rule("gross_margin_stable", 6, "gross_margin_change", lambda value: float(value) >= -0.01),
         _Rule("operating_margin_stable", 6, "operating_margin_stable", true),
         _Rule("net_margin_industry", 6, "net_margin_above_industry_median", true),
-        _Rule("roe", 8, "roe", lambda value: float(value) >= 0.10),
-        _Rule("roa", 6, "roa", lambda value: float(value) >= 0.05),
+        _Rule("roe", 8, "roe", lambda value: float(value) >= min_roe),
+        _Rule("roa", 6, "roa", lambda value: float(value) >= min_roa),
         _Rule("roe_not_deteriorating", 3, "roe_change_4q", lambda value: float(value) >= -0.02),
         _Rule("asset_productivity", 3, "asset_growth_supported", true),
         _Rule("revenue_growth_industry", 4, "revenue_growth_above_industry_median", true),
@@ -410,7 +447,10 @@ def _base_rules() -> tuple[_Rule, ...]:
     )
 
 
-def _extended_rules() -> tuple[_Rule, ...]:
+def _extended_rules(
+    *,
+    max_net_debt_to_equity: float = 0.50,
+) -> tuple[_Rule, ...]:
     positive = lambda value: float(value) > 0
     true = lambda value: bool(value)
     return (
@@ -420,7 +460,7 @@ def _extended_rules() -> tuple[_Rule, ...]:
         _Rule("fcf_to_cfo", 5, "fcf_to_cfo", lambda value: float(value) >= 0.50),
         _Rule("accrual_ratio", 4, "accrual_ratio", lambda value: float(value) <= 0.10),
         _Rule("positive_cfo_history", 3, "positive_cfo_year_ratio", lambda value: float(value) >= 2 / 3),
-        _Rule("net_debt_to_equity", 7, "net_debt_to_equity", lambda value: float(value) <= 0.50),
+        _Rule("net_debt_to_equity", 7, "net_debt_to_equity", lambda value: float(value) <= max_net_debt_to_equity),
         _Rule("interest_coverage", 7, "interest_coverage", lambda value: float(value) >= 5),
         _Rule("short_debt_coverage", 4, "cash_to_short_term_debt", lambda value: float(value) >= 1),
         _Rule("debt_growth", 4, "debt_growth_supported", true),
@@ -484,7 +524,11 @@ def _metric_diagnostics(
     return diagnostics
 
 
-def _base_values(snapshot: dict[str, Any]) -> dict[str, object]:
+def _base_values(
+    snapshot: dict[str, Any],
+    *,
+    prefer_ttm_returns: bool = False,
+) -> dict[str, object]:
     equity = _first_number(snapshot, "twse_parent_equity", "equity", "total_equity")
     assets = _first_number(snapshot, "twse_total_assets", "total_assets")
     liabilities = _first_number(snapshot, "twse_total_liabilities", "total_liabilities")
@@ -511,6 +555,16 @@ def _base_values(snapshot: dict[str, Any]) -> dict[str, object]:
         if asset_growth is None or revenue_growth is None
         else asset_growth <= revenue_growth + 0.05
     )
+    roe_keys = (
+        ("roe_ttm", "twse_roe_ytd_end_balance")
+        if prefer_ttm_returns
+        else ("twse_roe_ytd_end_balance", "roe_ttm")
+    )
+    roa_keys = (
+        ("roa_ttm", "twse_roa_ytd_end_balance")
+        if prefer_ttm_returns
+        else ("twse_roa_ytd_end_balance", "roa_ttm")
+    )
     return {
         "equity": equity,
         "debt_ratio": debt_ratio,
@@ -529,8 +583,8 @@ def _base_values(snapshot: dict[str, Any]) -> dict[str, object]:
         "net_margin_above_industry_median": snapshot.get(
             "net_margin_above_industry_median"
         ),
-        "roe": _first_number(snapshot, "twse_roe_ytd_end_balance", "roe_ttm"),
-        "roa": _first_number(snapshot, "twse_roa_ytd_end_balance", "roa_ttm"),
+        "roe": _first_number(snapshot, *roe_keys),
+        "roa": _first_number(snapshot, *roa_keys),
         "roe_change_4q": _first_number(snapshot, "roe_change_4q"),
         "asset_growth_supported": snapshot.get("asset_growth_supported"),
         "revenue_growth_above_industry_median": snapshot.get(

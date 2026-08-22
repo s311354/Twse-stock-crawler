@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
 
 import pandas as pd
 
+from application.fundamental_deriver import FundamentalDeriver
+from application.fundamental_point_in_time import PointInTimeResolver
+from application.fundamental_refresh import RefreshPlanner
+from application.fundamental_snapshot import BatchSnapshotResolution
+from application.fundamental_snapshot import SnapshotAssembler
 from application.filing_ingestion import FilingIngestionService
 from application.filing_refresh_planner import FilingRefreshPlanner
 from application.fundamental_ports import FilingCatalogPort
@@ -19,10 +22,8 @@ from application.fundamental_ports import FinancialBatchPort
 from application.fundamental_ports import FundamentalRepositoryPort
 from application.fundamental_ports import FundamentalUnitOfWork
 from domain.base_quality_features import BaseQualityFeatureProducer
-from domain.data_provenance import MOPS_PUBLIC_ANNOUNCEMENT
 from domain.errors import DataSourceError
 from domain.errors import NoDataError
-from domain.fundamental_derivation import FiledFinancials
 from domain.fundamental_derivation import FUNDAMENTAL_DERIVATION_VERSION
 from domain.fundamental_derivation import FundamentalBundle
 from domain.fundamental_derivation import derive_fundamentals
@@ -31,13 +32,6 @@ from domain.fundamental_models import FilingCandidate
 from domain.fundamental_models import FilingCorrection
 from domain.fundamental_models import FilingRecord
 from domain.fundamental_models import FundamentalSnapshot
-
-
-@dataclass(frozen=True)
-class _BatchSnapshotResolution:
-    snapshot: FundamentalSnapshot | None
-    source: str
-    cache_hit: bool
 
 
 class MopsFundamentalService:
@@ -80,6 +74,25 @@ class MopsFundamentalService:
         self.base_quality_feature_producer = (
             base_quality_feature_producer or BaseQualityFeatureProducer()
         )
+        self.refresh_planner = RefreshPlanner(
+            filing_catalog,
+            include_current_observations=include_current_observations,
+        )
+        self.point_in_time = PointInTimeResolver(
+            include_current_observations=include_current_observations,
+            now_provider=self._now_provider,
+        )
+        self.snapshot_assembler = SnapshotAssembler(
+            repository,
+            self.base_quality_feature_producer,
+        )
+        self.fundamental_deriver = FundamentalDeriver(
+            repository,
+            derive_bundle=lambda *args, **kwargs: derive_fundamentals(
+                *args,
+                **kwargs,
+            ),
+        )
         self._daily_financials: dict[str, FundamentalSnapshot] = {}
         self._daily_corrections: dict[
             str,
@@ -106,7 +119,9 @@ class MopsFundamentalService:
         self._daily_financials = self.financial_batch_client.load(
             observed_at=observed_at,
         )
-        self._persist_daily_financials()
+        self.snapshot_assembler.persist_daily_financials(
+            self._daily_financials
+        )
         logging.info(
             "TWSE financial batch loaded companies=%s observed_at=%s requests=2",
             len(self._daily_financials),
@@ -119,7 +134,10 @@ class MopsFundamentalService:
 
         if observed_at.tzinfo is None:
             raise ValueError("observed_at must be timezone-aware")
-        periods = self._recent_reporting_periods(observed_at)
+        periods = self.refresh_planner.recent_reporting_periods(
+            observed_at,
+            self._daily_financials,
+        )
         self._daily_corrections = {}
         discover = getattr(self.filing_catalog, "discover_corrections", None)
         if not callable(discover):
@@ -155,7 +173,9 @@ class MopsFundamentalService:
         if history_years < 3:
             raise ValueError("history_years must be at least 3")
         parsed_signal = pd.to_datetime(signal_date, utc=True, errors="raise")
-        effective_signal = self._effective_signal_time(parsed_signal)
+        effective_signal = self.point_in_time.effective_signal_time(
+            parsed_signal
+        )
         symbol_sectors = {
             symbol: self._resolve_sector(symbol, sector)
             for symbol in dict.fromkeys(str(item).strip() for item in symbols)
@@ -177,7 +197,8 @@ class MopsFundamentalService:
                 continue
             if self._daily_corrections.get(symbol):
                 continue
-            current_batch = self._eligible_batch_snapshot(
+            current_batch = self.snapshot_assembler.eligible_batch_snapshot(
+                self._daily_financials,
                 symbol,
                 effective_signal,
             )
@@ -193,8 +214,11 @@ class MopsFundamentalService:
                     effective_signal,
                     uow=uow,
                 )
-                bundle = self._attach_base_evidence(
-                    self._bundle_as_of(entry.bundle, effective_signal),
+                bundle = self.snapshot_assembler.attach_base_evidence(
+                    self.point_in_time.bundle_as_of(
+                        entry.bundle,
+                        effective_signal,
+                    ),
                     resolution,
                     symbol=symbol,
                     signal_time=effective_signal,
@@ -209,7 +233,7 @@ class MopsFundamentalService:
                     and entry.latest_period >= current_batch.period
                     and batch_state is None
                 ):
-                    self._save_batch_state(
+                    self.snapshot_assembler.save_batch_state(
                         symbol,
                         current_batch,
                         uow=uow,
@@ -249,10 +273,12 @@ class MopsFundamentalService:
         if history_years < 3:
             raise ValueError("history_years must be at least 3")
         parsed_signal = pd.to_datetime(signal_date, utc=True, errors="raise")
-        effective_signal = self._effective_signal_time(parsed_signal)
+        effective_signal = self.point_in_time.effective_signal_time(
+            parsed_signal
+        )
         local_year = effective_signal.tz_convert("Asia/Taipei").year
         minimum_year = local_year - history_years - 1
-        fallback_available_at = self._utc_now().isoformat()
+        fallback_available_at = self.point_in_time.utc_now().isoformat()
         repository = self.repository
         with repository.unit_of_work() as uow:
             cached_filings = repository.load_filings(
@@ -279,19 +305,24 @@ class MopsFundamentalService:
                 symbol,
                 uow=uow,
             )
-            event_corrected_periods = self._event_corrected_periods(
-                symbol,
-                cached_filings,
+            event_corrected_periods = (
+                self.refresh_planner.event_corrected_periods(
+                    symbol,
+                    cached_filings,
+                    self._daily_corrections,
+                )
             )
-            batch_has_new_period = self._batch_has_new_period(
+            batch_has_new_period = self.refresh_planner.batch_has_new_period(
                 batch_snapshot,
                 cached_filings,
                 as_of=effective_signal,
             )
-            cache_history_complete = self._has_complete_cached_filing_history(
-                cached_filings,
-                history_years=history_years,
-                as_of=effective_signal,
+            cache_history_complete = (
+                self.refresh_planner.has_complete_cached_filing_history(
+                    cached_filings,
+                    history_years=history_years,
+                    as_of=effective_signal,
+                )
             )
             if (
                 not monthly_refresh
@@ -305,7 +336,7 @@ class MopsFundamentalService:
                     sector=sector,
                     uow=uow,
                 )
-                bundle = self._attach_base_evidence(
+                bundle = self.snapshot_assembler.attach_base_evidence(
                     bundle,
                     batch_resolution,
                     symbol=symbol,
@@ -313,7 +344,7 @@ class MopsFundamentalService:
                     uow=uow,
                 )
                 if batch_snapshot is not None and batch_state is None:
-                    self._save_batch_state(
+                    self.snapshot_assembler.save_batch_state(
                         symbol,
                         batch_snapshot,
                         uow=uow,
@@ -367,14 +398,16 @@ class MopsFundamentalService:
                     cached_filings,
                     announcements,
                 )
-                refresh_candidates = self._select_refresh_candidates(
-                    dated_catalog,
-                    parsed_signal,
+                refresh_candidates = (
+                    self.refresh_planner.select_refresh_candidates(
+                        dated_catalog,
+                        parsed_signal,
+                    )
                 )
                 corrected_periods = set(event_corrected_periods)
                 if monthly_refresh:
                     corrected_periods.update(
-                        self._find_corrected_periods(
+                        self.refresh_planner.find_corrected_periods(
                             refresh_candidates,
                             cached_filings,
                         )
@@ -397,7 +430,7 @@ class MopsFundamentalService:
                             uow=uow,
                         )
                     )
-                effective_signal = self._advance_live_evaluation_time(
+                effective_signal = self.point_in_time.advance_live_evaluation_time(
                     effective_signal,
                     ingested_filings,
                 )
@@ -406,7 +439,9 @@ class MopsFundamentalService:
                     raise
                 return self._load_cached_fallback(
                     symbol,
-                    parsed_signal=self._effective_signal_time(parsed_signal),
+                    parsed_signal=self.point_in_time.effective_signal_time(
+                        parsed_signal
+                    ),
                     sector=sector,
                     uow=uow,
                     refresh_error=refresh_error,
@@ -430,15 +465,15 @@ class MopsFundamentalService:
                     retryable=False,
                 )
             resolved_sector = self._resolve_sector(symbol, sector)
-            bundle, cache_hit = self._load_or_derive_bundle(
+            bundle, cache_hit = self.fundamental_deriver.load_or_derive(
                 symbol,
                 parsed_signal=effective_signal,
                 resolved_sector=resolved_sector,
                 filed_financials=filed_financials,
                 uow=uow,
             )
-            bundle = self._bundle_as_of(bundle, effective_signal)
-            bundle = self._attach_base_evidence(
+            bundle = self.point_in_time.bundle_as_of(bundle, effective_signal)
+            bundle = self.snapshot_assembler.attach_base_evidence(
                 bundle,
                 batch_resolution,
                 symbol=symbol,
@@ -458,7 +493,7 @@ class MopsFundamentalService:
                     latest_filing_period >= batch_snapshot.period
                     and state_is_not_newer
                 ):
-                    self._save_batch_state(
+                    self.snapshot_assembler.save_batch_state(
                         symbol,
                         batch_snapshot,
                         uow=uow,
@@ -499,70 +534,6 @@ class MopsFundamentalService:
         )
         return bundle
 
-    def _recent_reporting_periods(
-        self,
-        observed_at: dt.datetime,
-    ) -> list[tuple[int, int]]:
-        local = observed_at.astimezone(dt.timezone(dt.timedelta(hours=8)))
-        completed_quarter = (local.month - 1) // 3
-        calendar_latest = (
-            (local.year, completed_quarter)
-            if completed_quarter > 0
-            else (local.year - 1, 4)
-        )
-        batch_periods = {
-            snapshot.period for snapshot in self._daily_financials.values()
-        }
-        latest = max(batch_periods | {calendar_latest})
-        previous = (
-            (latest[0], latest[1] - 1)
-            if latest[1] > 1
-            else (latest[0] - 1, 4)
-        )
-        return [previous, latest]
-
-    def _event_corrected_periods(
-        self,
-        symbol: str,
-        cached_filings: list[FilingRecord],
-    ) -> set[tuple[int, int]]:
-        events = self._daily_corrections.get(symbol, {})
-        if not events:
-            return set()
-        latest_cached: dict[tuple[int, int], FilingRecord] = {}
-        for filing in sorted(cached_filings, key=lambda item: item.revision_number):
-            latest_cached[(filing.fiscal_year, filing.quarter)] = filing
-        return {
-            period
-            for period, correction in events.items()
-            if period in latest_cached
-            and (
-                latest_cached[period].correction_announced_on is None
-                or correction.announced_on
-                > latest_cached[period].correction_announced_on
-            )
-        }
-
-    @staticmethod
-    def _batch_has_new_period(
-        batch_snapshot: FundamentalSnapshot | None,
-        cached_filings: list[FilingRecord],
-        *,
-        as_of: pd.Timestamp,
-    ) -> bool:
-        if batch_snapshot is None:
-            return False
-        eligible_periods = []
-        for filing in cached_filings:
-            available_at = pd.to_datetime(
-                filing.available_at,
-                utc=True,
-                errors="coerce",
-            )
-            if not pd.isna(available_at) and available_at <= as_of:
-                eligible_periods.append((filing.fiscal_year, filing.quarter))
-        return not eligible_periods or batch_snapshot.period > max(eligible_periods)
-
     def _load_cached_bundle(
         self,
         symbol: str,
@@ -585,7 +556,7 @@ class MopsFundamentalService:
                 retryable=False,
             )
         resolved_sector = self._resolve_sector(symbol, sector)
-        bundle, cache_hit = self._load_or_derive_bundle(
+        bundle, cache_hit = self.fundamental_deriver.load_or_derive(
             symbol,
             parsed_signal=parsed_signal,
             resolved_sector=resolved_sector,
@@ -593,23 +564,10 @@ class MopsFundamentalService:
             uow=uow,
         )
         return (
-            self._bundle_as_of(bundle, parsed_signal),
+            self.point_in_time.bundle_as_of(bundle, parsed_signal),
             cache_hit,
             len(filed_financials),
         )
-
-    def _eligible_batch_snapshot(
-        self,
-        symbol: str,
-        signal_time: pd.Timestamp,
-    ) -> FundamentalSnapshot | None:
-        snapshot = self._daily_financials.get(symbol)
-        if snapshot is None:
-            return None
-        observed_at = pd.to_datetime(snapshot.observed_at, utc=True, errors="coerce")
-        if pd.isna(observed_at) or observed_at > signal_time:
-            return None
-        return snapshot
 
     def _resolve_batch_snapshot(
         self,
@@ -617,224 +575,13 @@ class MopsFundamentalService:
         signal_time: pd.Timestamp,
         *,
         uow: FundamentalUnitOfWork,
-    ) -> _BatchSnapshotResolution:
-        current = self._eligible_batch_snapshot(symbol, signal_time)
-        if current is not None:
-            return _BatchSnapshotResolution(
-                snapshot=current,
-                source="TWSE_OPENAPI_LATEST",
-                cache_hit=False,
-            )
-
-        history = self.repository.load_financial_batch_snapshots(
+    ) -> BatchSnapshotResolution:
+        return self.snapshot_assembler.resolve(
+            self._daily_financials,
             symbol,
-            as_of=signal_time.isoformat(),
+            signal_time,
             uow=uow,
         )
-        if not history:
-            return _BatchSnapshotResolution(
-                snapshot=None,
-                source="MOPS_POINT_IN_TIME_BASE_FALLBACK",
-                cache_hit=False,
-            )
-
-        cached = max(
-            history,
-            key=lambda item: (item.period, item.observed_at, item.content_sha256),
-        )
-        logging.debug(
-            "TWSE financial batch symbol=%s status=CACHE_FALLBACK "
-            "period=%sQ%s observed_at=%s cache_hit=true",
-            symbol,
-            cached.fiscal_year,
-            cached.quarter,
-            cached.observed_at,
-        )
-        return _BatchSnapshotResolution(
-            snapshot=cached,
-            source="TWSE_OPENAPI_CACHE_FALLBACK",
-            cache_hit=True,
-        )
-
-    def _save_batch_state(
-        self,
-        symbol: str,
-        snapshot: FundamentalSnapshot,
-        *,
-        uow: FundamentalUnitOfWork,
-    ) -> None:
-        self.repository.save_financial_batch_state(
-            symbol,
-            snapshot.fiscal_year,
-            snapshot.quarter,
-            snapshot.content_sha256,
-            snapshot.observed_at,
-            uow=uow,
-        )
-
-    @staticmethod
-    def _has_complete_cached_filing_history(
-        cached_filings: list[FilingRecord],
-        *,
-        history_years: int,
-        as_of: pd.Timestamp,
-    ) -> bool:
-        eligible = []
-        for filing in cached_filings:
-            available_at = pd.to_datetime(
-                filing.available_at,
-                utc=True,
-                errors="coerce",
-            )
-            if not pd.isna(available_at) and available_at <= as_of:
-                eligible.append(filing)
-        if not eligible:
-            return False
-        periods = {(filing.fiscal_year, filing.quarter) for filing in eligible}
-        latest_period = max(periods)
-        annual_years = {year for year, quarter in periods if quarter == 4}
-        if len(annual_years) < history_years:
-            return False
-        latest_year, latest_quarter = latest_period
-        if latest_quarter < 4:
-            required = {
-                latest_period,
-                (latest_year - 1, latest_quarter),
-                (latest_year - 1, 4),
-            }
-            if not required.issubset(periods):
-                return False
-        return True
-
-    def _attach_batch_snapshot(
-        self,
-        bundle: FundamentalBundle,
-        batch_snapshot: FundamentalSnapshot,
-        *,
-        source: str,
-        signal_time: pd.Timestamp,
-        uow: FundamentalUnitOfWork,
-    ) -> FundamentalBundle:
-        self.repository.save_financial_batch_snapshot(batch_snapshot, uow=uow)
-        history = self.repository.load_financial_batch_snapshots(
-            batch_snapshot.symbol,
-            as_of=signal_time.isoformat(),
-            uow=uow,
-        )
-        features = self.base_quality_feature_producer.produce(
-            current=batch_snapshot,
-            history=history,
-            annual_fundamentals=bundle.annual_fundamentals,
-            existing_snapshot=bundle.snapshot,
-            signal_date=signal_time,
-        )
-        snapshot = dict(bundle.snapshot)
-        batch_fields = batch_snapshot.as_snapshot_fields()
-        batch_fields["twse_financial_source"] = source
-        snapshot.update(batch_fields)
-        snapshot.update(features.as_snapshot_fields())
-        snapshot["base_quality_evidence_mode"] = source
-        return FundamentalBundle(
-            annual_fundamentals=bundle.annual_fundamentals,
-            snapshot=snapshot,
-            as_of=bundle.as_of,
-        )
-
-    def _attach_base_evidence(
-        self,
-        bundle: FundamentalBundle,
-        resolution: _BatchSnapshotResolution,
-        *,
-        symbol: str,
-        signal_time: pd.Timestamp,
-        uow: FundamentalUnitOfWork,
-    ) -> FundamentalBundle:
-        if resolution.snapshot is not None:
-            return self._attach_batch_snapshot(
-                bundle,
-                resolution.snapshot,
-                source=resolution.source,
-                signal_time=signal_time,
-                uow=uow,
-            )
-
-        features = self.base_quality_feature_producer.produce(
-            current=None,
-            history=[],
-            annual_fundamentals=bundle.annual_fundamentals,
-            existing_snapshot=bundle.snapshot,
-            signal_date=signal_time,
-        )
-        snapshot = dict(bundle.snapshot)
-        snapshot.update(features.as_snapshot_fields())
-        snapshot["base_quality_evidence_mode"] = resolution.source
-        logging.debug(
-            "Base quality symbol=%s status=PROVISIONAL source=%s "
-            "feature_count=%s cache_hit=false",
-            symbol,
-            resolution.source,
-            len(features.values),
-        )
-        return FundamentalBundle(
-            annual_fundamentals=bundle.annual_fundamentals,
-            snapshot=snapshot,
-            as_of=bundle.as_of,
-        )
-
-    def _select_refresh_candidates(
-        self,
-        candidates: list[FilingCandidate],
-        signal_time: pd.Timestamp,
-    ) -> list[FilingCandidate]:
-        """Separate cache seeding from point-in-time fact eligibility.
-
-        A live run may download a catalog filing without an exact publication
-        timestamp. The stored document becomes usable only from its
-        FIRST_OBSERVED_DOWNLOAD timestamp; historical runs never download or
-        consume that undated candidate.
-        """
-
-        selected: list[FilingCandidate] = []
-        for candidate in candidates:
-            if candidate.available_at is None:
-                if self.include_current_observations:
-                    selected.append(candidate)
-                continue
-            available_at = pd.to_datetime(
-                candidate.available_at,
-                utc=True,
-                errors="coerce",
-            )
-            if not pd.isna(available_at) and available_at <= signal_time:
-                selected.append(candidate)
-        return selected
-
-    def _effective_signal_time(self, requested: pd.Timestamp) -> pd.Timestamp:
-        if not self.include_current_observations:
-            return requested
-        observed = pd.Timestamp(self._utc_now())
-        return max(requested, observed)
-
-    def _advance_live_evaluation_time(
-        self,
-        current: pd.Timestamp,
-        ingested_filings: list[FilingRecord],
-    ) -> pd.Timestamp:
-        """Make same-run first observations eligible without backdating them."""
-
-        if not self.include_current_observations or not ingested_filings:
-            return current
-        observed_times = [
-            pd.to_datetime(filing.available_at, utc=True, errors="raise")
-            for filing in ingested_filings
-        ]
-        return max(current, *observed_times)
-
-    def _utc_now(self) -> dt.datetime:
-        current = self._now_provider()
-        if current.tzinfo is None:
-            raise ValueError("MOPS now_provider must return a timezone-aware datetime")
-        return current.astimezone(dt.timezone.utc)
 
     def _load_cached_fallback(
         self,
@@ -854,20 +601,20 @@ class MopsFundamentalService:
         if not filed_financials:
             raise refresh_error
         resolved_sector = self._resolve_sector(symbol, sector)
-        bundle, cache_hit = self._load_or_derive_bundle(
+        bundle, cache_hit = self.fundamental_deriver.load_or_derive(
             symbol,
             parsed_signal=parsed_signal,
             resolved_sector=resolved_sector,
             filed_financials=filed_financials,
             uow=uow,
         )
-        bundle = self._bundle_as_of(bundle, parsed_signal)
+        bundle = self.point_in_time.bundle_as_of(bundle, parsed_signal)
         batch_resolution = self._resolve_batch_snapshot(
             symbol,
             parsed_signal,
             uow=uow,
         )
-        bundle = self._attach_base_evidence(
+        bundle = self.snapshot_assembler.attach_base_evidence(
             bundle,
             batch_resolution,
             symbol=symbol,
@@ -885,179 +632,17 @@ class MopsFundamentalService:
         )
         return bundle
 
-    def _persist_daily_financials(self) -> None:
-        """Seed period history even when a later MOPS refresh is unavailable."""
-
-        save = getattr(self.repository, "save_financial_batch_snapshot", None)
-        unit_of_work = getattr(self.repository, "unit_of_work", None)
-        if not callable(save) or not callable(unit_of_work):
-            return
-        with unit_of_work() as uow:
-            for snapshot in self._daily_financials.values():
-                save(snapshot, uow=uow)
-
-    @staticmethod
-    def _bundle_as_of(
-        bundle: FundamentalBundle,
-        evaluated_at: pd.Timestamp,
-    ) -> FundamentalBundle:
-        return FundamentalBundle(
-            annual_fundamentals=bundle.annual_fundamentals,
-            snapshot=bundle.snapshot,
-            as_of=evaluated_at.isoformat(),
-        )
-
-    def _load_or_derive_bundle(
-        self,
-        symbol: str,
-        *,
-        parsed_signal: pd.Timestamp,
-        resolved_sector: str,
-        filed_financials: list[FiledFinancials],
-        uow: FundamentalUnitOfWork,
-    ) -> tuple[FundamentalBundle, bool]:
-        repository = self.repository
-        filing_set_sha256 = repository.filing_set_hash(filed_financials)
-        snapshot_cache_key = hashlib.sha256(
-            "{}:{}".format(
-                FUNDAMENTAL_DERIVATION_VERSION,
-                filing_set_sha256,
-            ).encode("ascii")
-        ).hexdigest()
-        bundle = repository.load_fundamental_bundle(
-            symbol,
-            snapshot_cache_key,
-            resolved_sector,
-            uow=uow,
-        )
-        cache_hit = bundle is not None
-        if bundle is None:
-            bundle = derive_fundamentals(
-                filed_financials,
-                signal_date=parsed_signal,
-                sector=resolved_sector,
-            )
-            repository.save_fundamental_bundle(
-                symbol,
-                snapshot_cache_key,
-                resolved_sector,
-                bundle,
-                uow=uow,
-            )
-        latest = max(
-            filed_financials,
-            key=lambda filing: (
-                filing.fiscal_year,
-                filing.quarter,
-                filing.available_at,
-                filing.revision_number,
-            ),
-        )
-        available_at = max(
-            filed_financials,
-            key=lambda filing: pd.to_datetime(
-                filing.available_at,
-                utc=True,
-                errors="raise",
-            ),
-        ).available_at
-        repository.mark_active_fundamental_bundle(
-            symbol,
-            filing_set_sha256=filing_set_sha256,
-            snapshot_cache_key=snapshot_cache_key,
-            derivation_version=FUNDAMENTAL_DERIVATION_VERSION,
-            available_at=available_at,
-            latest_period=(latest.fiscal_year, latest.quarter),
-            annual_history_years=self._fast_path_history_years(
-                filed_financials
-            ),
-            uow=uow,
-        )
-        return bundle, cache_hit
-
-    @staticmethod
-    def _fast_path_history_years(
-        filings: list[FiledFinancials],
-    ) -> int:
-        periods = {(filing.fiscal_year, filing.quarter) for filing in filings}
-        if not periods:
-            return 0
-        latest_year, latest_quarter = max(periods)
-        if latest_quarter < 4:
-            comparable_periods = {
-                (latest_year, latest_quarter),
-                (latest_year - 1, latest_quarter),
-                (latest_year - 1, 4),
-            }
-            if not comparable_periods.issubset(periods):
-                return 0
-        return len({year for year, quarter in periods if quarter == 4})
-
     @staticmethod
     def _apply_availability(
         catalog: list[FilingCandidate],
         cached_filings: list[FilingRecord],
         announcements: list[FilingAnnouncement],
     ) -> list[FilingCandidate]:
-        latest_cached: dict[tuple[int, int], FilingRecord] = {}
-        for filing in sorted(cached_filings, key=lambda item: item.revision_number):
-            latest_cached[(filing.fiscal_year, filing.quarter)] = filing
-        available_by_period = {
-            (int(announcement.fiscal_year), int(announcement.quarter)): str(
-                announcement.available_at
-            )
-            for announcement in announcements
-        }
-        dated: list[FilingCandidate] = []
-        for candidate in catalog:
-            period = candidate.fiscal_year, candidate.quarter
-            existing = latest_cached.get(period)
-            available_at = available_by_period.get(period)
-            if available_at is None and existing is not None:
-                available_at = existing.available_at
-            dated.append(
-                FilingCandidate(
-                    symbol=candidate.symbol,
-                    fiscal_year=candidate.fiscal_year,
-                    quarter=candidate.quarter,
-                    report_id=candidate.report_id,
-                    source_url=candidate.source_url,
-                    available_at=available_at,
-                    period_end=candidate.period_end,
-                    statement_scope=candidate.statement_scope,
-                    audit_status=candidate.audit_status,
-                    availability_source=(
-                        MOPS_PUBLIC_ANNOUNCEMENT
-                        if period in available_by_period
-                        else existing.availability_source
-                        if existing is not None
-                        else candidate.availability_source
-                    ),
-                )
-            )
-        return dated
-
-    def _find_corrected_periods(
-        self,
-        candidates: list[FilingCandidate],
-        cached_filings: list[FilingRecord],
-    ) -> set[tuple[int, int]]:
-        latest_cached: dict[tuple[int, int], FilingRecord] = {}
-        for filing in sorted(cached_filings, key=lambda item: item.revision_number):
-            latest_cached[(filing.fiscal_year, filing.quarter)] = filing
-        corrected: set[tuple[int, int]] = set()
-        for candidate in candidates:
-            period = candidate.fiscal_year, candidate.quarter
-            existing = latest_cached.get(period)
-            if existing is None:
-                continue
-            correction = self.filing_catalog.latest_correction(candidate)
-            if correction is not None and (
-                existing.correction_announced_on is None
-                or correction.announced_on > existing.correction_announced_on
-            ):
-                corrected.add(period)
-        return corrected
+        return RefreshPlanner.apply_availability(
+            catalog,
+            cached_filings,
+            announcements,
+        )
 
     def _resolve_sector(self, symbol: str, fallback: str) -> str:
         if self._company_sectors is None:
@@ -1083,13 +668,5 @@ class MopsFundamentalService:
             return official_sector
         normalized_fallback = str(fallback).strip()
         return normalized_fallback if normalized_fallback.isdigit() else ""
-
-    @staticmethod
-    def _select_required_filings(
-        filings: list[FilingCandidate],
-        history_years: int,
-    ) -> list[FilingCandidate]:
-        return FilingRefreshPlanner.select_required_filings(filings, history_years)
-
 
 __all__ = ["MopsFundamentalService"]

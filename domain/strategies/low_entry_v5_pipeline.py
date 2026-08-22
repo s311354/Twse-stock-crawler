@@ -138,6 +138,8 @@ class DecisionComponent(Protocol):
         multiday_panic_reversal_trigger: pd.Series | None = None,
         recent_rally_retest_trigger: pd.Series | None = None,
         recent_rally_reclaim_trigger: pd.Series | None = None,
+        quality_pullback_trigger: pd.Series | None = None,
+        broad_rally_active: pd.Series | None = None,
     ) -> pd.Series: ...
 
     def position_fraction(
@@ -321,6 +323,10 @@ class LowEntryV5DecisionPipeline:
             recent_rally_reclaim_trigger=panic[
                 "recent_rally_reclaim_trigger"
             ],
+            quality_pullback_trigger=panic[
+                "quality_pullback_trigger"
+            ],
+            broad_rally_active=panic["broad_rally_active"],
         )
         if not security_supported:
             decision[:] = "NO_MODEL"

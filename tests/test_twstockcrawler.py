@@ -68,6 +68,15 @@ class EndpointStubClient:
         return outcome
 
 
+def test_legacy_profit_method_contract_remains_available() -> None:
+    crawler = TwStockCrawler()
+
+    assert crawler.maxProfit([7, 1, 5, 3, 6, 4]) == 5
+    assert crawler.maxProfitII([7, 1, 5, 3, 6, 4]) == 7
+    assert crawler.maxProfitIV(2, [3, 2, 6, 5, 0, 3]) == 7
+    assert crawler.maxProfitwithfee([1, 3, 2, 8, 4, 9], 2) == 8
+
+
 def test_get_stocktype_data_classifies_full_market_empty_as_unscheduled_closed(
     monkeypatch,
 ) -> None:

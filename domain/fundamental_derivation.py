@@ -386,15 +386,6 @@ def _derive_snapshot(
     }
 
 
-def _ttm_free_cash_flow(
-    latest: FiledFinancials,
-    filings: dict[tuple[int, int], FiledFinancials],
-) -> float | None:
-    cfo = _ttm_value(latest, filings, OPERATING_CASH_FLOW)
-    capex = _ttm_capex(latest, filings)
-    return cfo - capex if cfo is not None and capex is not None else None
-
-
 def _capex_value(filing: FiledFinancials, year: int) -> float | None:
     values = [
         value

@@ -1,21 +1,17 @@
 #!/usr/local/bin/python
 # -*- coding: utf-8 -*-
-from __future__ import annotations
-
-from interface.cli import create_parser
-
-r"""
+"""
 TWSE Real-time Stock Price Analysis
 
 This script is designed to help streamline models, by taking the Taiwan Stock Exchange dataset. This will be used by an application and figuring out the maximum profit that are required to run for those arguments. The resulting is then sending to private email sandbox.
 """
 
-import argparse
-import pandas as pd
-import enum
-import time
+from __future__ import annotations
+
 import datetime
 import logging
+
+import pandas as pd
 
 from application.analysis_dataset import AnalysisDatasetBuilder
 from application.market_history_cache import CachedMarketDay
@@ -40,12 +36,6 @@ from infrastructure.legacy_crawler_facade import LegacyCrawlerFacade
 from twse.parser import clean_cell
 from twse.parser import parse_price
 
-
-class QUERY(enum.Enum):
-    _order_ = 'NEOGENE PALEOGENE CRETACEOUS'
-    NEOGENE = 12
-    PALEOGENE = 15
-    CRETACEOUS = 30
 
 class TwseCrawker(LegacyCrawlerFacade):
     def __init__(
@@ -105,37 +95,6 @@ class TwseCrawker(LegacyCrawlerFacade):
         self.twse_no_data_dates: set[str] = set()
         self.twse_closed_unscheduled_dates: set[str] = set()
         self._market_history_refresh_dates: set[str] = set()
-
-
-    def __del__(self) -> None:
-        self.daily_stocks = [[] for _ in range(self.stocklistsize)]
-        self.iso_scheduled_times = list()
-        self.transactiondays = 0
-        self.stocksprice = list()
-        self.tracked_stock_numbers = [None for _ in range(self.stocklistsize)]
-        self.missing_tracked_stock_numbers = set()
-        self.missing_tracked_stock_first_dates = {}
-        self.daily_highs = [[] for _ in range(self.stocklistsize)]
-        self.daily_lows = [[] for _ in range(self.stocklistsize)]
-        self.daily_closes = [[] for _ in range(self.stocklistsize)]
-        self.daily_volumes = [[] for _ in range(self.stocklistsize)]
-        self.daily_trade_counts = [[] for _ in range(self.stocklistsize)]
-        self.daily_trade_values = [[] for _ in range(self.stocklistsize)]
-        self.daily_bid_prices = [[] for _ in range(self.stocklistsize)]
-        self.daily_ask_prices = [[] for _ in range(self.stocklistsize)]
-        self.daily_pe_ratios = [[] for _ in range(self.stocklistsize)]
-        self.daily_taiex_closes = [[] for _ in range(self.stocklistsize)]
-        self.daily_dates = [[] for _ in range(self.stocklistsize)]
-        self.market_breadth_snapshots_by_date = {}
-        self.annual_fundamentals_by_stock = {}
-        self.fundamental_snapshots_by_stock = {}
-        self.fundamental_status_by_stock = {}
-        self.fundamental_status_detail_by_stock = {}
-        self.low_entry_v4_signal_dates_by_stock = {}
-        self._missing_ohlc_records = {}
-        self.twse_no_data_dates = set()
-        self.twse_closed_unscheduled_dates = set()
-        self._market_history_refresh_dates = set()
 
 
     def clean_data(self, row: StockRow) -> StockRow:

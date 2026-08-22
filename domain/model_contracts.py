@@ -24,6 +24,7 @@ class FieldSource(str, enum.Enum):
     LES_V5 = "LES_V5"
     LES_V5_VALUATION = "LES_V5_VALUATION"
     EREM_V3 = "EREM_V3"
+    PAE_V1 = "PAE_V1"
     UNKNOWN = "UNKNOWN"
 
 

@@ -10,12 +10,22 @@ import numpy as np
 import pandas as pd
 
 
-VALUATION_MODEL_VERSION = "les-v5-valuation-2026-08-02-v1"
+VALUATION_MODEL_VERSION = "les-v5-valuation-2026-08-18-v4-air-cycle-review"
 
 
 class ValuationProductionStatus(str, Enum):
     COMPLETE = "COMPLETE"
     UNKNOWN = "UNKNOWN"
+
+
+class CycleValuationReviewStatus(str, Enum):
+    """Audit state for the multi-anchor cyclical valuation review."""
+
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+    NOT_TRIGGERED = "NOT_TRIGGERED"
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+    FAIL = "FAIL"
+    SUPPORTIVE = "SUPPORTIVE"
 
 
 @dataclass(frozen=True)
@@ -25,6 +35,14 @@ class LowEntryV5ValuationConfig:
     passive_benchmark_expected_return: float = 0.07
     required_excess_return: float = 0.03
     maximum_bear_permanent_loss: float = 0.35
+    # The strict gate remains the only valuation state that can authorize a
+    # normal BUY. Standard SUPPORTIVE remains a narrower exception for a
+    # conditional BUY_SMALL: downside must stay bounded and either base fair
+    # value or a near-hurdle CAGR must support spot. A separate cyclical
+    # review may also return SUPPORTIVE, but never strict PASS.
+    supportive_maximum_bear_permanent_loss: float = 0.45
+    air_supportive_maximum_bear_permanent_loss: float = 0.50
+    supportive_required_return_discount: float = 0.02
     bear_years: int = 3
     base_years: int = 5
     bull_years: int = 7
@@ -40,6 +58,17 @@ class LowEntryV5ValuationConfig:
     minimum_margin: float = 0.01
     maximum_dilution: float = 0.10
     minimum_dilution: float = -0.05
+    cyclical_sector_codes: frozenset[str] = frozenset({"15", "24"})
+    always_review_cyclical_sector_codes: frozenset[str] = frozenset({"15"})
+    normalized_eps_divergence_threshold: float = 3.0
+    cycle_ttm_eps_haircut: float = 0.70
+    cycle_minimum_pe: float = 5.0
+    cycle_maximum_pe: float = 20.0
+    cycle_minimum_justified_pb: float = 0.50
+    cycle_maximum_justified_pb: float = 3.00
+    cycle_default_net_income_conversion: float = 0.80
+    cycle_minimum_available_anchors: int = 2
+    cycle_minimum_supporting_anchors: int = 2
     model_version: str = VALUATION_MODEL_VERSION
 
 
@@ -62,6 +91,34 @@ class ValuationScenario:
 
 
 @dataclass(frozen=True)
+class CyclicalValuationReview:
+    """Multi-anchor review for cyclical earnings and asset-value divergence.
+
+    This review can support only the limited ``SUPPORTIVE`` valuation tier.
+    It never changes the strict Bear/Base/Bull gate and cannot override any
+    technical, falling-knife, trigger, liquidity, or risk requirement.
+    """
+
+    status: CycleValuationReviewStatus
+    required: bool
+    sector_code: str | None
+    ttm_eps: float | None
+    normalized_eps: float | None
+    eps_divergence_ratio: float | None
+    mid_cycle_operating_margin: float | None = None
+    normalized_roe: float | None = None
+    book_value_per_share: float | None = None
+    margin_fair_value: float | None = None
+    pb_fair_value: float | None = None
+    ttm_eps_fair_value: float | None = None
+    composite_fair_value: float | None = None
+    available_anchor_count: int = 0
+    supporting_anchor_count: int = 0
+    supportive: bool = False
+    reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class LowEntryV5ValuationResult:
     status: ValuationProductionStatus
     signal_date: str | None
@@ -73,6 +130,8 @@ class LowEntryV5ValuationResult:
     bull: ValuationScenario | None = None
     bear_permanent_loss: float | None = None
     bear_permanent_loss_acceptable: bool | None = None
+    supportive_gate_passed: bool | None = None
+    cycle_review: CyclicalValuationReview | None = None
     reasons: tuple[str, ...] = ()
     model_version: str = VALUATION_MODEL_VERSION
 
@@ -90,6 +149,7 @@ class LowEntryV5ValuationResult:
     def as_snapshot_fields(self) -> dict[str, object]:
         """Expose the historical v5 consumer keys plus auditable details."""
 
+        cycle = self.cycle_review
         return {
             "valuation_model_status": self.status.value,
             "valuation_model_version": self.model_version,
@@ -113,6 +173,49 @@ class LowEntryV5ValuationResult:
             "bear_case_permanent_loss": self.bear_permanent_loss,
             "bear_case_permanent_loss_acceptable": (
                 self.bear_permanent_loss_acceptable
+            ),
+            "supportive_valuation_gate_passed": self.supportive_gate_passed,
+            "cycle_valuation_review_status": (
+                cycle.status.value if cycle is not None else None
+            ),
+            "cycle_valuation_review_required": (
+                cycle.required if cycle is not None else None
+            ),
+            "cycle_valuation_reasons": (
+                (";".join(cycle.reasons) or "NONE")
+                if cycle is not None
+                else None
+            ),
+            "valuation_ttm_eps": cycle.ttm_eps if cycle is not None else None,
+            "normalized_eps_divergence_ratio": (
+                cycle.eps_divergence_ratio if cycle is not None else None
+            ),
+            "cycle_mid_cycle_operating_margin": (
+                cycle.mid_cycle_operating_margin if cycle is not None else None
+            ),
+            "cycle_normalized_roe": (
+                cycle.normalized_roe if cycle is not None else None
+            ),
+            "cycle_book_value_per_share": (
+                cycle.book_value_per_share if cycle is not None else None
+            ),
+            "cycle_margin_fair_value": (
+                cycle.margin_fair_value if cycle is not None else None
+            ),
+            "cycle_pb_fair_value": (
+                cycle.pb_fair_value if cycle is not None else None
+            ),
+            "cycle_ttm_eps_fair_value": (
+                cycle.ttm_eps_fair_value if cycle is not None else None
+            ),
+            "cycle_composite_fair_value": (
+                cycle.composite_fair_value if cycle is not None else None
+            ),
+            "cycle_available_anchor_count": (
+                cycle.available_anchor_count if cycle is not None else None
+            ),
+            "cycle_supporting_anchor_count": (
+                cycle.supporting_anchor_count if cycle is not None else None
             ),
         }
 
@@ -268,8 +371,36 @@ class LowEntryV5ValuationProducer:
             current_price=price,
             required_return=required_return,
         )
+        cycle_review = self._cyclical_valuation_review(
+            annual,
+            point_in_time_snapshot,
+            normalized_eps=normalized_eps,
+            current_price=price,
+            recent_pe_median=pe,
+            required_return=required_return,
+        )
         permanent_loss = max(0.0, 1.0 - (bear.fair_value / price))
         acceptable = permanent_loss <= self.config.maximum_bear_permanent_loss
+        sector_code = _text(point_in_time_snapshot.get("sector"))
+        supportive_loss_limit = (
+            self.config.air_supportive_maximum_bear_permanent_loss
+            if sector_code in self.config.always_review_cyclical_sector_codes
+            else self.config.supportive_maximum_bear_permanent_loss
+        )
+        supportive_downside = permanent_loss <= supportive_loss_limit
+        supportive_return = (
+            base.expected_cagr
+            >= (
+                required_return
+                - self.config.supportive_required_return_discount
+            )
+        )
+        supportive_value = base.fair_value > price
+        standard_supportive = bool(
+            supportive_downside
+            and (supportive_return or supportive_value)
+        )
+        supportive = bool(standard_supportive or cycle_review.supportive)
         gate_reasons: list[str] = []
         if base.expected_cagr < required_return:
             gate_reasons.append("BASE_CAGR_BELOW_REQUIRED_RETURN")
@@ -277,6 +408,8 @@ class LowEntryV5ValuationProducer:
             gate_reasons.append("BASE_FAIR_VALUE_NOT_ABOVE_CURRENT_PRICE")
         if not acceptable:
             gate_reasons.append("BEAR_PERMANENT_LOSS_EXCEEDS_LIMIT")
+        if cycle_review.required:
+            gate_reasons.extend(cycle_review.reasons)
         return LowEntryV5ValuationResult(
             status=ValuationProductionStatus.COMPLETE,
             signal_date=signal_time.isoformat(),
@@ -290,7 +423,9 @@ class LowEntryV5ValuationProducer:
             bull=bull,
             bear_permanent_loss=permanent_loss,
             bear_permanent_loss_acceptable=acceptable,
-            reasons=tuple(gate_reasons),
+            supportive_gate_passed=supportive,
+            cycle_review=cycle_review,
+            reasons=tuple(dict.fromkeys(gate_reasons)),
             model_version=self.config.model_version,
         )
 
@@ -438,6 +573,245 @@ class LowEntryV5ValuationProducer:
             values.extend(float(value) for value in growth.tail(4).dropna())
         return _median(values)
 
+    def _cyclical_valuation_review(
+        self,
+        annual: pd.DataFrame,
+        snapshot: dict[str, Any],
+        *,
+        normalized_eps: float,
+        current_price: float,
+        recent_pe_median: float,
+        required_return: float,
+    ) -> CyclicalValuationReview:
+        """Review cyclical valuations with multiple independent anchors.
+
+        The three independent anchors are deliberately visible in the result:
+
+        1. mid-cycle operating margin converted to EPS and valued at a capped PE;
+        2. book value per share times a normalized-ROE-derived P/B multiple;
+        3. TTM EPS valued at the same capped PE after a peak-cycle haircut.
+
+        At least two available anchors and two anchors above spot are required
+        before the review can mark valuation as SUPPORTIVE.
+        """
+
+        sector_code = _text(snapshot.get("sector"))
+        ttm_eps = _positive_number(snapshot.get("ttm_eps"))
+        divergence = (
+            ttm_eps / normalized_eps
+            if ttm_eps is not None and normalized_eps > 0
+            else None
+        )
+        common = {
+            "sector_code": sector_code,
+            "ttm_eps": ttm_eps,
+            "normalized_eps": normalized_eps,
+            "eps_divergence_ratio": divergence,
+        }
+        if sector_code not in self.config.cyclical_sector_codes:
+            return CyclicalValuationReview(
+                status=CycleValuationReviewStatus.NOT_APPLICABLE,
+                required=False,
+                reasons=("NON_CYCLICAL_SECTOR",),
+                **common,
+            )
+        always_review = (
+            sector_code in self.config.always_review_cyclical_sector_codes
+        )
+        if not always_review and (
+            divergence is None
+            or divergence <= self.config.normalized_eps_divergence_threshold
+        ):
+            return CyclicalValuationReview(
+                status=CycleValuationReviewStatus.NOT_TRIGGERED,
+                required=False,
+                reasons=("NORMALIZED_EPS_DIVERGENCE_NOT_TRIGGERED",),
+                **common,
+            )
+
+        reasons = [
+            "AIR_CYCLICAL_VALUATION_REVIEW"
+            if always_review
+            else "NORMALIZED_EPS_DIVERGENCE"
+        ]
+        cycle_pe = float(
+            np.clip(
+                recent_pe_median,
+                self.config.cycle_minimum_pe,
+                self.config.cycle_maximum_pe,
+            )
+        )
+        mid_cycle_margin = self._mid_cycle_operating_margin(annual)
+        normalized_roe = self._normalized_cycle_roe(annual)
+        current_revenue = self._current_revenue(annual, snapshot)
+        current_equity = self._current_equity(annual, snapshot)
+        shares = self._current_diluted_shares(annual)
+        net_income_conversion = self._mid_cycle_net_income_conversion(annual)
+        if net_income_conversion is None:
+            net_income_conversion = self.config.cycle_default_net_income_conversion
+            reasons.append("MID_CYCLE_NET_INCOME_CONVERSION_ASSUMED")
+
+        margin_fair_value: float | None = None
+        if (
+            mid_cycle_margin is not None
+            and mid_cycle_margin > 0
+            and current_revenue is not None
+            and shares is not None
+        ):
+            mid_cycle_eps = (
+                current_revenue
+                * mid_cycle_margin
+                * net_income_conversion
+                / shares
+            )
+            margin_fair_value = mid_cycle_eps * cycle_pe
+
+        book_value_per_share = (
+            current_equity / shares
+            if current_equity is not None and shares is not None
+            else None
+        )
+        pb_fair_value: float | None = None
+        if (
+            normalized_roe is not None
+            and normalized_roe > 0
+            and book_value_per_share is not None
+            and required_return > 0
+        ):
+            justified_pb = float(
+                np.clip(
+                    normalized_roe / required_return,
+                    self.config.cycle_minimum_justified_pb,
+                    self.config.cycle_maximum_justified_pb,
+                )
+            )
+            pb_fair_value = book_value_per_share * justified_pb
+
+        ttm_eps_fair_value = (
+            ttm_eps * cycle_pe * self.config.cycle_ttm_eps_haircut
+            if ttm_eps is not None
+            else None
+        )
+        anchors = [
+            value
+            for value in (
+                margin_fair_value,
+                pb_fair_value,
+                ttm_eps_fair_value,
+            )
+            if value is not None and np.isfinite(value) and value > 0
+        ]
+        available_count = len(anchors)
+        supporting_count = sum(value >= current_price for value in anchors)
+        composite = _median(anchors, positive=True)
+
+        if available_count < self.config.cycle_minimum_available_anchors:
+            status = CycleValuationReviewStatus.INSUFFICIENT_DATA
+            supportive = False
+            reasons.append("CYCLE_REVIEW_INSUFFICIENT_ANCHORS")
+        else:
+            supportive = bool(
+                supporting_count
+                >= self.config.cycle_minimum_supporting_anchors
+                and composite is not None
+                and composite >= current_price
+            )
+            if supportive:
+                status = CycleValuationReviewStatus.SUPPORTIVE
+                reasons.append("CYCLE_REVIEW_SUPPORTIVE")
+            else:
+                status = CycleValuationReviewStatus.FAIL
+                reasons.append("CYCLE_REVIEW_NOT_SUPPORTIVE")
+
+        return CyclicalValuationReview(
+            status=status,
+            required=True,
+            mid_cycle_operating_margin=mid_cycle_margin,
+            normalized_roe=normalized_roe,
+            book_value_per_share=book_value_per_share,
+            margin_fair_value=margin_fair_value,
+            pb_fair_value=pb_fair_value,
+            ttm_eps_fair_value=ttm_eps_fair_value,
+            composite_fair_value=composite,
+            available_anchor_count=available_count,
+            supporting_anchor_count=supporting_count,
+            supportive=supportive,
+            reasons=tuple(reasons),
+            **common,
+        )
+
+    @staticmethod
+    def _mid_cycle_operating_margin(annual: pd.DataFrame) -> float | None:
+        if "operating_margin" not in annual:
+            return None
+        values = pd.to_numeric(
+            annual["operating_margin"],
+            errors="coerce",
+        ).tail(5)
+        return _median([float(value) for value in values.dropna()])
+
+    @staticmethod
+    def _normalized_cycle_roe(annual: pd.DataFrame) -> float | None:
+        if not {"net_income", "equity"}.issubset(annual):
+            return None
+        income = pd.to_numeric(annual["net_income"], errors="coerce")
+        equity = pd.to_numeric(annual["equity"], errors="coerce")
+        roe = (income / equity.where(equity > 0)).replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+        return _median([float(value) for value in roe.tail(5).dropna()])
+
+    @staticmethod
+    def _mid_cycle_net_income_conversion(annual: pd.DataFrame) -> float | None:
+        if "net_income" not in annual:
+            return None
+        income = pd.to_numeric(annual["net_income"], errors="coerce")
+        if "ebit" in annual:
+            ebit = pd.to_numeric(annual["ebit"], errors="coerce")
+        elif {"revenue", "operating_margin"}.issubset(annual):
+            revenue = pd.to_numeric(annual["revenue"], errors="coerce")
+            margin = pd.to_numeric(annual["operating_margin"], errors="coerce")
+            ebit = revenue * margin
+        else:
+            return None
+        conversion = (income / ebit.where(ebit > 0)).replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+        values = [
+            float(value)
+            for value in conversion.tail(5).dropna()
+            if value > 0
+        ]
+        result = _median(values, positive=True)
+        return float(np.clip(result, 0.50, 1.00)) if result is not None else None
+
+    @staticmethod
+    def _current_revenue(
+        annual: pd.DataFrame,
+        snapshot: dict[str, Any],
+    ) -> float | None:
+        value = _positive_number(snapshot.get("revenue_ttm"))
+        if value is not None:
+            return value
+        return _last_positive(annual, "revenue")
+
+    @staticmethod
+    def _current_equity(
+        annual: pd.DataFrame,
+        snapshot: dict[str, Any],
+    ) -> float | None:
+        for key in ("equity", "total_equity", "twse_parent_equity"):
+            value = _positive_number(snapshot.get(key))
+            if value is not None:
+                return value
+        return _last_positive(annual, "equity")
+
+    @staticmethod
+    def _current_diluted_shares(annual: pd.DataFrame) -> float | None:
+        return _last_positive(annual, "diluted_shares")
+
     @staticmethod
     def _scenario(
         *,
@@ -496,6 +870,21 @@ def _positive_number(value: object) -> float | None:
     return parsed if parsed is not None and parsed > 0 else None
 
 
+def _text(value: object) -> str | None:
+    if value is None:
+        return None
+    parsed = str(value).strip()
+    return parsed or None
+
+
+def _last_positive(frame: pd.DataFrame, column: str) -> float | None:
+    if column not in frame:
+        return None
+    values = pd.to_numeric(frame[column], errors="coerce")
+    values = values[(values > 0) & values.notna()]
+    return float(values.iloc[-1]) if not values.empty else None
+
+
 def _median(values: list[float], *, positive: bool = False) -> float | None:
     clean = [
         float(value)
@@ -506,6 +895,8 @@ def _median(values: list[float], *, positive: bool = False) -> float | None:
 
 
 __all__ = [
+    "CycleValuationReviewStatus",
+    "CyclicalValuationReview",
     "LowEntryV5ValuationConfig",
     "LowEntryV5ValuationProducer",
     "LowEntryV5ValuationResult",

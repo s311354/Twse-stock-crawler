@@ -29,6 +29,8 @@ from infrastructure.fundamentals.mops_unit_of_work import borrow_connection
 class MopsQueryRepository:
     """Execute point-in-time reads without owning any persistence command."""
 
+    _BULK_SYMBOL_CHUNK_SIZE = 400
+
     def __init__(
         self,
         connect: Callable[[], sqlite3.Connection],
@@ -311,6 +313,37 @@ class MopsQueryRepository:
             return None
         return (int(row[0]), int(row[1])), str(row[2])
 
+    def load_financial_batch_states(
+        self,
+        symbols: list[str],
+        *,
+        uow: FundamentalUnitOfWork | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, tuple[tuple[int, int], str]]:
+        normalized = list(dict.fromkeys(symbol for symbol in symbols if symbol))
+        if not normalized:
+            return {}
+        self._ensure_schema()
+        loaded: dict[str, tuple[tuple[int, int], str]] = {}
+        with borrow_connection(self._connect, connection, uow) as active:
+            for offset in range(0, len(normalized), self._BULK_SYMBOL_CHUNK_SIZE):
+                chunk = normalized[offset : offset + self._BULK_SYMBOL_CHUNK_SIZE]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = active.execute(
+                    """
+                    SELECT symbol, fiscal_year, quarter, content_sha256
+                    FROM financial_batch_state
+                    WHERE symbol IN ({})
+                    """.format(placeholders),
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    loaded[str(row[0])] = (
+                        (int(row[1]), int(row[2])),
+                        str(row[3]),
+                    )
+        return loaded
+
     def load_financial_batch_snapshots(
         self,
         symbol: str,
@@ -338,6 +371,47 @@ class MopsQueryRepository:
                 FundamentalSnapshot(**payload)
             )
         return [latest_by_period[period] for period in sorted(latest_by_period)]
+
+    def load_financial_batch_snapshots_many(
+        self,
+        symbols: list[str],
+        *,
+        as_of: str,
+        uow: FundamentalUnitOfWork | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, list[FundamentalSnapshot]]:
+        normalized = list(dict.fromkeys(symbol for symbol in symbols if symbol))
+        if not normalized:
+            return {}
+        self._ensure_schema()
+        grouped: dict[
+            str,
+            dict[tuple[int, int], FundamentalSnapshot],
+        ] = {symbol: {} for symbol in normalized}
+        with borrow_connection(self._connect, connection, uow) as active:
+            for offset in range(0, len(normalized), self._BULK_SYMBOL_CHUNK_SIZE):
+                chunk = normalized[offset : offset + self._BULK_SYMBOL_CHUNK_SIZE]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = active.execute(
+                    """
+                    SELECT symbol, fiscal_year, quarter, observed_at_epoch, id,
+                           snapshot_json
+                    FROM financial_batch_snapshots
+                    WHERE symbol IN ({}) AND observed_at_epoch <= ?
+                    ORDER BY symbol, fiscal_year, quarter, observed_at_epoch, id
+                    """.format(placeholders),
+                    [*chunk, to_epoch(as_of)],
+                ).fetchall()
+                for row in rows:
+                    symbol = str(row[0])
+                    payload = json.loads(str(row[5]))
+                    grouped[symbol][(int(row[1]), int(row[2]))] = (
+                        FundamentalSnapshot(**payload)
+                    )
+        return {
+            symbol: [periods[period] for period in sorted(periods)]
+            for symbol, periods in grouped.items()
+        }
 
     @staticmethod
     def filing_set_hash(filings: list[FiledFinancials]) -> str:

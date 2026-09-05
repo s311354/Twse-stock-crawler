@@ -75,6 +75,7 @@ _BUILTIN_STRATEGIES = {
     "low_entry_score_v4_1": "domain.strategies.low_entry_score_v4_1.LowEntryScoreV41Strategy",
     "low_entry_score_v5": "domain.strategies.low_entry_score_v5.LowEntryScoreV5Strategy",
     "portfolio_allocation_v1": "domain.strategies.portfolio_allocation_v1.PortfolioAllocationV1Strategy",
+    "portfolio_allocation_v2": "domain.strategies.portfolio_allocation_v2.PortfolioAllocationV2Strategy",
 }
 
 def load_builtin_strategies(name: str | None = None) -> None:

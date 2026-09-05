@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import logging
 from collections.abc import Mapping
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -173,6 +174,20 @@ class StrategyDecisionAssembler:
         decisions: list[StrategyDecision] = []
         for item, (_, row) in enumerate(dataset.iterrows()):
             symbol = str(market.stock_numbers[item]).strip()
+            if (
+                not symbol
+                or not market.closes[item]
+            ):
+                logging.debug(
+                    "Skipping stock %s because no valid TWSE market history was collected.",
+                    symbol or "<unresolved>",
+                    extra={
+                        "symbol": symbol or None,
+                        "source": "TWSE",
+                        "status": "ANALYSIS_SLOT_SKIPPED",
+                    },
+                )
+                continue
             evaluated_at = self._evaluated_at(market, item, symbol)
             snapshot = market.fundamental_snapshots.get(symbol, {})
             extended_at = self._timestamp(

@@ -10,6 +10,9 @@ _EXECUTABLE_LES_DECISIONS = frozenset({"BUY", "BUY_SMALL"})
 _ACCEPTABLE_QUALITY_STATUSES = frozenset(
     {"QUALITY_CONFIRMED", "QUALITY_PROVISIONAL"}
 )
+_STARTER_QUALITY_STATUSES = frozenset(
+    {"QUALITY_CONFIRMED", "QUALITY_PROVISIONAL", "QUALITY_WATCH"}
+)
 _HARD_REJECT_STATUSES = frozenset(
     {"HARD_NO_BUY", "QUALITY_REJECT", "BASE_REJECT", "EXTENDED_REJECT"}
 )
@@ -158,8 +161,12 @@ class PortfolioCandidateEvaluator:
             )
             cer = scenario_return - uncertainty_penalty
 
-        quality_acceptable = (
-            security.quality_status.upper() in _ACCEPTABLE_QUALITY_STATUSES
+        les_decision = security.les_decision.upper()
+        is_starter = les_decision == "BUY_SMALL"
+        quality_acceptable = security.quality_status.upper() in (
+            _STARTER_QUALITY_STATUSES
+            if is_starter
+            else _ACCEPTABLE_QUALITY_STATUSES
         )
         classification_known = (
             security.sector.strip().upper() not in {"", "UNKNOWN", "N/A"}
@@ -168,7 +175,12 @@ class PortfolioCandidateEvaluator:
         )
         if not classification_known:
             reasons.append("PORTFOLIO_CLASSIFICATION_MISSING")
-        valuation_pass = security.valuation_gate.upper() == "PASS"
+        accepted_valuation_gates = (
+            {"PASS", "SUPPORTIVE"} if is_starter else {"PASS"}
+        )
+        valuation_pass = (
+            security.valuation_gate.upper() in accepted_valuation_gates
+        )
         absolute_strategic_candidate = bool(
             not hard_reject
             and quality_acceptable
@@ -184,16 +196,16 @@ class PortfolioCandidateEvaluator:
         strategic_candidate = absolute_strategic_candidate
         executable_candidate = bool(
             strategic_candidate
-            and security.les_decision.upper() in _EXECUTABLE_LES_DECISIONS
+            and les_decision in _EXECUTABLE_LES_DECISIONS
             and security.risk_gate.upper() == "PASS"
-            and security.falling_knife_state.upper() != "HARD_NO_BUY"
+            and security.falling_knife_state.upper() == "CLEAR"
             and security.executable_shares > 0
         )
         edge = max((cer or 0.0) - required_return, 0.0)
         execution_factor = {
             "BUY": self.config.buy_execution_factor,
             "BUY_SMALL": self.config.buy_small_execution_factor,
-        }.get(security.les_decision.upper(), 0.0)
+        }.get(les_decision, 0.0)
         capital_claim = (
             edge
             * float(security.data_confidence or 0) / 100

@@ -9,6 +9,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from domain.security_identity import is_airline_issuer
+
 
 VALUATION_MODEL_VERSION = "les-v5-valuation-2026-08-18-v4-air-cycle-review"
 
@@ -382,9 +384,13 @@ class LowEntryV5ValuationProducer:
         permanent_loss = max(0.0, 1.0 - (bear.fair_value / price))
         acceptable = permanent_loss <= self.config.maximum_bear_permanent_loss
         sector_code = _text(point_in_time_snapshot.get("sector"))
+        airline_profile = is_airline_issuer(
+            point_in_time_snapshot.get("issuer_symbol"),
+            sector_code,
+        )
         supportive_loss_limit = (
             self.config.air_supportive_maximum_bear_permanent_loss
-            if sector_code in self.config.always_review_cyclical_sector_codes
+            if airline_profile
             else self.config.supportive_maximum_bear_permanent_loss
         )
         supportive_downside = permanent_loss <= supportive_loss_limit
@@ -618,6 +624,10 @@ class LowEntryV5ValuationProducer:
         always_review = (
             sector_code in self.config.always_review_cyclical_sector_codes
         )
+        airline_profile = is_airline_issuer(
+            snapshot.get("issuer_symbol"),
+            sector_code,
+        )
         if not always_review and (
             divergence is None
             or divergence <= self.config.normalized_eps_divergence_threshold
@@ -631,6 +641,8 @@ class LowEntryV5ValuationProducer:
 
         reasons = [
             "AIR_CYCLICAL_VALUATION_REVIEW"
+            if airline_profile
+            else "TRANSPORT_CYCLICAL_VALUATION_REVIEW"
             if always_review
             else "NORMALIZED_EPS_DIVERGENCE"
         ]

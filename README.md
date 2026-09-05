@@ -22,6 +22,8 @@ The crawler keeps the legacy scripts compatible while introducing a cleaner, low
 ```
 .
 |-- main.py                         # project entrypoint
+|-- pyproject.toml                  # versioned Python package and CLI metadata
+|-- aistock_twse_integration/       # AIStock owner-research JSON contract/entry
 |-- interface/
 |   `-- cli.py                      # CLI argument adapter
 |-- application/
@@ -49,8 +51,12 @@ The crawler keeps the legacy scripts compatible while introducing a cleaner, low
 |       |-- low_entry_score_v3.py   # advanced Low Entry Score v3 strategy
 |       |-- low_entry_score_v4.py   # backward-compatible LES v4 strategy
 |       |-- low_entry_score_v4_1.py # quality-first stabilized LES v4.1
-|       |-- low_entry_score_v5.py   # quality-first panic-reversal LES v5
-|       `-- portfolio_allocation_v1.py # portfolio allocation engine v1
+|       |-- low_entry_score_v5.py   # LES v5 public strategy/config facade
+|       |-- low_entry_v5_composition.py # LES v5 component composition root
+|       |-- low_entry_v5_pipeline.py # rule-neutral LES v5 orchestration
+|       |-- low_entry_v5_compat.py  # lazy legacy RuleEngine facade
+|       |-- portfolio_allocation_v1.py # backward-compatible portfolio allocator
+|       `-- portfolio_allocation_v2.py # PAE v2 opportunity-cost allocator
 |-- infrastructure/
 |   |-- crawler/twse_client.py      # TWSE HTTP boundary
 |   |-- fundamentals/
@@ -58,6 +64,13 @@ The crawler keeps the legacy scripts compatible while introducing a cleaner, low
 |   |   |-- ixbrl_parser.py         # normalized Inline XBRL facts
 |   |   |-- mops_repository.py      # SQLite metadata + raw revision cache
 |   |   `-- twse_financial_batch.py # daily all-company financial snapshots
+|   |-- runtime/
+|   |   |-- market_data_adapter.py  # TWSE market-data port adapter
+|   |   |-- fundamental_adapter.py  # thin fundamental port adapter
+|   |   |-- fundamental_refresh.py  # cache-first refresh coordinator
+|   |   |-- strategy_adapter.py     # LES/EREM/PAE execution adapter
+|   |   `-- output_adapters.py      # report, SMTP, and chart adapters
+|   |-- stock_analysis_adapters.py  # backward-compatible runtime imports
 |   |-- report/html_renderer.py     # strategy HTML renderer factory
 |   |-- storage/csv_repository.py   # CSV output boundary
 |   |-- storage/stock_repository.py # CSV/SQLite/DuckDB stock repositories
@@ -120,26 +133,27 @@ EREM decision mapping:
 - `STRONG HOLD`: Holding Confidence >= 85
 - `HOLD`: 70 <= Holding Confidence < 85
 - `HOLD`: 55 <= Holding Confidence < 70
-- `REDUCE 25%`: 40 <= Holding Confidence < 55
+- `REDUCE 25%-50%`: 40 <= Holding Confidence < 55. The recommended reduction
+  increases in 5% steps as Holding Confidence falls: HC 54 maps to 25%, while
+  HC 40 maps to 50%.
 - `EXIT`: Holding Confidence < 40
 
-### Portfolio Allocation Engine v1 ###
+### Portfolio Allocation Engine v2 ###
 
-Portfolio Allocation Engine v1 (`portfolio_allocation_v1`) consumes the final LES v5, EREM v3, Quality v5, and Valuation v5 outputs. It does not recompute their indicators or combine them into a master score. Its decision order is:
+Portfolio Allocation Engine v2 (`portfolio_allocation_v2`, schema `pae.portfolio_decision.v2`) is the daily production allocator. It consumes published LES v5 and EREM v3 outputs and adds opportunity-cost allocation, complete-portfolio improvement, explicit cash preference, and atomic four-seat replacement rules.
 
-```text
-PortfolioMode from effective holding count
-  -> Hard Gates
-  -> Conservative Expected Return (CER)
-  -> Absolute Required Return
-  -> COLD_START / BUILDING: skip pairwise dominance
-  -> STEADY_STATE: Quality Advantage + CER Switch Hurdle
-  -> STEADY_STATE: Dual Dominance + Persistence / Obvious Opportunity
-  -> Concentration, Correlation and Liquidity Gates
-  -> Target Weights and Cash
-```
+The premarket entry universe accepts only hard-gate-complete LES v5 `BUY`, `EARLY_BUY`, and `BUY_SMALL` decisions. `BUY` must score at least 75. PAE sizing applies the execution factor exactly once: `BUY = 1.00`, `EARLY_BUY = 0.65`, and `BUY_SMALL = 0.50`. A high LES score never overrides unknown or failed Quality, Valuation, Risk, Falling-Knife, liquidity, or point-in-time evidence.
 
-`PortfolioMode` is recalculated from the current effective holdings on every run: `0 = COLD_START`, `1 = BUILDING`, and `>= 2 = STEADY_STATE`. It does not depend on prior runs, so the same portfolio input always produces the same mode.
+| Effective holdings | Mode | Authority |
+|---:|---|---|
+| 0-2 | `DIRECT_SELECTION` | `NON_BINDING`; LES controls entries and EREM controls holdings; CER diagnostics cannot veto a hard-gate-complete LES entry |
+| 3 | `PAE_ACTIVE_OPEN_SLOT` | `BINDING`; the fourth slot must pass absolute gates and Portfolio Improvement |
+| 4 | `PAE_ACTIVE_FULL` | `BINDING`; a new symbol requires Dual Dominance, Switch Hurdle, Persistence/Fast Path, and atomic seat release |
+| >4 | `POLICY_BREACH_REDUCE_ONLY` | No new name or net equity increase; hard exits retain priority |
+
+PAE v2 fails closed for new capital when Quality, Valuation, CER, LES, Risk, Falling-Knife, liquidity, position-cap, or point-in-time evidence is missing. Missing EREM evidence alone produces `HOLD_DATA_INSUFFICIENT`, never an automatic exit. Cash remains a valid output and four holdings are a hard cap, not a target.
+
+At four holdings, a replacement is one atomic `EXIT_THEN_ENTER` plan: the incumbent must exit completely before the challenger can enter. A failed exit cancels entry; a failed entry leaves the account in cash. The crawler publishes this bounded plan but does not upgrade frozen LES decisions or substitute a Top-3 fallback.
 
 ### Email Configuration ###
 
@@ -168,7 +182,8 @@ $ python main.py -h
 usage: main.py [-h] [--list-strategies] [--check-config] [-t {VEH,ELEC,BUI,AIR,CHEMI,BIO,SEMI,COMP,COMM}] [-o {SHIRONG,shirong}] [-e ENDBACKTRACK] [-b BEGINBACKTRACK] [-s SUBJECT] [-cc CCRECEIVER]
                [-l] [-p PERIOD] [-m] [--skip-mops]
                [--mops-history-years MOPS_HISTORY_YEARS] [--account-equity ACCOUNT_EQUITY]
-               [--pae-holdings-file PAE_HOLDINGS_FILE] [--pae-current-cash PAE_CURRENT_CASH]
+               [--pae-holdings-file PAE_HOLDINGS_FILE] [--include-symbols-file INCLUDE_SYMBOLS_FILE]
+               [--pae-current-cash PAE_CURRENT_CASH]
                [--mode {release,debug}]
                [stocklist ...]
 
@@ -201,6 +216,8 @@ options:
                         NTD account equity used for board-lot risk sizing.
   --pae-holdings-file PAE_HOLDINGS_FILE
                         PAE holdings text file using symbols or symbol:shares.
+  --include-symbols-file INCLUDE_SYMBOLS_FILE
+                        Add symbol-only rows to a shared market analysis universe without marking them as PAE holdings.
   --pae-current-cash PAE_CURRENT_CASH
                         Optional current portfolio cash in NTD.
   --mode {release,debug}

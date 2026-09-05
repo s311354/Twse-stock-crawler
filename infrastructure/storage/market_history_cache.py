@@ -88,6 +88,93 @@ class SQLiteMarketHistoryCache:
                 loaded[trade_date] = day
         return loaded
 
+    def load_symbols_many(
+        self,
+        trade_dates: list[str],
+        *,
+        market_type: str,
+        symbols: set[str],
+        schema_version: int = MARKET_HISTORY_SCHEMA_VERSION,
+    ) -> dict[str, CachedMarketDay]:
+        normalized_dates = sorted(set(trade_dates))
+        normalized_symbols = sorted(
+            set(str(symbol).strip() for symbol in symbols if str(symbol).strip())
+        )
+        if (
+            not normalized_dates
+            or not normalized_symbols
+            or not self.database_path.exists()
+        ):
+            return {}
+        self._validate_market_type(market_type)
+        self._validate_schema_version(schema_version)
+        for trade_date in normalized_dates:
+            self._validate_trade_date(trade_date)
+
+        date_values = ",".join("(?)" for _ in normalized_dates)
+        symbol_values = ",".join("(?)" for _ in normalized_symbols)
+        query = """
+            WITH requested_dates(trade_date) AS (VALUES {}),
+                 requested_symbols(symbol) AS (VALUES {})
+            SELECT cache.trade_date, cache.dataset,
+                   json_group_array(json(stock_row.value)) AS payload_json
+            FROM market_history_cache AS cache
+            JOIN requested_dates
+              ON requested_dates.trade_date = cache.trade_date
+            JOIN json_each(cache.payload_json) AS stock_row
+            JOIN requested_symbols
+              ON requested_symbols.symbol = CAST(
+                    json_extract(stock_row.value, '$[0]') AS TEXT
+                 )
+            WHERE cache.schema_version = ?
+              AND cache.dataset = ?
+              AND cache.market_type = ?
+            GROUP BY cache.trade_date, cache.dataset
+            UNION ALL
+            SELECT cache.trade_date, cache.dataset, cache.payload_json
+            FROM market_history_cache AS cache
+            JOIN requested_dates
+              ON requested_dates.trade_date = cache.trade_date
+            WHERE cache.schema_version = ?
+              AND cache.dataset = ?
+              AND cache.market_type = ?
+            ORDER BY 1, 2
+        """.format(date_values, symbol_values)
+        parameters: list[object] = [*normalized_dates, *normalized_symbols]
+        parameters.extend(
+            [
+                schema_version,
+                STOCK_TABLE_DATASET,
+                market_type,
+                schema_version,
+                TAIEX_DATASET,
+                TAIEX_MARKET_TYPE,
+            ]
+        )
+        try:
+            self._ensure_schema()
+            with sqlite3.connect(self.database_path) as connection:
+                records = connection.execute(query, parameters).fetchall()
+        except sqlite3.Error as error:
+            raise MarketHistoryCacheError(
+                "Unable to load filtered TWSE market-history cache at {}: {}".format(
+                    self.database_path,
+                    error,
+                )
+            ) from error
+
+        payloads: dict[str, dict[str, str]] = {}
+        for trade_date, dataset, payload_json in records:
+            payloads.setdefault(str(trade_date), {})[str(dataset)] = str(
+                payload_json
+            )
+        loaded: dict[str, CachedMarketDay] = {}
+        for trade_date, datasets in payloads.items():
+            day = self._decode_day(trade_date, datasets)
+            if day is not None:
+                loaded[trade_date] = day
+        return loaded
+
     def upsert_day(
         self,
         day: CachedMarketDay,

@@ -7,6 +7,7 @@ import pytest
 
 from domain.data_provenance import OFFICIAL_FILING_TIMESTAMP
 from domain.fundamental_derivation import FundamentalBundle
+from domain.fundamental_models import FundamentalSnapshot
 from domain.fundamental_models import NormalizedFact
 from infrastructure.fundamentals.models import MopsFilingCandidate
 from infrastructure.fundamentals.mops_commands import MopsRevisionWriter
@@ -138,6 +139,47 @@ def test_snapshot_cache_hit_uses_one_query_without_reading_facts(
     assert "facts" not in selects[0].lower()
 
 
+def test_bulk_financial_batch_queries_match_single_symbol_results(
+    tmp_path,
+) -> None:
+    repository = MopsRepository(tmp_path / "mops")
+    snapshots = [
+        _snapshot("2330", 2025, 4, "2026-02-10T00:00:00+00:00"),
+        _snapshot("2330", 2026, 1, "2026-05-10T00:00:00+00:00"),
+        _snapshot("2317", 2025, 4, "2026-02-11T00:00:00+00:00"),
+    ]
+    with repository.unit_of_work() as uow:
+        for snapshot in snapshots:
+            repository.save_financial_batch_snapshot(snapshot, uow=uow)
+        repository.save_financial_batch_state(
+            "2330",
+            2026,
+            1,
+            snapshots[1].content_sha256,
+            snapshots[1].observed_at,
+            uow=uow,
+        )
+
+    symbols = ["2330", "2317", "9999"]
+    as_of = "2026-06-01T00:00:00+00:00"
+    bulk_history = repository.load_financial_batch_snapshots_many(
+        symbols,
+        as_of=as_of,
+    )
+    bulk_states = repository.load_financial_batch_states(symbols)
+
+    assert bulk_history == {
+        symbol: repository.load_financial_batch_snapshots(
+            symbol,
+            as_of=as_of,
+        )
+        for symbol in symbols
+    }
+    assert bulk_states == {
+        "2330": repository.load_financial_batch_state("2330")
+    }
+
+
 def _candidate() -> MopsFilingCandidate:
     return MopsFilingCandidate(
         symbol="2330",
@@ -160,4 +202,31 @@ def _fact(value: float) -> NormalizedFact:
         end_date="2025-12-31",
         instant=None,
         dimensions=(),
+    )
+
+
+def _snapshot(
+    symbol: str,
+    fiscal_year: int,
+    quarter: int,
+    observed_at: str,
+) -> FundamentalSnapshot:
+    return FundamentalSnapshot(
+        symbol=symbol,
+        company_name=symbol,
+        fiscal_year=fiscal_year,
+        quarter=quarter,
+        observed_at=observed_at,
+        revenue_ytd=1_000.0,
+        gross_profit_ytd=400.0,
+        operating_income_ytd=200.0,
+        net_income_ytd=150.0,
+        parent_net_income_ytd=150.0,
+        basic_eps_ytd=10.0,
+        current_assets=400.0,
+        total_assets=1_000.0,
+        current_liabilities=200.0,
+        total_liabilities=300.0,
+        parent_equity=600.0,
+        total_equity=700.0,
     )

@@ -13,7 +13,7 @@ from domain.features import SharedFeaturePipeline
 from domain.strategy import Strategy
 
 EXPECTED_RETURN_EXIT_STRATEGY_NAME = "expected_return_exit_v3"
-EREM_V3_MODEL_VERSION = "3.1.0"
+EREM_V3_MODEL_VERSION = "3.2.4"
 EREM_V3_MAX_RAW_SCORE = 105.0
 
 EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS = [
@@ -21,10 +21,13 @@ EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS = [
     "EREM Raw Score",
     "EREM Holding Confidence",
     "EREM Entry LES",
+    "EREM Entry Decision",
+    "EREM Grace Profile",
     "EREM Holding Days",
     "EREM Entry Weight",
     "EREM Exit Streak Count",
     "EREM 決策訊號",
+    "EREM 建議減倉比例",
     "EREM Trend Score",
     "EREM Momentum Score",
     "EREM Volatility Score",
@@ -95,6 +98,13 @@ class ExpectedReturnExitV3Config:
     entry_weight_floor: float = 0.10
     entry_weight_decay_days: float = 20.0
     exit_confidence_threshold: float = 40.0
+    exit_confirmation_sessions: int = 2
+    buy_grace_sessions: int = 3
+    buy_exit_confirmation_sessions: int = 3
+    early_buy_grace_sessions: int = 2
+    buy_small_grace_sessions: int = 2
+    buy_small_exit_confirmation_sessions: int = 2
+    buy_entry_les_threshold: float = 75.0
     ema_slope_lookback: int = 5
     epsilon: float = 1e-9
 
@@ -105,6 +115,27 @@ class ExpectedReturnExitV3Config:
             )
         if self.entry_weight_decay_days <= 0:
             raise ValueError("entry_weight_decay_days must be positive")
+        if self.exit_confirmation_sessions <= 0:
+            raise ValueError("exit_confirmation_sessions must be positive")
+        for name, value in (
+            ("buy_grace_sessions", self.buy_grace_sessions),
+            ("early_buy_grace_sessions", self.early_buy_grace_sessions),
+            ("buy_small_grace_sessions", self.buy_small_grace_sessions),
+        ):
+            if value < 0:
+                raise ValueError("{} must be non-negative".format(name))
+        for name, value in (
+            (
+                "buy_exit_confirmation_sessions",
+                self.buy_exit_confirmation_sessions,
+            ),
+            (
+                "buy_small_exit_confirmation_sessions",
+                self.buy_small_exit_confirmation_sessions,
+            ),
+        ):
+            if value <= 0:
+                raise ValueError("{} must be positive".format(name))
 
 
 class ExpectedReturnExitV3Strategy(Strategy):
@@ -118,7 +149,8 @@ class ExpectedReturnExitV3Strategy(Strategy):
     name = EXPECTED_RETURN_EXIT_STRATEGY_NAME
     description = (
         "Holding confidence with decaying Entry LES memory, three-state VWAP, "
-        "trend, momentum, volatility, distribution, and relative strength"
+        "confirmed soft exits, new-position grace, trend, momentum, volatility, "
+        "distribution, and relative strength"
     )
     version = EREM_V3_MODEL_VERSION
 
@@ -313,6 +345,26 @@ class ExpectedReturnExitV3Strategy(Strategy):
             ("Holding Days", "Holding_Days", "持有天數"),
         ).clip(lower=0)
         holding_days_available = holding_days.notna()
+        entry_decision = (
+            self._text_column(
+                df,
+                (
+                    "Entry Decision",
+                    "Entry_Decision",
+                    "進場決策",
+                    "進場訊號",
+                ),
+            )
+            .ffill()
+            .str.strip()
+            .str.upper()
+            .str.replace("-", "_", regex=False)
+            .str.replace(" ", "_", regex=False)
+        )
+        entry_decision = entry_decision.where(
+            entry_decision.isin({"BUY", "EARLY_BUY", "BUY_SMALL"})
+        )
+        entry_decision_available = entry_decision.notna()
         decayed_entry_weight = self.config.entry_weight_initial * np.exp(
             -holding_days / self.config.entry_weight_decay_days
         )
@@ -372,14 +424,31 @@ class ExpectedReturnExitV3Strategy(Strategy):
             (1 - entry_weight) * current_score
             + entry_weight * entry_anchor
         ).clip(lower=0, upper=100)
-        exit_streak = self._consecutive_true(
-            holding_confidence < self.config.exit_confidence_threshold
+        exit_streak, exit_confirmed, entry_grace, grace_profile = (
+            self._exit_confirmation(
+                holding_confidence=holding_confidence,
+                entry_les=entry_les,
+                holding_days=holding_days,
+                entry_decision=entry_decision,
+            )
         )
         ema20_slope = (
             (ema20 - ema20.shift(self.config.ema_slope_lookback))
             / (self.config.ema_slope_lookback * atr14)
         ).where(atr14.abs() > self.config.epsilon)
-        decision = self._decision(holding_confidence)
+        proposed_reduction_percentage = self._recommended_reduction_percentage(
+            holding_confidence
+        )
+        decision = self._decision(
+            holding_confidence,
+            proposed_reduction_percentage,
+            exit_confirmed=exit_confirmed,
+            entry_grace=entry_grace,
+        )
+        reduction_percentage = proposed_reduction_percentage.where(
+            decision.eq("EXIT") | decision.str.startswith("REDUCE"),
+            0.0,
+        )
 
         result = pd.DataFrame(
             {
@@ -387,10 +456,13 @@ class ExpectedReturnExitV3Strategy(Strategy):
                 "EREM Raw Score": raw_score.round(2),
                 "EREM Holding Confidence": holding_confidence.round(2),
                 "EREM Entry LES": entry_les.round(2),
+                "EREM Entry Decision": entry_decision,
+                "EREM Grace Profile": grace_profile,
                 "EREM Holding Days": holding_days.round(0),
                 "EREM Entry Weight": entry_weight.round(4),
                 "EREM Exit Streak Count": exit_streak,
                 "EREM 決策訊號": decision,
+                "EREM 建議減倉比例": reduction_percentage,
                 "EREM Trend Score": trend_score.round(2),
                 "EREM Momentum Score": momentum_score.round(2),
                 "EREM Volatility Score": volatility_score.round(2),
@@ -440,8 +512,12 @@ class ExpectedReturnExitV3Strategy(Strategy):
                     current_score=current_score,
                     holding_confidence=holding_confidence,
                     exit_streak=exit_streak,
+                    exit_confirmed=exit_confirmed,
+                    entry_grace=entry_grace,
+                    grace_profile=grace_profile,
                     ema20_slope=ema20_slope,
                     entry_les_available=entry_les_available,
+                    entry_decision_available=entry_decision_available,
                     holding_days=holding_days,
                     holding_days_available=holding_days_available,
                     entry_weight=entry_weight,
@@ -485,6 +561,12 @@ class ExpectedReturnExitV3Strategy(Strategy):
                 return pd.to_numeric(data[name], errors="coerce")
         return pd.Series(np.nan, index=data.index, dtype="float64")
 
+    def _text_column(self, data: pd.DataFrame, names: tuple[str, ...]) -> pd.Series:
+        for name in names:
+            if name in data.columns:
+                return data[name].astype("string")
+        return pd.Series(pd.NA, index=data.index, dtype="string")
+
     def _turnover_input(self, df: pd.DataFrame, volume: pd.Series) -> tuple[pd.Series, str]:
         for name in ("Turnover", "Turnover Rate", "週轉率"):
             if name in df.columns:
@@ -497,6 +579,76 @@ class ExpectedReturnExitV3Strategy(Strategy):
         mask = condition.fillna(False).astype(bool)
         groups = (~mask).cumsum()
         return mask.groupby(groups).cumsum().astype("int64")
+
+    def _exit_confirmation(
+        self,
+        holding_confidence: pd.Series,
+        entry_les: pd.Series,
+        holding_days: pd.Series,
+        entry_decision: pd.Series,
+    ) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+        """Confirm soft exits without carrying pre-entry weakness forward.
+
+        Hard stops and confirmed fundamental risks remain outside EREM and may
+        still exit immediately.  This confirmation applies only to EREM's
+        score-driven soft exit so one weak session does not churn a new or
+        otherwise valid holding.
+        """
+        exit_warning = (
+            holding_confidence < self.config.exit_confidence_threshold
+        )
+        position_context = entry_les.notna() & holding_days.notna()
+
+        # When position metadata exists, pre-entry rows must reset the streak.
+        # Diagnostic runs without position metadata retain ordinary consecutive
+        # scoring, but still require more than one warning before EXIT.
+        streak_input = exit_warning
+        if bool(position_context.any()):
+            streak_input = exit_warning & position_context
+        exit_streak = self._consecutive_true(streak_input)
+
+        eligible_context = position_context & entry_decision.isin(
+            {"BUY", "EARLY_BUY", "BUY_SMALL"}
+        )
+        holding_session_index = position_context.astype("int64").cumsum().sub(1)
+        buy_window = (
+            eligible_context
+            & entry_decision.eq("BUY")
+            & entry_les.ge(self.config.buy_entry_les_threshold)
+            & holding_session_index.lt(self.config.buy_grace_sessions)
+        )
+        buy_small_window = (
+            eligible_context
+            & entry_decision.eq("BUY_SMALL")
+            & holding_session_index.lt(self.config.buy_small_grace_sessions)
+        )
+        early_buy_window = (
+            eligible_context
+            & entry_decision.eq("EARLY_BUY")
+            & holding_session_index.lt(self.config.early_buy_grace_sessions)
+        )
+        grace_profile = pd.Series(
+            "NONE",
+            index=holding_confidence.index,
+            dtype="object",
+        )
+        grace_profile.loc[buy_window] = "BUY_3_SESSION"
+        grace_profile.loc[early_buy_window] = "EARLY_BUY_2_SESSION"
+        grace_profile.loc[buy_small_window] = "BUY_SMALL_2_SESSION"
+        entry_grace = buy_window | early_buy_window | buy_small_window
+        required_sessions = pd.Series(
+            float(self.config.exit_confirmation_sessions),
+            index=holding_confidence.index,
+            dtype="float64",
+        )
+        required_sessions.loc[buy_window] = float(
+            self.config.buy_exit_confirmation_sessions
+        )
+        required_sessions.loc[buy_small_window] = float(
+            self.config.buy_small_exit_confirmation_sessions
+        )
+        exit_confirmed = exit_warning & exit_streak.ge(required_sessions)
+        return exit_streak, exit_confirmed, entry_grace, grace_profile
 
     @staticmethod
     def _vwap_assessment(
@@ -548,15 +700,59 @@ class ExpectedReturnExitV3Strategy(Strategy):
         )
         return score, state
 
-    def _decision(self, score: pd.Series) -> pd.Series:
-        return pd.Series(
+    @staticmethod
+    def _recommended_reduction_percentage(score: pd.Series) -> pd.Series:
+        """Return an actionable reduction percentage from Holding Confidence.
+
+        The 40-54 band scales linearly from 50% down to 25%, quantized to
+        practical 5% steps. Scores below 40 remain full EXIT signals, while
+        HOLD states recommend no reduction.
+        """
+        continuous = 25.0 + ((54.0 - score) / 14.0 * 25.0)
+        stepped = (np.floor((continuous + 2.5) / 5.0) * 5.0).clip(25, 50)
+        reduction = pd.Series(
             np.select(
-                [score >= 85, score >= 70, score >= 55, score >= 40],
-                ["STRONG HOLD", "HOLD", "HOLD", "REDUCE 25%"],
-                default="EXIT",
+                [score < 40, (score >= 40) & (score < 55)],
+                [100.0, stepped],
+                default=0.0,
             ),
             index=score.index,
+            dtype="float64",
         )
+        return reduction.where(score.notna())
+
+    def _decision(
+        self,
+        score: pd.Series,
+        reduction_percentage: pd.Series | None = None,
+        *,
+        exit_confirmed: pd.Series | None = None,
+        entry_grace: pd.Series | None = None,
+    ) -> pd.Series:
+        reduction = (
+            reduction_percentage
+            if reduction_percentage is not None
+            else self._recommended_reduction_percentage(score)
+        )
+        grace = (
+            entry_grace.fillna(False).astype(bool)
+            if entry_grace is not None
+            else pd.Series(False, index=score.index, dtype="bool")
+        )
+        decision = pd.Series("HOLD_REVIEW", index=score.index, dtype="object")
+        decision.loc[score >= 55] = "HOLD"
+        decision.loc[score >= 85] = "STRONG HOLD"
+        reduce_mask = (score >= 40) & (score < 55)
+        decision.loc[reduce_mask] = (
+            "REDUCE "
+            + reduction.loc[reduce_mask].astype(int).astype(str)
+            + "%"
+        )
+        decision.loc[score < self.config.exit_confidence_threshold] = "EXIT"
+        # Entry grace only suppresses an ordinary 40-54 REDUCE. It must never
+        # delay EXIT (<40), hard stops, or fundamental hard-risk exits.
+        decision.loc[grace & reduce_mask] = "HOLD_REVIEW"
+        return decision
 
     def _reasons(
         self,
@@ -564,8 +760,12 @@ class ExpectedReturnExitV3Strategy(Strategy):
         current_score: pd.Series,
         holding_confidence: pd.Series,
         exit_streak: pd.Series,
+        exit_confirmed: pd.Series,
+        entry_grace: pd.Series,
+        grace_profile: pd.Series,
         ema20_slope: pd.Series,
         entry_les_available: pd.Series,
+        entry_decision_available: pd.Series,
         holding_days: pd.Series,
         holding_days_available: pd.Series,
         entry_weight: pd.Series,
@@ -589,8 +789,12 @@ class ExpectedReturnExitV3Strategy(Strategy):
                 "current": current_score,
                 "holding": holding_confidence,
                 "exit_streak": exit_streak,
+                "exit_confirmed": exit_confirmed,
+                "entry_grace": entry_grace,
+                "grace_profile": grace_profile,
                 "ema20_slope": ema20_slope,
                 "entry_available": entry_les_available,
+                "entry_decision_available": entry_decision_available,
                 "holding_days": holding_days,
                 "holding_days_available": holding_days_available,
                 "entry_weight": entry_weight,
@@ -616,6 +820,8 @@ class ExpectedReturnExitV3Strategy(Strategy):
                 missing.append("TAIEX")
             if not bool(row["entry_available"]):
                 missing.append("Entry LES")
+            if not bool(row["entry_decision_available"]):
+                missing.append("Entry Decision")
             if bool(row["entry_available"]) and not bool(
                 row["holding_days_available"]
             ):
@@ -635,7 +841,9 @@ class ExpectedReturnExitV3Strategy(Strategy):
                 "週轉{turnover:+.0f}；VWAP{vwap:+.0f}({vwap_state})；"
                 "HoldingDays={holding_days_text}；EntryWeight={entry_weight:.4f}；"
                 "持有信心{holding:.2f}；"
-                "ExitStreak={exit_streak:.0f}；EMA20Slope={ema20_slope:.4f}；"
+                "ExitStreak={exit_streak:.0f}；ExitConfirmed={exit_confirmed}；"
+                "GraceProfile={grace_profile}；"
+                "EMA20Slope={ema20_slope:.4f}；"
                 "決策={decision}{missing_note}"
             ).format(**values)
 
@@ -648,10 +856,13 @@ class ExpectedReturnExitV3Strategy(Strategy):
                 "EREM 分數": 0,
                 "EREM Raw Score": 0,
                 "EREM Holding Confidence": 0,
+                "EREM Entry Decision": np.nan,
+                "EREM Grace Profile": "NONE",
                 "EREM Holding Days": np.nan,
                 "EREM Entry Weight": 0,
                 "EREM Exit Streak Count": 0,
                 "EREM 決策訊號": "EXIT",
+                "EREM 建議減倉比例": np.nan,
                 "EREM Trend Score": 0,
                 "EREM Momentum Score": 0,
                 "EREM Volatility Score": 0,

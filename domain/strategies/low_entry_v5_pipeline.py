@@ -140,6 +140,8 @@ class DecisionComponent(Protocol):
         recent_rally_reclaim_trigger: pd.Series | None = None,
         quality_pullback_trigger: pd.Series | None = None,
         broad_rally_active: pd.Series | None = None,
+        elec_trend_pullback_trigger: pd.Series | None = None,
+        elec_repriced_risk_gate: pd.Series | None = None,
     ) -> pd.Series: ...
 
     def position_fraction(
@@ -295,6 +297,15 @@ class LowEntryV5DecisionPipeline:
             plan,
             panic["state"],
         )
+        elec_trigger = panic.get(
+            "elec_trend_pullback_trigger", pd.Series(False, index=frame.index)
+        )
+        elec_repriced_risk_gate = pd.Series("UNKNOWN", index=frame.index)
+        if elec_trigger.any():
+            elec_repriced_risk_gate, _ = self.components.market.evaluate_risk_gate(
+                indicators, broad_rally_plan, market_gate
+            )
+        panic["elec_repriced_risk_gate"] = elec_repriced_risk_gate
         decision = self.components.decision.resolve_decision(
             score=score,
             quality=quality,
@@ -327,6 +338,8 @@ class LowEntryV5DecisionPipeline:
                 "quality_pullback_trigger"
             ],
             broad_rally_active=panic["broad_rally_active"],
+            elec_trend_pullback_trigger=elec_trigger,
+            elec_repriced_risk_gate=elec_repriced_risk_gate,
         )
         if not security_supported:
             decision[:] = "NO_MODEL"

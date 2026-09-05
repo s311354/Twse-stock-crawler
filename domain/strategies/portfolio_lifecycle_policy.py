@@ -86,11 +86,7 @@ class LifecyclePolicy:
         for security in request.candidates:
             evaluation = evaluations[security.symbol]
             if security.symbol in selected:
-                action = (
-                    PortfolioAction.STARTER
-                    if security.les_decision.upper() == "BUY_SMALL"
-                    else PortfolioAction.ADD
-                )
+                action = self.entry_action(security, evaluation)
                 reason = "COLD_START_EXECUTABLE"
             elif evaluation.data_insufficient:
                 action = PortfolioAction.DATA_INSUFFICIENT
@@ -180,11 +176,7 @@ class LifecyclePolicy:
         for candidate in request.candidates:
             evaluation = evaluations[candidate.symbol]
             if selected is not None and candidate.symbol == selected.symbol:
-                action = (
-                    PortfolioAction.STARTER
-                    if candidate.les_decision.upper() == "BUY_SMALL"
-                    else PortfolioAction.ADD
-                )
+                action = self.entry_action(candidate, evaluation)
                 reason = "BUILDING_EXECUTABLE_SECOND_POSITION"
             elif evaluation.data_insufficient:
                 action = PortfolioAction.DATA_INSUFFICIENT
@@ -324,11 +316,22 @@ class LifecyclePolicy:
                 PortfolioAction.FAST_TRACK_ROTATE,
             }
         ]
-        if qualified_rotations and available_slots > 0:
+        if qualified_rotations and available_slots >= 0:
             _, symbol, chosen = sorted(
                 qualified_rotations,
-                key=lambda item: (item[0], item[1]),
+                key=lambda item: (
+                    item[0],
+                    -float(item[2].quality_advantage or 0.0),
+                    -float(item[2].excess_opportunity or 0.0),
+                    item[1],
+                ),
             )[0]
+            if available_slots == 0:
+                chosen = replace(
+                    chosen,
+                    target_weight=0.0,
+                    reason=chosen.reason + ";FULL_PORTFOLIO_ATOMIC_ROTATION",
+                )
             lines = [
                 chosen
                 if line.symbol == symbol
@@ -356,11 +359,7 @@ class LifecyclePolicy:
         for candidate in request.candidates:
             evaluation = evaluations[candidate.symbol]
             if candidate.symbol in selected_candidates:
-                action = (
-                    PortfolioAction.STARTER
-                    if candidate.les_decision.upper() == "BUY_SMALL"
-                    else PortfolioAction.ADD
-                )
+                action = self.entry_action(candidate, evaluation)
                 reason = "EXECUTABLE_CAPITAL_RECIPIENT"
             elif evaluation.data_insufficient:
                 action = PortfolioAction.DATA_INSUFFICIENT
@@ -402,11 +401,7 @@ class LifecyclePolicy:
             item for item in request.holdings if item.symbol == line.symbol
         )
         if line.evaluation.executable_candidate:
-            action = (
-                PortfolioAction.STARTER
-                if holding.les_decision.upper() == "BUY_SMALL"
-                else PortfolioAction.ADD
-            )
+            action = self.entry_action(holding, line.evaluation)
             return replace(
                 line,
                 action=action,
@@ -417,6 +412,23 @@ class LifecyclePolicy:
             action=PortfolioAction.HOLD_NO_ADD,
             reason=line.reason + ";WEAK_LES_IS_NOT_A_SELL_SIGNAL",
         )
+
+    def entry_action(
+        self,
+        security: AllocationSecurity,
+        evaluation: SecurityEvaluation,
+    ) -> PortfolioAction:
+        """Map an executable candidate to a size-aware entry action."""
+        if security.les_decision.upper() == "BUY_SMALL":
+            return PortfolioAction.STARTER
+        if (
+            float(security.quality_score or 0.0)
+            >= self.config.obvious_quality_score
+            and evaluation.opportunity_edge
+            >= self.config.obvious_required_return_spread
+        ):
+            return PortfolioAction.STRONG_ADD
+        return PortfolioAction.ADD
 
     @staticmethod
     def hold_rotation_candidate(

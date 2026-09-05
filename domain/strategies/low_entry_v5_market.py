@@ -9,12 +9,14 @@ import pandas as pd
 
 from domain.features import FeatureFrame
 from domain.features import SharedFeatureConfig
+from domain.industry_profiles import ELECTRONICS_SECTOR_CODES
 from domain.market_breadth import MARKET_BREADTH_ATTR
 from domain.market_breadth import MARKET_BREADTH_HISTORY_ATTR
 from domain.market_breadth import MARKET_DATA_THROUGH_ATTR
 from domain.market_breadth import MARKET_SESSION_FINAL_ATTR
 from domain.market_breadth import normalize_market_breadth_snapshot
 from domain.strategies.low_entry_score_v4 import ACCOUNT_EQUITY_ATTR
+from domain.strategies.low_entry_score_v4 import FUNDAMENTAL_SNAPSHOT_ATTR
 from domain.strategies.low_entry_score_v4 import PRICE_SCALE_ATTR
 from domain.strategies.low_entry_v5_contracts import BroadRallyTier
 
@@ -89,6 +91,18 @@ class LowEntryV5MarketEvaluator:
         )
         indicators["taiex_r1"] = indicators["taiex"].pct_change(
             fill_method=None
+        )
+        fundamental_snapshot = context.get(FUNDAMENTAL_SNAPSHOT_ATTR)
+        sector = (
+            str(fundamental_snapshot.get("sector") or "").strip()
+            if isinstance(fundamental_snapshot, dict)
+            else ""
+        )
+        # An unknown classification cannot opt into an industry-specific path.
+        indicators["is_electronics"] = pd.Series(
+            sector in ELECTRONICS_SECTOR_CODES if sector else pd.NA,
+            index=indicators.index,
+            dtype="boolean",
         )
         self._attach_breadth_facts(indicators, snapshot)
         indicators["broad_rally_tier"] = self._evaluate_breadth_rally_tier(

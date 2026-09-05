@@ -57,6 +57,7 @@ class SnapshotAssembler:
         signal_time: pd.Timestamp,
         *,
         uow: FundamentalUnitOfWork,
+        history: list[FundamentalSnapshot] | None = None,
     ) -> BatchSnapshotResolution:
         current = self.eligible_batch_snapshot(
             daily_financials,
@@ -69,11 +70,12 @@ class SnapshotAssembler:
                 source="TWSE_OPENAPI_LATEST",
                 cache_hit=False,
             )
-        history = self._repository.load_financial_batch_snapshots(
-            symbol,
-            as_of=signal_time.isoformat(),
-            uow=uow,
-        )
+        if history is None:
+            history = self._repository.load_financial_batch_snapshots(
+                symbol,
+                as_of=signal_time.isoformat(),
+                uow=uow,
+            )
         if not history:
             return BatchSnapshotResolution(
                 snapshot=None,
@@ -126,6 +128,8 @@ class SnapshotAssembler:
         symbol: str,
         signal_time: pd.Timestamp,
         uow: FundamentalUnitOfWork,
+        history: list[FundamentalSnapshot] | None = None,
+        persist_snapshot: bool = True,
     ) -> FundamentalBundle:
         if resolution.snapshot is not None:
             return self._attach_batch_snapshot(
@@ -134,6 +138,8 @@ class SnapshotAssembler:
                 source=resolution.source,
                 signal_time=signal_time,
                 uow=uow,
+                history=history,
+                persist_snapshot=persist_snapshot,
             )
         features = self._feature_producer.produce(
             current=None,
@@ -182,16 +188,33 @@ class SnapshotAssembler:
         source: str,
         signal_time: pd.Timestamp,
         uow: FundamentalUnitOfWork,
+        history: list[FundamentalSnapshot] | None,
+        persist_snapshot: bool,
     ) -> FundamentalBundle:
-        self._repository.save_financial_batch_snapshot(
-            batch_snapshot,
-            uow=uow,
-        )
-        history = self._repository.load_financial_batch_snapshots(
-            batch_snapshot.symbol,
-            as_of=signal_time.isoformat(),
-            uow=uow,
-        )
+        if persist_snapshot:
+            self._repository.save_financial_batch_snapshot(
+                batch_snapshot,
+                uow=uow,
+            )
+        if history is None:
+            history = self._repository.load_financial_batch_snapshots(
+                batch_snapshot.symbol,
+                as_of=signal_time.isoformat(),
+                uow=uow,
+            )
+        elif not any(
+            item.content_sha256 == batch_snapshot.content_sha256
+            and item.period == batch_snapshot.period
+            for item in history
+        ):
+            history = sorted(
+                [*history, batch_snapshot],
+                key=lambda item: (
+                    item.period,
+                    item.observed_at,
+                    item.content_sha256,
+                ),
+            )
         features = self._feature_producer.produce(
             current=batch_snapshot,
             history=history,

@@ -357,7 +357,7 @@ class DominancePolicy:
             + self.config.obvious_required_return_spread
             and candidate.les_decision.upper() == "BUY"
             and candidate.risk_gate.upper() == "PASS"
-            and candidate.falling_knife_state.upper() != "HARD_NO_BUY"
+            and candidate.falling_knife_state.upper() == "CLEAR"
             and excess >= self.config.obvious_excess_opportunity
         )
 

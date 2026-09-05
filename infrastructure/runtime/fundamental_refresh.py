@@ -1,0 +1,567 @@
+"""Cache-first fundamental refresh coordination."""
+
+from __future__ import annotations
+
+import datetime
+import logging
+import time
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from application.contracts import AnalysisContext
+from application.contracts import StockAnalysisRequest
+from application.observability import NullRunObserver
+from application.ports import RunObserverPort
+from domain.fundamental_derivation import FundamentalBundle
+from domain.security_identity import SecurityIdentity
+from domain.security_identity import resolve_security_identity
+from infrastructure.crawler.twse_http_client import TwseClientError
+from infrastructure.crawler.twse_http_client import TwseNetworkError
+from infrastructure.crawler.twse_http_client import TwseSchemaChangedError
+from infrastructure.fundamentals.mops_repository import MopsStorageError
+from infrastructure.observability import structured_extra
+
+
+TAIPEI_TIMEZONE = ZoneInfo("Asia/Taipei")
+MOPS_INFRASTRUCTURE_FAILURE_THRESHOLD = 2
+
+
+class FundamentalRefreshCoordinator:
+    """Coordinate cache-first MOPS refresh while preserving fail-closed behavior."""
+
+    def __init__(
+        self,
+        fundamental_service: Any,
+        *,
+        observer: RunObserverPort | None = None,
+    ) -> None:
+        self.fundamental_service = fundamental_service
+        self._observer = observer or NullRunObserver()
+
+    def refresh(
+        self,
+        context: AnalysisContext,
+        request: StockAnalysisRequest,
+        *,
+        analysis_time: datetime.datetime,
+    ) -> None:
+        refresh_started = time.monotonic()
+        crawler = context.resource
+        stocknumbers = getattr(crawler, "stocknumbers", [])
+        stocknames = getattr(crawler, "stocknames", [])
+        daily_dates = getattr(crawler, "daily_dates", [])
+        setter = getattr(crawler, "set_low_entry_v4_fundamentals", None)
+        if not callable(setter):
+            self._observer.record(
+                "fundamental_refresh_skipped",
+                source="MOPS",
+                status="UNSUPPORTED",
+            )
+            return
+
+        localized_time = analysis_time.astimezone(TAIPEI_TIMEZONE)
+        analysis_signal_date = localized_time.isoformat()
+        consecutive_network_failures = 0
+        consecutive_storage_failures = 0
+        consecutive_schema_failures = 0
+        bundles_by_issuer: dict[str, FundamentalBundle] = {}
+        reset_scope_fallbacks = getattr(
+            self.fundamental_service,
+            "reset_scope_fallback_diagnostics",
+            None,
+        )
+        if callable(reset_scope_fallbacks):
+            reset_scope_fallbacks()
+        reset_access_blocked = getattr(
+            self.fundamental_service,
+            "reset_access_blocked_diagnostics",
+            None,
+        )
+        if callable(reset_access_blocked):
+            reset_access_blocked()
+
+        prepare_daily_batch = getattr(
+            self.fundamental_service,
+            "prepare_daily_batch",
+            None,
+        )
+        if callable(prepare_daily_batch):
+            try:
+                company_count = prepare_daily_batch(localized_time)
+                self._observer.record(
+                    "financial_batch_loaded",
+                    trade_date=context.market_date.isoformat(),
+                    source="TWSE_OPENAPI",
+                    status="SUCCESS",
+                    company_count=company_count,
+                )
+            except TwseClientError as error:
+                self._observer.record(
+                    "financial_batch_unavailable",
+                    level=logging.WARNING,
+                    trade_date=context.market_date.isoformat(),
+                    source="TWSE_OPENAPI",
+                    status=error.category.value.upper(),
+                )
+                logging.warning(
+                    "TWSE financial batch status=%s unavailable; "
+                    "falling back to cache-first MOPS refresh: %s",
+                    error.category.value.upper(),
+                    error,
+                )
+
+        prepare_daily_revisions = getattr(
+            self.fundamental_service,
+            "prepare_daily_revisions",
+            None,
+        )
+        if callable(prepare_daily_revisions):
+            try:
+                correction_count = prepare_daily_revisions(localized_time)
+                self._observer.record(
+                    "fundamental_revision_scan_completed",
+                    trade_date=context.market_date.isoformat(),
+                    source="MOPS",
+                    status="SUCCESS",
+                    correction_count=correction_count,
+                )
+            except TwseClientError as error:
+                self._observer.record(
+                    "fundamental_revision_scan_unavailable",
+                    level=logging.WARNING,
+                    trade_date=context.market_date.isoformat(),
+                    source="MOPS",
+                    status=error.category.value.upper(),
+                )
+                logging.warning(
+                    "MOPS daily correction scan status=%s unavailable; "
+                    "complete filing caches remain usable: %s",
+                    error.category.value.upper(),
+                    error,
+                )
+
+        issuer_symbols = []
+        for item, stock_no in enumerate(stocknumbers):
+            if not stock_no or item >= len(daily_dates) or not daily_dates[item]:
+                continue
+            stock_name = stocknames[item] if item < len(stocknames) else ""
+            issuer_symbols.append(
+                resolve_security_identity(stock_no, stock_name).issuer_symbol
+            )
+        preloaded_bundles: dict[str, FundamentalBundle] = {}
+        preload_cached_bundles = getattr(
+            self.fundamental_service,
+            "load_cached_bundles",
+            None,
+        )
+        if callable(preload_cached_bundles):
+            preload_started = time.monotonic()
+            try:
+                preloaded_bundles = preload_cached_bundles(
+                    list(dict.fromkeys(issuer_symbols)),
+                    signal_date=analysis_signal_date,
+                    sector=str(request.stocktype),
+                    history_years=request.mops_history_years,
+                )
+                self._observer.record(
+                    "fundamental_cache_preload_completed",
+                    trade_date=context.market_date.isoformat(),
+                    source="MOPS_CACHE",
+                    status="SUCCESS",
+                    cache_hit=bool(preloaded_bundles),
+                    requested_symbol_count=len(set(issuer_symbols)),
+                    reused_symbol_count=len(preloaded_bundles),
+                    duration_seconds=round(
+                        time.monotonic() - preload_started,
+                        3,
+                    ),
+                )
+            except (MopsStorageError, TwseClientError) as error:
+                self._observer.record(
+                    "fundamental_cache_preload_failed",
+                    level=logging.DEBUG,
+                    trade_date=context.market_date.isoformat(),
+                    source="MOPS_CACHE",
+                    status="BULK_PRELOAD_FAILED",
+                    cache_hit=False,
+                    requested_symbol_count=len(set(issuer_symbols)),
+                    duration_seconds=round(
+                        time.monotonic() - preload_started,
+                        3,
+                    ),
+                )
+                logging.debug(
+                    "MOPS snapshot bulk preload unavailable; falling back to "
+                    "per-symbol refresh: %s",
+                    error,
+                    extra={
+                        "source": "MOPS_CACHE",
+                        "status": "BULK_PRELOAD_FAILED",
+                        "cache_hit": False,
+                    },
+                )
+
+        for item, stock_no in enumerate(stocknumbers):
+            if not stock_no or item >= len(daily_dates) or not daily_dates[item]:
+                continue
+            stock_name = stocknames[item] if item < len(stocknames) else ""
+            identity = resolve_security_identity(stock_no, stock_name)
+            issuer_symbol = identity.issuer_symbol
+            if issuer_symbol != stock_no:
+                logging.debug(
+                    "Fundamental identity market_symbol=%s issuer_symbol=%s "
+                    "security_type=%s",
+                    stock_no,
+                    issuer_symbol,
+                    identity.security_type.value,
+                    extra={
+                        "symbol": stock_no,
+                        "source": "TWSE_SECURITY_MASTER",
+                        "status": "IDENTITY_MAPPED",
+                    },
+                )
+            try:
+                bundle = bundles_by_issuer.get(issuer_symbol)
+                if bundle is None:
+                    bundle = preloaded_bundles.get(issuer_symbol)
+                    if bundle is None:
+                        bundle = self.fundamental_service.load(
+                            issuer_symbol,
+                            signal_date=analysis_signal_date,
+                            sector=str(request.stocktype),
+                            history_years=request.mops_history_years,
+                        )
+                    bundles_by_issuer[issuer_symbol] = bundle
+                bundle = self._attach_security_identity(bundle, identity)
+            except TwseNetworkError as error:
+                self._observer.record(
+                    "fundamental_refresh_failed",
+                    level=logging.ERROR,
+                    symbol=stock_no,
+                    trade_date=context.market_date.isoformat(),
+                    source="MOPS",
+                    status=error.category.value.upper(),
+                )
+                self._mark_unavailable(
+                    crawler,
+                    stock_no,
+                    status=error.category.value.upper(),
+                    detail=str(error),
+                    signal_date=analysis_signal_date,
+                    account_equity=request.account_equity,
+                )
+                logging.error(
+                    "MOPS status=%s market_symbol=%s issuer_symbol=%s detail=%s; "
+                    "LES v5 formal BUY disabled.",
+                    error.category.value.upper(),
+                    stock_no,
+                    issuer_symbol,
+                    error,
+                    extra={
+                        "symbol": stock_no,
+                        "source": "MOPS",
+                        "status": error.category.value.upper(),
+                    },
+                )
+                consecutive_storage_failures = 0
+                consecutive_schema_failures = 0
+                consecutive_network_failures += 1
+                if (
+                    consecutive_network_failures
+                    >= MOPS_INFRASTRUCTURE_FAILURE_THRESHOLD
+                ):
+                    logging.error(
+                        "MOPS circuit open after %s consecutive network failures; "
+                        "skipping remaining symbols; LES v5 formal BUY disabled.",
+                        consecutive_network_failures,
+                    )
+                    self._observer.record(
+                        "fundamental_circuit_opened",
+                        level=logging.ERROR,
+                        source="MOPS",
+                        status="NETWORK_ERROR",
+                    )
+                    self._mark_remaining_unavailable(
+                        crawler,
+                        stocknumbers[item + 1 :],
+                        status="CIRCUIT_OPEN",
+                        detail="MOPS network failure circuit is open",
+                        signal_date=analysis_signal_date,
+                        account_equity=request.account_equity,
+                    )
+                    break
+                continue
+            except TwseClientError as error:
+                self._observer.record(
+                    "fundamental_refresh_failed",
+                    level=logging.ERROR,
+                    symbol=stock_no,
+                    trade_date=context.market_date.isoformat(),
+                    source="MOPS",
+                    status=error.category.value.upper(),
+                )
+                self._mark_unavailable(
+                    crawler,
+                    stock_no,
+                    status=error.category.value.upper(),
+                    detail=str(error),
+                    signal_date=analysis_signal_date,
+                    account_equity=request.account_equity,
+                )
+                logging.error(
+                    "MOPS status=%s market_symbol=%s issuer_symbol=%s detail=%s; "
+                    "LES v5 formal BUY disabled.",
+                    error.category.value.upper(),
+                    stock_no,
+                    issuer_symbol,
+                    error,
+                    extra={
+                        "symbol": stock_no,
+                        "source": "MOPS",
+                        "status": error.category.value.upper(),
+                    },
+                )
+                consecutive_network_failures = 0
+                consecutive_storage_failures = 0
+                consecutive_schema_failures = (
+                    consecutive_schema_failures + 1
+                    if isinstance(error, TwseSchemaChangedError)
+                    else 0
+                )
+                if (
+                    consecutive_schema_failures
+                    >= MOPS_INFRASTRUCTURE_FAILURE_THRESHOLD
+                ):
+                    logging.error(
+                        "MOPS schema circuit open after %s consecutive failures; "
+                        "skipping remaining symbols; LES v5 formal BUY disabled.",
+                        consecutive_schema_failures,
+                    )
+                    self._observer.record(
+                        "fundamental_circuit_opened",
+                        level=logging.ERROR,
+                        source="MOPS",
+                        status="SCHEMA_CHANGED",
+                    )
+                    self._mark_remaining_unavailable(
+                        crawler,
+                        stocknumbers[item + 1 :],
+                        status="CIRCUIT_OPEN",
+                        detail="MOPS schema failure circuit is open",
+                        signal_date=analysis_signal_date,
+                        account_equity=request.account_equity,
+                    )
+                    break
+                continue
+            except MopsStorageError as error:
+                self._observer.record(
+                    "fundamental_refresh_failed",
+                    level=logging.ERROR,
+                    symbol=stock_no,
+                    trade_date=context.market_date.isoformat(),
+                    source="MOPS_CACHE",
+                    status="STORAGE_ERROR",
+                )
+                self._mark_unavailable(
+                    crawler,
+                    stock_no,
+                    status="STORAGE_ERROR",
+                    detail=str(error),
+                    signal_date=analysis_signal_date,
+                    account_equity=request.account_equity,
+                )
+                logging.error(
+                    "MOPS storage market_symbol=%s issuer_symbol=%s unavailable; "
+                    "LES v5 formal BUY disabled: %s",
+                    stock_no,
+                    issuer_symbol,
+                    error,
+                    extra={
+                        "symbol": stock_no,
+                        "source": "MOPS_CACHE",
+                        "status": "STORAGE_ERROR",
+                    },
+                )
+                consecutive_network_failures = 0
+                consecutive_schema_failures = 0
+                consecutive_storage_failures += 1
+                if (
+                    consecutive_storage_failures
+                    >= MOPS_INFRASTRUCTURE_FAILURE_THRESHOLD
+                ):
+                    logging.error(
+                        "MOPS storage circuit open after %s consecutive failures; "
+                        "skipping remaining symbols; LES v5 formal BUY disabled.",
+                        consecutive_storage_failures,
+                    )
+                    self._observer.record(
+                        "fundamental_circuit_opened",
+                        level=logging.ERROR,
+                        source="MOPS_CACHE",
+                        status="STORAGE_ERROR",
+                    )
+                    self._mark_remaining_unavailable(
+                        crawler,
+                        stocknumbers[item + 1 :],
+                        status="CIRCUIT_OPEN",
+                        detail="MOPS storage failure circuit is open",
+                        signal_date=analysis_signal_date,
+                        account_equity=request.account_equity,
+                    )
+                    break
+                continue
+
+            consecutive_network_failures = 0
+            consecutive_storage_failures = 0
+            consecutive_schema_failures = 0
+            cache_value = bundle.snapshot.get("remote_refresh_skipped")
+            cache_hit = (
+                cache_value if isinstance(cache_value, bool) else None
+            )
+            self._observer.record(
+                "fundamental_refresh_completed",
+                level=logging.DEBUG,
+                symbol=stock_no,
+                trade_date=context.market_date.isoformat(),
+                source="MOPS_CACHE" if cache_hit else "MOPS",
+                status="SUCCESS",
+                cache_hit=cache_hit,
+                available_at=bundle.as_of,
+                issuer_symbol=issuer_symbol,
+                security_type=identity.security_type.value,
+            )
+            setter(
+                stock_no,
+                annual_fundamentals=bundle.annual_fundamentals,
+                fundamental_snapshot=bundle.snapshot,
+                account_equity=request.account_equity,
+                signal_date=bundle.as_of or analysis_signal_date,
+            )
+
+        consume_scope_fallbacks = getattr(
+            self.fundamental_service,
+            "consume_scope_fallback_symbols",
+            None,
+        )
+        if callable(consume_scope_fallbacks):
+            fallback_symbols = tuple(consume_scope_fallbacks())
+            if fallback_symbols:
+                logging.warning(
+                    "MOPS individual scope fallback summary stocks=%s "
+                    "symbols=%s; consolidated filing was unavailable for "
+                    "one or more selected periods. Use debug mode for "
+                    "per-symbol details.",
+                    len(fallback_symbols),
+                    ",".join(fallback_symbols),
+                    extra=structured_extra(
+                        source="MOPS",
+                        status="INDIVIDUAL_SCOPE_FALLBACK_SUMMARY",
+                    ),
+                )
+                self._observer.record(
+                    "fundamental_individual_scope_fallback_summary",
+                    level=logging.DEBUG,
+                    source="MOPS",
+                    status="INDIVIDUAL_SCOPE_FALLBACK_SUMMARY",
+                    fallback_symbols=list(fallback_symbols),
+                    fallback_symbol_count=len(fallback_symbols),
+                )
+
+        consume_access_blocked = getattr(
+            self.fundamental_service,
+            "consume_access_blocked_cache_fallback_symbols",
+            None,
+        )
+        if callable(consume_access_blocked):
+            blocked_symbols = tuple(consume_access_blocked())
+            if blocked_symbols:
+                logging.warning(
+                    "MOPS access blocked cache fallback summary stocks=%s "
+                    "symbols=%s; cached filings were reused. Use debug mode "
+                    "for per-symbol details.",
+                    len(blocked_symbols),
+                    ",".join(blocked_symbols),
+                    extra=structured_extra(
+                        source="MOPS_CACHE",
+                        status="ACCESS_BLOCKED_CACHE_FALLBACK_SUMMARY",
+                        cache_hit=True,
+                    ),
+                )
+                self._observer.record(
+                    "fundamental_access_blocked_cache_fallback_summary",
+                    level=logging.DEBUG,
+                    source="MOPS_CACHE",
+                    status="ACCESS_BLOCKED_CACHE_FALLBACK_SUMMARY",
+                    cache_hit=True,
+                    fallback_symbols=list(blocked_symbols),
+                    fallback_symbol_count=len(blocked_symbols),
+                )
+
+        self._observer.record(
+            "fundamental_runtime_completed",
+            trade_date=context.market_date.isoformat(),
+            source="MOPS",
+            status="SUCCESS",
+            issuer_symbol_count=len(set(issuer_symbols)),
+            preloaded_symbol_count=len(preloaded_bundles),
+            duration_seconds=round(time.monotonic() - refresh_started, 3),
+        )
+
+    @staticmethod
+    def _attach_security_identity(
+        bundle: FundamentalBundle,
+        identity: SecurityIdentity,
+    ) -> FundamentalBundle:
+        snapshot = dict(bundle.snapshot)
+        snapshot.update(identity.snapshot_fields())
+        return FundamentalBundle(
+            annual_fundamentals=bundle.annual_fundamentals,
+            snapshot=snapshot,
+            as_of=bundle.as_of,
+        )
+
+    @staticmethod
+    def _mark_unavailable(
+        crawler: Any,
+        stock_no: str,
+        *,
+        status: str,
+        detail: str,
+        signal_date: str,
+        account_equity: float,
+    ) -> None:
+        marker = getattr(
+            crawler,
+            "set_low_entry_v4_fundamentals_unavailable",
+            None,
+        )
+        if callable(marker):
+            marker(
+                stock_no,
+                status=status,
+                detail=detail,
+                signal_date=signal_date,
+                account_equity=account_equity,
+            )
+
+    @classmethod
+    def _mark_remaining_unavailable(
+        cls,
+        crawler: Any,
+        stocknumbers: list[str],
+        *,
+        status: str,
+        detail: str,
+        signal_date: str,
+        account_equity: float,
+    ) -> None:
+        for stock_no in stocknumbers:
+            if stock_no:
+                cls._mark_unavailable(
+                    crawler,
+                    stock_no,
+                    status=status,
+                    detail=detail,
+                    signal_date=signal_date,
+                    account_equity=account_equity,
+                )

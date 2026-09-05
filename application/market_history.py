@@ -59,6 +59,7 @@ class MarketHistoryInput:
         str,
         datetime.date | str,
     ] = field(default_factory=dict)
+    entry_decisions_by_stock: Mapping[str, str] = field(default_factory=dict)
     market_breadth_snapshots: Mapping[
         str,
         Mapping[str, object],
@@ -140,6 +141,7 @@ class MarketHistoryAssembler:
         stock_no = market.stock_numbers[item]
         entry_les = market.entry_les_by_stock.get(stock_no)
         entry_date = market.entry_dates_by_stock.get(stock_no)
+        entry_decision = market.entry_decisions_by_stock.get(stock_no)
         if entry_date is not None:
             parsed_entry_date = pd.to_datetime(entry_date, errors="coerce")
             parsed_dates = pd.to_datetime(history["Date"], errors="coerce")
@@ -156,10 +158,19 @@ class MarketHistoryAssembler:
                         float(entry_les),
                         index=history.index,
                     ).where(active_holding)
+                if entry_decision is not None:
+                    history["Entry Decision"] = pd.Series(
+                        str(entry_decision),
+                        index=history.index,
+                    ).where(active_holding)
         elif entry_les is not None:
             # Missing entry date remains supported. EREM applies only its 10%
             # floor so unknown recency cannot claim full new-entry protection.
             history["Entry LES"] = float(entry_les)
+        if entry_date is None and entry_decision is not None:
+            # Retain the diagnostic value, but EREM cannot grant entry grace
+            # without a dated, scored execution record.
+            history["Entry Decision"] = str(entry_decision)
         dates = market.dates[item]
         market_data_through = str(dates[-1]) if dates else None
         history.attrs[SIGNAL_DATE_ATTR] = market.signal_dates.get(

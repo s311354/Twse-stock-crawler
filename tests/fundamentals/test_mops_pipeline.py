@@ -26,6 +26,7 @@ from infrastructure.fundamentals.mops_repository import EMPTY_FILING_SET_SHA256
 from infrastructure.fundamentals.mops_repository import MopsRepository
 from infrastructure.fundamentals.mops_repository import MopsStorageError
 from infrastructure.crawler.twse_http_client import TwseNetworkError
+from infrastructure.crawler.twse_http_client import TwseAccessBlockedError
 from infrastructure.crawler.twse_http_client import TwseHttpResponse
 from infrastructure.crawler.twse_http_client import TwseSchemaChangedError
 from infrastructure.fundamentals.mops_client import TWSE_COMPANY_PROFILE_URL
@@ -623,6 +624,53 @@ def test_mops_client_classifies_unrecognized_catalog_html_as_schema_changed() ->
 
     with pytest.raises(TwseSchemaChangedError, match="without filing rows"):
         client.discover_filings("2330")
+
+
+def test_mops_client_classifies_security_guard_page_as_access_blocked(
+    caplog,
+) -> None:
+    guard_page = (
+        "<html><body>因為安全性考量，您所執行的頁面無法呈現。</body></html>"
+    ).encode("utf-8")
+
+    class GuardedHttpClient:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.reset_calls = 0
+
+        def request_bytes(self, *args, **kwargs):
+            self.calls += 1
+            return type("Response", (), {"content": guard_page})()
+
+        def reset_session(self) -> None:
+            self.reset_calls += 1
+
+    http_client = GuardedHttpClient()
+    client = MopsClient(
+        http_client=http_client,
+        catalog_empty_attempts=2,
+        catalog_empty_backoff_seconds=0,
+        min_request_interval_seconds=0,
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(
+            TwseAccessBlockedError,
+            match="security guard page",
+        ) as error:
+            client.discover_filings("6924")
+
+    assert error.value.category.value == "access_blocked"
+    assert http_client.calls == 2
+    assert http_client.reset_calls == 1
+    retry_records = [
+        record
+        for record in caplog.records
+        if getattr(record, "status", None) == "ACCESS_BLOCKED"
+    ]
+    assert len(retry_records) == 1
+    assert retry_records[0].levelno == logging.DEBUG
+    assert retry_records[0].symbol == "6924"
 
 
 def test_mops_client_resets_session_after_transient_catalog_guard_page() -> None:

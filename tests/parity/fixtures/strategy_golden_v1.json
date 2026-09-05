@@ -1,0 +1,53 @@
+{
+  "captured_on": "2026-08-30",
+  "erem_v3_trend": {
+    "EREM Distribution Score": 10.0,
+    "EREM Entry Quality Score": 5.0,
+    "EREM Entry Weight": 0.1,
+    "EREM Holding Confidence": 76.57,
+    "EREM Momentum Score": 5.0,
+    "EREM Raw Score": 80.0,
+    "EREM Relative Strength Score": 10.0,
+    "EREM Relative Strength60": 0.0458,
+    "EREM Remaining Return Score": 5.0,
+    "EREM RewardRisk": 0.1245,
+    "EREM Structure Score": 5.0,
+    "EREM Trend Score": 20.0,
+    "EREM Turnover Score": 5.0,
+    "EREM Turnover Source": "Turnover",
+    "EREM VWAP Score": 5.0,
+    "EREM Volatility Score": 10.0,
+    "EREM 分數": 76.19,
+    "EREM 建議減倉比例": 0.0,
+    "EREM 決策訊號": "HOLD",
+    "model_version": "3.2.4",
+    "output_columns_sha256": "210cb6ee2247403f246d2ca370ed78006cec25b7c4f7cc23b9f6f0c1f2ab55b1",
+    "reason_sha256": "7fd3b73e3bf7ea54b934823409f795fef1bea6a6f0ba0c3719cba2a7fa9c603c"
+  },
+  "pae_v2_direct_buy_small": {
+    "binding": "NON_BINDING",
+    "cash_weight_after": 0.95,
+    "cash_weight_before": 1.0,
+    "holding_count_after": 1,
+    "holding_count_before": 0,
+    "lines": [
+      {
+        "action": "STARTER",
+        "blocking_reasons": [],
+        "capital_claim": 0.02997,
+        "current_weight": 0.0,
+        "executable_candidate": true,
+        "reason_codes": ["LES_DIRECT_SELECTION_NON_BINDING"],
+        "role": "CANDIDATE",
+        "stock_id": "2330",
+        "strategic_candidate": true,
+        "target_weight": 0.05
+      }
+    ],
+    "mode": "DIRECT_SELECTION",
+    "model_version": "2.0.0",
+    "reason_codes": ["PAE_NOT_TRIGGERED_HOLDINGS_LT_3"],
+    "required_return": 0.1,
+    "schema_version": "pae.portfolio_decision.v2"
+  }
+}

@@ -24,12 +24,13 @@ def security(
     bull: float = 0.22,
     maximum_weight: float | None = None,
     fundamental_hard_reject: bool = False,
+    quality_status: str = "QUALITY_CONFIRMED",
 ) -> AllocationSecurity:
     return AllocationSecurity(
         symbol=symbol,
         sector="24",
         correlation_cluster=symbol,
-        quality_status="QUALITY_CONFIRMED",
+        quality_status=quality_status,
         quality_score=quality_score,
         data_confidence=100,
         valuation_status="COMPLETE",
@@ -114,6 +115,28 @@ def test_exit_policy_keeps_hard_reject_independent_from_lifecycle() -> None:
 
     assert action is PortfolioAction.EXIT_AND_REALLOCATE
     assert reason == "FUNDAMENTAL_HARD_REJECT"
+    assert assessment.strategy_stop_breached is False
+
+
+def test_entry_quality_reject_does_not_force_an_existing_holding_to_exit() -> None:
+    engine = PortfolioAllocationEngine()
+    holding = security(
+        "2351",
+        quality_score=65.67,
+        quality_status="HARD_NO_BUY",
+        fundamental_hard_reject=False,
+    )
+    evaluation = engine.candidate_evaluator.evaluate(holding, 0.10)
+
+    action, reason, assessment = engine.exit_policy.base_holding_action(
+        holding,
+        evaluation,
+        has_alternative=False,
+    )
+
+    assert evaluation.hard_reject is True
+    assert action is PortfolioAction.HOLD
+    assert reason == "INCUMBENCY_PROTECTED"
     assert assessment.strategy_stop_breached is False
 
 

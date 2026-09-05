@@ -125,6 +125,46 @@ class LowEntryV5QualityEligibility:
             and not quality.hard_rejects
         )
 
+    def high_quality_reversal_starter_eligible(
+        self,
+        quality: LowEntryV5QualityResult,
+    ) -> bool:
+        """Reserve quiet-absorption starters for confirmed top-quality names."""
+
+        return bool(
+            quality.final_status is FinalQualityStatus.CONFIRMED
+            and quality.final_score is not None
+            and quality.final_score
+            >= self.config.high_quality_reversal_minimum_quality_score
+            and not quality.hard_rejects
+        )
+
+    def elec_trend_pullback_quality_eligible(
+        self,
+        quality: LowEntryV5QualityResult,
+    ) -> bool:
+        return bool(
+            quality.final_status is FinalQualityStatus.CONFIRMED
+            and self.broad_rally_quality_eligible(quality)
+            and quality.final_score is not None
+            and quality.final_score
+            >= self.config.elec_trend_pullback_minimum_quality_score
+        )
+
+    def air_cycle_starter_eligible(
+        self,
+        quality: LowEntryV5QualityResult,
+    ) -> bool:
+        """Allow only confirmed airline issuers into the cycle starter path."""
+
+        return bool(
+            quality.final_status is FinalQualityStatus.CONFIRMED
+            and quality.final_score is not None
+            and quality.final_score >= self.config.air_cycle_minimum_quality_score
+            and "AIR_QUALITY_PROFILE_ACTIVE" in quality.warnings
+            and not quality.hard_rejects
+        )
+
 
 class LowEntryV5PanicEvaluator:
     """Evaluate panic state and all reversal-entry trigger variants."""
@@ -518,9 +558,17 @@ class LowEntryV5PanicEvaluator:
             (reversal_count >= 1)
             & (indicators["close"] > indicators["previous_low20"])
         ).fillna(False)
-        quality_pullback_trigger = (
+        recent_new_low_resolved = (
+            (indicators["new_low_count3"] == 0)
+            | (
+                (indicators["new_low_count3"] == 1)
+                & (indicators["close"] > indicators["previous_low20"])
+                & (reversal_count >= 2)
+            )
+        ).fillna(False)
+        standard_quality_pullback_trigger = (
             (block_text == "NONE")
-            & (indicators["new_low_count3"] == 0)
+            & recent_new_low_resolved
             & (pullback_confirmed | pullback_stop_entry_setup)
             & (indicators["clv"] >= self.config.quality_pullback_minimum_clv)
             & (
@@ -538,11 +586,67 @@ class LowEntryV5PanicEvaluator:
             & self.quality_policy.quality_pullback_starter_eligible(quality)
             & valuation_supports_starter
         ).fillna(False)
+        high_quality_reversal_trigger = (
+            (block_text == "NONE")
+            & recent_new_low_resolved
+            & (indicators["close"] > indicators["previous_low20"])
+            & (
+                reversal_count
+                >= self.config.high_quality_reversal_minimum_reversals
+            )
+            & (
+                indicators["clv"]
+                >= self.config.high_quality_reversal_minimum_clv
+            )
+            & (
+                indicators["volume_ratio"]
+                >= self.config.high_quality_reversal_minimum_volume_ratio
+            )
+            & (
+                indicators["price_position60"]
+                <= self.config.high_quality_reversal_maximum_price_position
+            )
+            & (
+                indicators["drawdown60"]
+                <= self.config.high_quality_reversal_maximum_drawdown
+            )
+            & self.quality_policy.high_quality_reversal_starter_eligible(quality)
+            & valuation_supports_starter
+        ).fillna(False)
+        quality_pullback_trigger = (
+            standard_quality_pullback_trigger | high_quality_reversal_trigger
+        ).fillna(False)
+        elec_trend_pullback_trigger = self._elec_trend_pullback_trigger(
+            indicators, quality, valuation, block_text
+        )
+
+        # This is a watch state rather than an entry. The following session
+        # must satisfy next_day_confirmation before BUY_SMALL is possible.
+        air_cycle_watch = (
+            (block_text == "NONE")
+            & (indicators["new_low_count3"] == 0)
+            & (indicators["close"] > indicators["previous_low20"])
+            # Do not re-arm the watch on the positive-CLV confirmation bar;
+            # otherwise current-state REVERSAL_WATCH would prevent the
+            # next-day BUY_SMALL path from seeing a CLEAR state.
+            & (indicators["clv"] <= 0)
+            & (
+                indicators["price_position60"]
+                <= self.config.air_cycle_maximum_price_position
+            )
+            & (
+                indicators["drawdown60"]
+                <= self.config.air_cycle_maximum_drawdown
+            )
+            & self.quality_policy.air_cycle_starter_eligible(quality)
+            & (valuation == ValuationStatus.SUPPORTIVE.value)
+        ).fillna(False)
 
         state = pd.Series(FallingKnifeState.CLEAR.value, index=indicators.index)
         state.loc[blocks.any(axis=1)] = FallingKnifeState.PANIC_WATCH.value
         state.loc[undercut_reclaim] = FallingKnifeState.REVERSAL_WATCH.value
         state.loc[capitulation] = FallingKnifeState.REVERSAL_WATCH.value
+        state.loc[air_cycle_watch] = FallingKnifeState.REVERSAL_WATCH.value
 
         return {
             "opportunity": opportunity,
@@ -560,7 +664,68 @@ class LowEntryV5PanicEvaluator:
             "recent_rally_retest_trigger": recent_rally_retest_trigger,
             "recent_rally_reclaim_trigger": recent_rally_reclaim_trigger,
             "quality_pullback_trigger": quality_pullback_trigger,
+            "high_quality_reversal_trigger": high_quality_reversal_trigger,
+            "elec_trend_pullback_trigger": elec_trend_pullback_trigger,
+            "elec_starter_required_score": pd.Series(
+                self.config.elec_trend_pullback_score_threshold,
+                index=indicators.index,
+            ),
+            "elec_starter_required_raw_score": pd.Series(
+                self.config.elec_trend_pullback_minimum_raw_score,
+                index=indicators.index,
+            ),
+            "air_cycle_watch": air_cycle_watch,
         }
+
+    def _elec_trend_pullback_trigger(
+        self,
+        indicators: pd.DataFrame,
+        quality: LowEntryV5QualityResult,
+        valuation: pd.Series,
+        block_text: pd.Series,
+    ) -> pd.Series:
+        """Local retracement + reclaim, using only completed causal bars."""
+        required = {
+            "is_electronics", "ema5", "ema20", "ema50", "atr14",
+            "close", "open", "clv", "volume_ratio", "drawdown20",
+            "previous_low20", "new_low_count3",
+        }
+        if (
+            not self.config.elec_trend_pullback_enabled
+            or not required.issubset(indicators.columns)
+            or not self.quality_policy.elec_trend_pullback_quality_eligible(quality)
+        ):
+            return pd.Series(False, index=indicators.index)
+        distance = (indicators["close"] - indicators["ema20"]) / (
+            indicators["atr14"].where(indicators["atr14"] > 0)
+        )
+        return (
+            indicators["is_electronics"].fillna(False)
+            & (block_text == "NONE")
+            & valuation.isin(
+                [ValuationStatus.PASS.value, ValuationStatus.SUPPORTIVE.value]
+            )
+            & (indicators["ema20"] >= indicators["ema50"])
+            & (indicators["ema50"] >= indicators["ema50"].shift(5))
+            & indicators["drawdown20"].between(
+                self.config.elec_trend_pullback_drawdown_floor,
+                self.config.elec_trend_pullback_drawdown_ceiling,
+            )
+            & distance.between(
+                self.config.elec_trend_pullback_minimum_ema20_atr,
+                self.config.elec_trend_pullback_maximum_ema20_atr,
+            )
+            & (indicators["new_low_count3"] == 0)
+            & (indicators["close"] > indicators["previous_low20"])
+            & (indicators["close"] > indicators["ema5"])
+            & (indicators["close"] > indicators["close"].shift(1))
+            & (indicators["close"] > indicators["open"])
+            & (indicators["clv"] >= self.config.elec_trend_pullback_minimum_clv)
+            & (
+                indicators["volume_ratio"]
+                >= self.config.elec_trend_pullback_minimum_volume_ratio
+            )
+        ).fillna(False).astype(bool)
 
 
 __all__ = ["LowEntryV5PanicEvaluator", "LowEntryV5QualityEligibility"]

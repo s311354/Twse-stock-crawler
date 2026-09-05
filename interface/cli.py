@@ -183,6 +183,15 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--include-symbols-file",
+        type=Path,
+        default=None,
+        help=(
+            "Additional symbols to include in the shared market analysis "
+            "universe without treating them as portfolio holdings."
+        ),
+    )
+    parser.add_argument(
         "--pae-current-cash",
         type=float,
         default=None,
@@ -210,11 +219,11 @@ def load_stocklist(values: list[str]) -> list[str]:
 
 
 def load_pae_holdings_file(path: str | Path) -> tuple[PortfolioPosition, ...]:
-    """Parse ``symbol[:shares[:entry_date[:entry_les]]]`` holdings input.
+    """Parse ``symbol[:shares[:entry_date[:entry_les[:entry_decision]]]]``.
 
     Empty optional fields are supported, for example
-    ``2449::2026-08-05:82`` or ``2449:125::``.  Existing symbol-only and
-    ``symbol:shares`` files remain valid.
+    ``2449::2026-08-05:82:BUY`` or ``2449:125:::``. Existing one- through
+    four-field holding tokens remain valid.
     """
     holdings_path = Path(path).expanduser()
     try:
@@ -238,7 +247,7 @@ def load_pae_holdings_file(path: str | Path) -> tuple[PortfolioPosition, ...]:
     positions: list[PortfolioPosition] = []
     for token in tokens:
         parts = token.split(":")
-        if len(parts) > 4:
+        if len(parts) > 5:
             raise SettingsError("Invalid PAE holding token: {}".format(token))
         symbol = parts[0].strip().upper()
         if re.fullmatch(r"[0-9A-Z]{4,10}", symbol) is None:
@@ -260,6 +269,7 @@ def load_pae_holdings_file(path: str | Path) -> tuple[PortfolioPosition, ...]:
                 raise SettingsError(
                     "Invalid PAE Entry LES for {}: {}".format(symbol, parts[3])
                 ) from error
+        entry_decision = parts[4].strip() if len(parts) >= 5 else ""
         try:
             positions.append(
                 PortfolioPosition(
@@ -267,6 +277,7 @@ def load_pae_holdings_file(path: str | Path) -> tuple[PortfolioPosition, ...]:
                     shares=shares,
                     entry_date=entry_date or None,
                     entry_les=entry_les,
+                    entry_decision=entry_decision or None,
                 )
             )
         except ValueError as error:
@@ -276,6 +287,32 @@ def load_pae_holdings_file(path: str | Path) -> tuple[PortfolioPosition, ...]:
     if len(symbols) != len(set(symbols)):
         raise SettingsError("PAE holdings file contains duplicate symbols")
     return tuple(positions)
+
+
+def load_include_symbols_file(path: str | Path) -> tuple[str, ...]:
+    """Load bounded, symbol-only additions to a shared analysis universe."""
+    symbols_path = Path(path).expanduser()
+    try:
+        raw = symbols_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise SettingsError(
+            "include symbols file is not readable: {}".format(symbols_path)
+        ) from error
+    content = "\n".join(line.split("#", 1)[0] for line in raw.splitlines())
+    tokens = [
+        token.strip().upper()
+        for token in re.split(r"[\s,;()]+", content.strip())
+        if token.strip()
+    ]
+    if len(tokens) > 40_000:
+        raise SettingsError("include symbols file exceeds the 40000 symbol limit")
+    invalid = next(
+        (symbol for symbol in tokens if re.fullmatch(r"[0-9A-Z]{4,10}", symbol) is None),
+        None,
+    )
+    if invalid is not None:
+        raise SettingsError("Invalid included symbol: {}".format(invalid))
+    return tuple(dict.fromkeys(tokens))
 
 
 def build_run_configuration(
@@ -319,6 +356,13 @@ def build_run_configuration(
 
     stocklist = load_stocklist(args.stocklist)
     tracked = set(stocklist)
+    included_symbols: tuple[str, ...] = ()
+    if args.include_symbols_file is not None:
+        included_symbols = load_include_symbols_file(args.include_symbols_file)
+        for symbol in included_symbols:
+            if symbol not in tracked:
+                stocklist.append(symbol)
+                tracked.add(symbol)
     for position in settings.pae_positions:
         if position.symbol not in tracked:
             stocklist.append(position.symbol)
@@ -338,6 +382,17 @@ def build_run_configuration(
         mops_enabled=not args.skip_mops,
         mops_history_years=settings.mops_history_years,
         account_equity=settings.account_equity,
+        portfolio_symbols=tuple(
+            position.symbol for position in settings.pae_positions
+        ),
+        explicit_symbols=tuple(
+            dict.fromkeys(
+                [
+                    *included_symbols,
+                    *(position.symbol for position in settings.pae_positions),
+                ]
+            )
+        ),
     )
     return request, settings
 

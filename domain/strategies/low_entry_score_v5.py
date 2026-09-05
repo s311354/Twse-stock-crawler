@@ -10,7 +10,6 @@ import pandas as pd
 from domain.features import FeatureFrame
 from domain.features import SharedFeatureConfig
 from domain.quality_v5 import LowEntryV5QualityConfig
-from domain.quality_v5 import LowEntryV5QualityResult
 from domain.strategy import Strategy
 from domain.strategies.low_entry_score_v4 import LowEntryScoreV4Config
 from domain.strategies.low_entry_score_v4 import LowEntryScoreV4Strategy
@@ -20,6 +19,16 @@ from domain.strategies.low_entry_v5_contracts import LES_V5_MODEL_VERSION
 from domain.strategies.low_entry_v5_contracts import LES_V5_PARAMETER_VERSION
 from domain.strategies.low_entry_v5_contracts import LOW_ENTRY_STRATEGY_NAME
 from domain.strategies.low_entry_v5_contracts import ValuationStatus
+from domain.strategies.low_entry_v5_compat import (
+    LowEntryV5CompatibilityFacade,
+)
+from domain.strategies.low_entry_v5_compat import LowEntryV5DecisionRules
+from domain.strategies.low_entry_v5_compat import LowEntryV5FundamentalRules
+from domain.strategies.low_entry_v5_compat import LowEntryV5MarketRules
+from domain.strategies.low_entry_v5_compat import LowEntryV5PanicRules
+from domain.strategies.low_entry_v5_compat import LowEntryV5ReportRules
+from domain.strategies.low_entry_v5_compat import LowEntryV5ScoringRules
+from domain.strategies.low_entry_v5_composition import LowEntryV5CompositionRoot
 from domain.strategies.low_entry_v5_decision import LowEntryV5DecisionEvaluator
 from domain.strategies.low_entry_v5_fundamentals import (
     LowEntryV5FundamentalEvaluator,
@@ -33,7 +42,6 @@ from domain.strategies.low_entry_v5_report import LowEntryV5ReportBuilder
 from domain.strategies.low_entry_v5_scoring import LowEntryV5ScoringEvaluator
 from domain.valuation_v5 import LowEntryV5ValuationConfig
 from domain.valuation_v5 import LowEntryV5ValuationProducer
-from domain.valuation_v5 import LowEntryV5ValuationResult
 
 @dataclass(frozen=True)
 class LowEntryScoreV5Config(LowEntryScoreV4Config):
@@ -70,6 +78,40 @@ class LowEntryScoreV5Config(LowEntryScoreV4Config):
     quality_pullback_minimum_volume_ratio: float = 0.50
     quality_pullback_maximum_price_position: float = 0.50
     quality_pullback_maximum_drawdown: float = -0.05
+    # A second, stricter quality tier may arm the same conditional 1/8 starter
+    # on a quiet absorption bar.  The relaxed CLV/volume floors are not an
+    # immediate entry: the order remains a next-session stop above the entire
+    # signal bar, and every valuation, Falling-Knife and execution-risk gate
+    # remains binding.
+    high_quality_reversal_minimum_quality_score: float = 85.0
+    high_quality_reversal_minimum_clv: float = -0.10
+    high_quality_reversal_minimum_volume_ratio: float = 0.25
+    high_quality_reversal_maximum_price_position: float = 0.40
+    high_quality_reversal_maximum_drawdown: float = -0.08
+    high_quality_reversal_minimum_reversals: int = 2
+    # Electronics can make a useful local pullback while remaining above the
+    # lower half of their 60-day range. This path requires a healthy medium
+    # trend and an actual reclaim, not just a cheaper price or broad rally.
+    # Only a conditional 1/8 starter is possible; the signal-bar plan is
+    # rechecked against the ordinary RR/ATR/liquidity limits before selection.
+    elec_trend_pullback_enabled: bool = True
+    elec_trend_pullback_minimum_quality_score: float = 80.0
+    elec_trend_pullback_score_threshold: float = 55.0
+    elec_trend_pullback_minimum_raw_score: float = 60.0
+    elec_trend_pullback_drawdown_floor: float = -0.15
+    elec_trend_pullback_drawdown_ceiling: float = -0.03
+    elec_trend_pullback_minimum_ema20_atr: float = -1.0
+    elec_trend_pullback_maximum_ema20_atr: float = 1.0
+    elec_trend_pullback_minimum_clv: float = 0.20
+    elec_trend_pullback_minimum_volume_ratio: float = 0.50
+    # Airlines can turn before backward-looking demand and momentum recover.
+    # A weak low-zone session only arms a watch; a 1/8 BUY_SMALL still needs
+    # next-session confirmation and every ordinary valuation/risk hard gate.
+    air_cycle_minimum_quality_score: float = 85.0
+    air_cycle_score_threshold: float = 35.0
+    air_cycle_minimum_raw_score: float = 45.0
+    air_cycle_maximum_price_position: float = 0.35
+    air_cycle_maximum_drawdown: float = -0.05
     breadth_rally_score_threshold: float = 30.0
     breadth_rally_minimum_raw_score: float = 40.0
     # A completed breadth reversal may graduate from the tiny starter to a
@@ -386,527 +428,47 @@ class LowEntryV4MarketAdapter:
         return self._model._positive_float(value, fallback)
 
 
-class LowEntryV5RuleEngine:
-    """Compatibility facade over the composable LES v5 decision components."""
+class LowEntryV5RuleEngine(LowEntryV5CompatibilityFacade):
+    """Compatibility facade; production runs use components directly."""
 
     def __init__(
         self,
         config: LowEntryScoreV5Config | None = None,
         valuation_producer: LowEntryV5ValuationProducer | None = None,
         market_adapter: LowEntryV4MarketAdapter | None = None,
+        *,
+        components: LowEntryV5PipelineComponents | None = None,
     ) -> None:
         resolved_config = config or LowEntryScoreV5Config()
-        self.config = resolved_config
-        self.market_adapter = market_adapter or LowEntryV4MarketAdapter(
+        resolved_valuation = (
+            valuation_producer
+            or LowEntryV5ValuationProducer(resolved_config.valuation)
+        )
+        resolved_market = market_adapter or LowEntryV4MarketAdapter(
             resolved_config
         )
-        self.valuation_producer = valuation_producer or LowEntryV5ValuationProducer(
-            resolved_config.valuation
+        resolved_components = components or LowEntryV5CompositionRoot(
+            config=resolved_config,
+            valuation_producer=resolved_valuation,
+            market_adapter=resolved_market,
+            output_columns=LOW_ENTRY_OUTPUT_COLUMNS,
+        ).build()
+        super().__init__(
+            resolved_components,
+            config=resolved_config,
+            valuation_producer=resolved_valuation,
+            market_adapter=resolved_market,
         )
-        self.quality_policy = LowEntryV5QualityEligibility(resolved_config)
-        self.market_evaluator = LowEntryV5MarketEvaluator(
-            resolved_config,
-            self.market_adapter,
-        )
-        self.fundamental_evaluator = LowEntryV5FundamentalEvaluator(
-            resolved_config.v5_quality,
-            self.valuation_producer,
-            self.market_adapter.positive_float,
-        )
-        self.panic_evaluator = LowEntryV5PanicEvaluator(
-            resolved_config,
-            self.quality_policy,
-        )
-        self.scoring_evaluator = LowEntryV5ScoringEvaluator(resolved_config)
-        self.decision_evaluator = LowEntryV5DecisionEvaluator(
-            resolved_config,
-            self.market_adapter,
-            self.quality_policy,
-        )
-        self.report_builder = LowEntryV5ReportBuilder(LOW_ENTRY_OUTPUT_COLUMNS)
-
-    @staticmethod
-    def _quality_metric_passed(
-        quality: LowEntryV5QualityResult,
-        metric_name: str,
-    ) -> bool:
-        return LowEntryV5QualityEligibility.quality_metric_passed(
-            quality,
-            metric_name,
-        )
-
-    def _conditional_quality_starter_eligible(
-        self,
-        quality: LowEntryV5QualityResult,
-    ) -> bool:
-        return self.quality_policy.conditional_quality_starter_eligible(quality)
-
-    def _broad_rally_quality_eligible(
-        self,
-        quality: LowEntryV5QualityResult,
-    ) -> bool:
-        return self.quality_policy.broad_rally_quality_eligible(quality)
-
-    def _broad_rally_full_buy_quality_eligible(
-        self,
-        quality: LowEntryV5QualityResult,
-    ) -> bool:
-        return self.quality_policy.broad_rally_full_buy_quality_eligible(quality)
-
-    def _supportive_non_broad_quality_eligible(
-        self,
-        quality: LowEntryV5QualityResult,
-    ) -> bool:
-        return self.quality_policy.supportive_non_broad_quality_eligible(quality)
-
-    def _quality_pullback_starter_eligible(
-        self,
-        quality: LowEntryV5QualityResult,
-    ) -> bool:
-        return self.quality_policy.quality_pullback_starter_eligible(quality)
-
-    def shared_feature_config(self) -> SharedFeatureConfig:
-        return self.market_evaluator.shared_feature_config()
-
-    def calculate_indicators(
-        self,
-        data: pd.DataFrame,
-        features: FeatureFrame,
-    ) -> pd.DataFrame:
-        return self.market_evaluator.calculate_indicators(data, features)
-
-    def evaluate_market_data(
-        self,
-        data: pd.DataFrame,
-        indicators: pd.DataFrame,
-        context: dict[str, Any],
-    ) -> tuple[pd.Series, pd.Series]:
-        return self.market_evaluator.evaluate_market_data(
-            data,
-            indicators,
-            context,
-        )
-
-    def build_trade_plan(
-        self,
-        indicators: pd.DataFrame,
-        context: dict[str, Any],
-    ) -> pd.DataFrame:
-        return self.market_evaluator.build_trade_plan(indicators, context)
-
-    def build_broad_rally_plan(
-        self,
-        indicators: pd.DataFrame,
-        plan: pd.DataFrame,
-        context: dict[str, Any],
-    ) -> pd.DataFrame:
-        return self.market_evaluator.build_broad_rally_plan(
-            indicators,
-            plan,
-            context,
-        )
-
-    def evaluate_risk_gate(
-        self,
-        indicators: pd.DataFrame,
-        plan: pd.DataFrame,
-        market_gate: pd.Series,
-    ) -> tuple[pd.Series, pd.Series]:
-        return self.market_evaluator.evaluate_risk_gate(
-            indicators,
-            plan,
-            market_gate,
-        )
-
-    def evaluate_broad_rally_risk_gate(
-        self,
-        indicators: pd.DataFrame,
-        plan: pd.DataFrame,
-        market_gate: pd.Series,
-    ) -> tuple[pd.Series, pd.Series]:
-        return self.market_evaluator.evaluate_broad_rally_risk_gate(
-            indicators,
-            plan,
-            market_gate,
-        )
-
-    @staticmethod
-    def _next_twse_stock_tick(
-        prices: pd.Series,
-        *,
-        price_scale: float,
-    ) -> pd.Series:
-        return LowEntryV5MarketEvaluator._next_twse_stock_tick(
-            prices,
-            price_scale=price_scale,
-        )
-
-    @staticmethod
-    def _attach_breadth_facts(
-        indicators: pd.DataFrame,
-        snapshot: dict[str, object],
-    ) -> None:
-        LowEntryV5MarketEvaluator._attach_breadth_facts(indicators, snapshot)
-
-    def _evaluate_breadth_rally_regime(self, *args: Any, **kwargs: Any) -> pd.Series:
-        return self.market_evaluator._evaluate_breadth_rally_regime(
-            *args,
-            **kwargs,
-        )
-
-    def _evaluate_breadth_rally_tier(self, *args: Any, **kwargs: Any) -> pd.Series:
-        return self.market_evaluator._evaluate_breadth_rally_tier(
-            *args,
-            **kwargs,
-        )
-
-    def _evaluate_recent_breadth_regime(
-        self,
-        *args: Any,
-        **kwargs: Any,
-    ) -> tuple[pd.Series, pd.Series]:
-        return self.market_evaluator._evaluate_recent_breadth_regime(
-            *args,
-            **kwargs,
-        )
-
-    def evaluate_quality(
-        self,
-        data: pd.DataFrame,
-        context: dict[str, Any],
-    ) -> LowEntryV5QualityResult:
-        return self.fundamental_evaluator.evaluate_quality(data, context)
-
-    def evaluate_valuation(
-        self,
-        indicators: pd.DataFrame,
-        context: dict[str, Any],
-    ) -> tuple[pd.Series, LowEntryV5ValuationResult]:
-        return self.fundamental_evaluator.evaluate_valuation(
-            indicators,
-            context,
-        )
-
-    def evaluate_panic(
-        self,
-        indicators: pd.DataFrame,
-        quality: LowEntryV5QualityResult,
-        valuation: pd.Series,
-    ) -> dict[str, pd.Series]:
-        return self.panic_evaluator.evaluate_panic(
-            indicators,
-            quality,
-            valuation,
-        )
-
-    def score_components(
-        self,
-        indicators: pd.DataFrame,
-        plan: pd.DataFrame,
-        valuation: pd.Series,
-    ) -> pd.DataFrame:
-        return self.scoring_evaluator.score_components(
-            indicators,
-            plan,
-            valuation,
-        )
-
-    def falling_knife_penalty(
-        self,
-        indicators: pd.DataFrame,
-    ) -> tuple[pd.Series, pd.Series]:
-        return self.scoring_evaluator.falling_knife_penalty(indicators)
-
-    def required_score(
-        self,
-        quality: LowEntryV5QualityResult,
-        risk_off: pd.Series,
-        index: pd.Index,
-    ) -> pd.Series:
-        return self.scoring_evaluator.required_score(
-            quality,
-            risk_off,
-            index,
-        )
-
-    def evaluate_trigger(self, indicators: pd.DataFrame) -> pd.Series:
-        return self.decision_evaluator.evaluate_trigger(indicators)
-
-    def next_day_confirmation(
-        self,
-        indicators: pd.DataFrame,
-        plan: pd.DataFrame,
-        falling_state: pd.Series,
-    ) -> pd.Series:
-        return self.decision_evaluator.next_day_confirmation(
-            indicators,
-            plan,
-            falling_state,
-        )
-
-    def resolve_decision(self, **kwargs: Any) -> pd.Series:
-        return self.decision_evaluator.resolve_decision(**kwargs)
-
-    def position_fraction(
-        self,
-        decision: pd.Series,
-        quality: LowEntryV5QualityResult,
-        risk_off: pd.Series,
-        broad_rally_full_buy: pd.Series | None = None,
-    ) -> pd.Series:
-        return self.decision_evaluator.position_fraction(
-            decision,
-            quality,
-            risk_off,
-            broad_rally_full_buy,
-        )
-
-    def cap_position_shares(
-        self,
-        plan: pd.DataFrame,
-        position_fraction: pd.Series,
-        context: dict[str, Any],
-    ) -> pd.Series:
-        return self.decision_evaluator.cap_position_shares(
-            plan,
-            position_fraction,
-            context,
-        )
-
-    def enforce_executable_position(
-        self,
-        decision: pd.Series,
-        recommended_shares: pd.Series,
-    ) -> pd.Series:
-        return self.decision_evaluator.enforce_executable_position(
-            decision,
-            recommended_shares,
-        )
-
-    @staticmethod
-    def scenario_value(
-        result: LowEntryV5ValuationResult,
-        scenario_name: str,
-        field_name: str,
-    ) -> object:
-        return LowEntryV5ReportBuilder.scenario_value(
-            result,
-            scenario_name,
-            field_name,
-        )
-
-    @staticmethod
-    def cycle_review_value(review: object, field_name: str) -> object:
-        return LowEntryV5ReportBuilder.cycle_review_value(review, field_name)
-
-    @staticmethod
-    def valuation_confidence(
-        quality: LowEntryV5QualityResult,
-        result: LowEntryV5ValuationResult,
-    ) -> float:
-        return LowEntryV5ReportBuilder.valuation_confidence(quality, result)
-
-    def build_reasons(self, *args: Any, **kwargs: Any) -> pd.Series:
-        return self.report_builder.build_reasons(*args, **kwargs)
-
-    def assemble_result(self, **kwargs: Any) -> pd.DataFrame:
-        return self.report_builder.assemble_result(**kwargs)
-
-    def empty_result(self) -> dict[str, object]:
-        return self.report_builder.empty_result()
-
-@dataclass(frozen=True)
-class LowEntryV5MarketRules:
-    rules: LowEntryV5RuleEngine
-
-    def shared_feature_config(self) -> SharedFeatureConfig:
-        return self.rules.shared_feature_config()
-
-    def calculate_indicators(
-        self,
-        data: pd.DataFrame,
-        features: FeatureFrame,
-    ) -> pd.DataFrame:
-        return self.rules.calculate_indicators(data, features)
-
-    def evaluate_market_data(
-        self,
-        data: pd.DataFrame,
-        indicators: pd.DataFrame,
-        context: dict[str, Any],
-    ) -> tuple[pd.Series, pd.Series]:
-        return self.rules.evaluate_market_data(data, indicators, context)
-
-    def build_trade_plan(
-        self,
-        indicators: pd.DataFrame,
-        context: dict[str, Any],
-    ) -> pd.DataFrame:
-        return self.rules.build_trade_plan(indicators, context)
-
-    def build_broad_rally_plan(
-        self,
-        indicators: pd.DataFrame,
-        plan: pd.DataFrame,
-        context: dict[str, Any],
-    ) -> pd.DataFrame:
-        return self.rules.build_broad_rally_plan(indicators, plan, context)
-
-    def evaluate_risk_gate(
-        self,
-        indicators: pd.DataFrame,
-        plan: pd.DataFrame,
-        market_gate: pd.Series,
-    ) -> tuple[pd.Series, pd.Series]:
-        return self.rules.evaluate_risk_gate(indicators, plan, market_gate)
-
-    def evaluate_broad_rally_risk_gate(
-        self,
-        indicators: pd.DataFrame,
-        plan: pd.DataFrame,
-        market_gate: pd.Series,
-    ) -> tuple[pd.Series, pd.Series]:
-        return self.rules.evaluate_broad_rally_risk_gate(
-            indicators,
-            plan,
-            market_gate,
-        )
-
-
-@dataclass(frozen=True)
-class LowEntryV5FundamentalRules:
-    rules: LowEntryV5RuleEngine
-
-    def evaluate_quality(
-        self,
-        data: pd.DataFrame,
-        context: dict[str, Any],
-    ) -> LowEntryV5QualityResult:
-        return self.rules.evaluate_quality(data, context)
-
-    def evaluate_valuation(
-        self,
-        indicators: pd.DataFrame,
-        context: dict[str, Any],
-    ) -> tuple[pd.Series, LowEntryV5ValuationResult]:
-        return self.rules.evaluate_valuation(indicators, context)
-
-
-@dataclass(frozen=True)
-class LowEntryV5PanicRules:
-    rules: LowEntryV5RuleEngine
-
-    def evaluate_panic(
-        self,
-        indicators: pd.DataFrame,
-        quality: LowEntryV5QualityResult,
-        valuation: pd.Series,
-    ) -> dict[str, pd.Series]:
-        return self.rules.evaluate_panic(indicators, quality, valuation)
-
-
-@dataclass(frozen=True)
-class LowEntryV5ScoringRules:
-    rules: LowEntryV5RuleEngine
-
-    def score_components(
-        self,
-        indicators: pd.DataFrame,
-        plan: pd.DataFrame,
-        valuation: pd.Series,
-    ) -> pd.DataFrame:
-        return self.rules.score_components(indicators, plan, valuation)
-
-    def falling_knife_penalty(
-        self,
-        indicators: pd.DataFrame,
-    ) -> tuple[pd.Series, pd.Series]:
-        return self.rules.falling_knife_penalty(indicators)
-
-    def required_score(
-        self,
-        quality: LowEntryV5QualityResult,
-        risk_off: pd.Series,
-        index: pd.Index,
-    ) -> pd.Series:
-        return self.rules.required_score(quality, risk_off, index)
-
-
-@dataclass(frozen=True)
-class LowEntryV5DecisionRules:
-    rules: LowEntryV5RuleEngine
-
-    def evaluate_trigger(self, indicators: pd.DataFrame) -> pd.Series:
-        return self.rules.evaluate_trigger(indicators)
-
-    def next_day_confirmation(
-        self,
-        indicators: pd.DataFrame,
-        plan: pd.DataFrame,
-        falling_state: pd.Series,
-    ) -> pd.Series:
-        return self.rules.next_day_confirmation(
-            indicators,
-            plan,
-            falling_state,
-        )
-
-    def resolve_decision(self, **kwargs: Any) -> pd.Series:
-        return self.rules.resolve_decision(**kwargs)
-
-    def position_fraction(
-        self,
-        decision: pd.Series,
-        quality: LowEntryV5QualityResult,
-        risk_off: pd.Series,
-        broad_rally_full_buy: pd.Series | None = None,
-    ) -> pd.Series:
-        return self.rules.position_fraction(
-            decision,
-            quality,
-            risk_off,
-            broad_rally_full_buy,
-        )
-
-    def cap_position_shares(
-        self,
-        plan: pd.DataFrame,
-        position_fraction: pd.Series,
-        context: dict[str, Any],
-    ) -> pd.Series:
-        return self.rules.cap_position_shares(
-            plan,
-            position_fraction,
-            context,
-        )
-
-    def enforce_executable_position(
-        self,
-        decision: pd.Series,
-        recommended_shares: pd.Series,
-    ) -> pd.Series:
-        return self.rules.enforce_executable_position(
-            decision,
-            recommended_shares,
-        )
-
-
-@dataclass(frozen=True)
-class LowEntryV5ReportRules:
-    rules: LowEntryV5RuleEngine
-
-    def empty_result(self) -> dict[str, object]:
-        return self.rules.empty_result()
-
-    def assemble_result(self, **kwargs: Any) -> pd.DataFrame:
-        return self.rules.assemble_result(**kwargs)
 
 
 class LowEntryScoreV5Strategy(Strategy):
-    """Plugin facade that delegates all model behavior to a decision pipeline."""
+    """Plugin facade that delegates all behavior to composed components."""
 
     name = LOW_ENTRY_STRATEGY_NAME
-    description = "Quality-first panic reversal entry strategy with Base/Extended Quality gates, valuation DCF, and breadth-recovery exceptions"
+    description = (
+        "Quality-first panic reversal entry strategy with Base/Extended "
+        "Quality gates, valuation DCF, and breadth-recovery exceptions"
+    )
     version = LES_V5_MODEL_VERSION
 
     def __init__(
@@ -924,24 +486,35 @@ class LowEntryScoreV5Strategy(Strategy):
             valuation_producer
             or LowEntryV5ValuationProducer(self.config.valuation)
         )
-        self.rule_engine: LowEntryV5RuleEngine | None = None
+        self._rule_engine: LowEntryV5RuleEngine | None = None
+        self._market_adapter: LowEntryV4MarketAdapter | None = None
         if pipeline is not None:
             self.pipeline = pipeline
             return
         if components is None:
-            self.rule_engine = LowEntryV5RuleEngine(
+            self._market_adapter = LowEntryV4MarketAdapter(self.config)
+            components = LowEntryV5CompositionRoot(
+                config=self.config,
+                valuation_producer=self.valuation_producer,
+                market_adapter=self._market_adapter,
+                output_columns=LOW_ENTRY_OUTPUT_COLUMNS,
+            ).build()
+        self.pipeline = LowEntryV5DecisionPipeline(components)
+
+    @property
+    def rule_engine(self) -> LowEntryV5RuleEngine:
+        """Build the legacy facade only when a compatibility caller needs it."""
+        if self._rule_engine is None:
+            market_adapter = self._market_adapter or LowEntryV4MarketAdapter(
+                self.config
+            )
+            self._rule_engine = LowEntryV5RuleEngine(
                 self.config,
                 self.valuation_producer,
+                market_adapter,
+                components=self.pipeline.components,
             )
-            components = LowEntryV5PipelineComponents(
-                market=self.rule_engine.market_evaluator,
-                fundamentals=self.rule_engine.fundamental_evaluator,
-                panic=self.rule_engine.panic_evaluator,
-                scoring=self.rule_engine.scoring_evaluator,
-                decision=self.rule_engine.decision_evaluator,
-                report=self.rule_engine.report_builder,
-            )
-        self.pipeline = LowEntryV5DecisionPipeline(components)
+        return self._rule_engine
 
     def run(self, data: pd.DataFrame) -> pd.DataFrame:
         return self.pipeline.run(data)
@@ -960,7 +533,6 @@ class LowEntryScoreV5Strategy(Strategy):
         falling_state: pd.Series,
     ) -> pd.Series:
         """Compatibility delegate for callers of the former private helper."""
-
         return self.pipeline.components.decision.next_day_confirmation(
             indicators,
             plan,

@@ -278,6 +278,19 @@ class MopsRepository:
             connection=connection,
         )
 
+    def load_financial_batch_states(
+        self,
+        symbols: list[str],
+        *,
+        uow: FundamentalUnitOfWork | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, tuple[tuple[int, int], str]]:
+        return self.queries.load_financial_batch_states(
+            symbols,
+            uow=uow,
+            connection=connection,
+        )
+
     def save_financial_batch_state(
         self,
         symbol: str,
@@ -322,6 +335,21 @@ class MopsRepository:
     ) -> list[FundamentalSnapshot]:
         return self.queries.load_financial_batch_snapshots(
             symbol,
+            as_of=as_of,
+            uow=uow,
+            connection=connection,
+        )
+
+    def load_financial_batch_snapshots_many(
+        self,
+        symbols: list[str],
+        *,
+        as_of: str,
+        uow: FundamentalUnitOfWork | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, list[FundamentalSnapshot]]:
+        return self.queries.load_financial_batch_snapshots_many(
+            symbols,
             as_of=as_of,
             uow=uow,
             connection=connection,

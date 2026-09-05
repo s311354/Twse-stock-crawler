@@ -380,6 +380,88 @@ def test_service_bulk_preload_skips_facts_and_filters_refresh_events(
     ) == {}
 
 
+def test_service_bulk_preload_uses_one_uow_for_multiple_symbols(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    repository = MopsRepository(tmp_path / "mops")
+    symbols = ("2330", "2317")
+    for symbol in symbols:
+        candidates = [
+            _candidate(year, 4, symbol=symbol)
+            for year in range(2021, 2026)
+        ]
+        announcements = [
+            FilingAnnouncement(
+                symbol=symbol,
+                fiscal_year=candidate.fiscal_year,
+                quarter=candidate.quarter,
+                available_at=candidate.available_at or "",
+                title="財務報告",
+            )
+            for candidate in candidates
+        ]
+        client = _FakeMopsClient(repository, candidates, announcements)
+        seed_service = _fundamental_service(client, repository)
+        seed_service._company_sectors = {symbol: "24"}
+        seed_service.load(
+            symbol,
+            signal_date="2026-07-21T13:30:00+08:00",
+            sector="ELEC",
+            history_years=5,
+        )
+
+    service = _fundamental_service(
+        _FakeMopsClient(repository, [], []),
+        repository,
+    )
+    service._company_sectors = {symbol: "24" for symbol in symbols}
+    unit_of_work_calls = 0
+    real_unit_of_work = repository.unit_of_work
+
+    def counted_unit_of_work():
+        nonlocal unit_of_work_calls
+        unit_of_work_calls += 1
+        return real_unit_of_work()
+
+    def fail_single_symbol_read(*args, **kwargs):
+        raise AssertionError("bulk preload must not issue per-symbol reads")
+
+    def fail_duplicate_snapshot_write(*args, **kwargs):
+        raise AssertionError("persisted daily snapshots must not be rewritten")
+
+    monkeypatch.setattr(repository, "unit_of_work", counted_unit_of_work)
+    monkeypatch.setattr(
+        repository,
+        "load_financial_batch_snapshots",
+        fail_single_symbol_read,
+    )
+    monkeypatch.setattr(
+        repository,
+        "load_financial_batch_state",
+        fail_single_symbol_read,
+    )
+    monkeypatch.setattr(
+        repository,
+        "save_financial_batch_snapshot",
+        fail_duplicate_snapshot_write,
+    )
+
+    cached = service.load_cached_bundles(
+        list(symbols),
+        signal_date="2026-07-22T13:30:00+08:00",
+        sector="ELEC",
+        history_years=5,
+    )
+
+    assert set(cached) == set(symbols)
+    assert all(
+        bundle.snapshot["remote_refresh_skipped"] is True
+        for bundle in cached.values()
+    )
+    assert unit_of_work_calls == 1
+
+
 def test_complete_cache_refreshes_only_when_twse_batch_period_advances(
     tmp_path,
 ) -> None:

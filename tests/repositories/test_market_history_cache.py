@@ -86,6 +86,41 @@ def test_sqlite_market_history_cache_upserts_both_datasets_atomically(
     ) == {original.trade_date: replacement}
 
 
+def test_sqlite_market_history_cache_loads_only_requested_symbols(
+    tmp_path,
+) -> None:
+    cache = SQLiteMarketHistoryCache(tmp_path / "market_history.sqlite3")
+    day = CachedMarketDay(
+        trade_date="20260807",
+        stock_rows=[
+            ["2330", "台積電", "1,000"],
+            ["2317", "鴻海", "2,000"],
+            ["2881", "富邦金", "3,000"],
+        ],
+        taiex_close=24_000.5,
+    )
+    cache.upsert_day(day, market_type="ALLBUT0999")
+
+    loaded = cache.load_symbols_many(
+        ["20260807"],
+        market_type="ALLBUT0999",
+        symbols={"2881", "9999"},
+    )
+
+    assert loaded == {
+        "20260807": CachedMarketDay(
+            trade_date="20260807",
+            stock_rows=[["2881", "富邦金", "3,000"]],
+            taiex_close=24_000.5,
+        )
+    }
+    assert cache.load_symbols_many(
+        ["20260807"],
+        market_type="ALLBUT0999",
+        symbols={"9999"},
+    ) == {}
+
+
 def test_sqlite_market_history_cache_ignores_partial_or_corrupt_days(
     tmp_path,
 ) -> None:

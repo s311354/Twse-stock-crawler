@@ -41,6 +41,7 @@ class FakeSession:
         self.outcomes = list(outcomes)
         self.headers: dict[str, str] = {}
         self.calls: list[dict[str, object]] = []
+        self.closed = False
 
     def get(self, url: str, **kwargs: object) -> FakeResponse:
         self.calls.append({"url": url, **kwargs})
@@ -51,6 +52,9 @@ class FakeSession:
 
     def post(self, url: str, **kwargs: object) -> FakeResponse:
         return self.get(url, **kwargs)
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def config(**overrides: object) -> TwseHttpConfig:
@@ -87,6 +91,34 @@ def test_http_client_reuses_session_and_retries_network_error() -> None:
     assert len(session.calls) == 2
     assert session.calls[0]["timeout"] == 5.0
     assert session.headers["Accept"] == "application/json"
+
+
+def test_http_client_resets_poisoned_redirect_session_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    poisoned = FakeSession([
+        requests_exceptions.TooManyRedirects("redirect loop"),
+    ])
+    recovered = FakeSession([FakeResponse({"stat": "OK"})])
+    monkeypatch.setattr(
+        "infrastructure.crawler.twse_http_client.requests.Session",
+        lambda: recovered,
+    )
+    client = TwseHttpClient(
+        config=config(),
+        session=poisoned,
+        sleeper=lambda _: None,
+    )
+
+    response = client.get_json(
+        "https://example.test",
+        context="TWSE market data at 20241227",
+    )
+
+    assert response.payload == {"stat": "OK"}
+    assert response.attempts == 2
+    assert poisoned.closed is True
+    assert len(recovered.calls) == 1
 
 
 def test_http_retry_log_carries_structured_request_context(caplog) -> None:

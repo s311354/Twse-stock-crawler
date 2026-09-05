@@ -12,6 +12,10 @@ ISSUER_SYMBOL_FIELD = "issuer_symbol"
 SECURITY_TYPE_FIELD = "security_type"
 SECURITY_IDENTITY_SOURCE_FIELD = "security_identity_source"
 
+# TWSE industry code 15 is the broad transportation/shipping sector, not an
+# airline-only universe. Keep airline-specific rules scoped to actual carriers.
+AIRLINE_ISSUER_SYMBOLS = frozenset({"2610", "2618", "2646", "6757"})
+
 
 class SecurityType(str, Enum):
     """Instrument categories relevant to fundamental model eligibility."""
@@ -92,12 +96,23 @@ def resolve_security_identity(
     )
 
 
+def is_airline_issuer(issuer_symbol: object, sector_code: object) -> bool:
+    """Return whether an issuer is an airline inside TWSE sector 15."""
+
+    return (
+        str(sector_code or "").strip() == "15"
+        and str(issuer_symbol or "").strip() in AIRLINE_ISSUER_SYMBOLS
+    )
+
+
 __all__ = [
+    "AIRLINE_ISSUER_SYMBOLS",
     "ISSUER_SYMBOL_FIELD",
     "MARKET_SYMBOL_FIELD",
     "SECURITY_IDENTITY_SOURCE_FIELD",
     "SECURITY_TYPE_FIELD",
     "SecurityIdentity",
     "SecurityType",
+    "is_airline_issuer",
     "resolve_security_identity",
 ]

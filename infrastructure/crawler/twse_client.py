@@ -19,7 +19,11 @@ class TwseClient:
             raise ValueError("Pass either crawler or http_client, not both")
         self._crawler = crawler or TwStockCrawler(http_client=http_client)
 
-    def get_daily_stock_rows(self, date_time: str, stocktype: int) -> StockRows:
+    def get_daily_stock_rows(
+        self,
+        date_time: str,
+        stocktype: int | str,
+    ) -> StockRows:
         return self._crawler.get_stocktype_data(date_time, stocktype)
 
     def get_daily_taiex_close(self, date_time: str) -> float | None:

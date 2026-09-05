@@ -94,6 +94,14 @@ class FundamentalRepositoryPort(Protocol):
         uow: FundamentalUnitOfWork | None = None,
     ) -> tuple[tuple[int, int], str] | None: ...
 
+    def load_financial_batch_states(
+        self,
+        symbols: list[str],
+        *,
+        uow: FundamentalUnitOfWork | None = None,
+    ) -> dict[str, tuple[tuple[int, int], str]]:
+        """Bulk-load the latest persisted batch state for each symbol."""
+
     def save_financial_batch_state(
         self,
         symbol: str,
@@ -121,6 +129,15 @@ class FundamentalRepositoryPort(Protocol):
         uow: FundamentalUnitOfWork | None = None,
     ) -> list[FundamentalSnapshot]:
         """Load latest point-in-time TWSE revisions for every stored period."""
+
+    def load_financial_batch_snapshots_many(
+        self,
+        symbols: list[str],
+        *,
+        as_of: str,
+        uow: FundamentalUnitOfWork | None = None,
+    ) -> dict[str, list[FundamentalSnapshot]]:
+        """Bulk-load point-in-time TWSE revisions grouped by symbol."""
 
     def latest_filing(
         self,

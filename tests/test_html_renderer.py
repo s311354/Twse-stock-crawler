@@ -4,6 +4,10 @@ from domain.model_contracts import DecisionField
 from domain.model_contracts import FieldSource
 from domain.model_contracts import FieldUnit
 from domain.model_contracts import StrategyDecision
+from infrastructure.report.html_renderer import PortfolioAllocationRenderer
+from infrastructure.report.html_renderer import (
+    PortfolioAllocationV1Renderer,
+)
 from infrastructure.report.html_renderer import RendererFactory
 from textmewhenitsdone import StockhtmlMessage
 
@@ -37,6 +41,18 @@ def decisions(values: dict[str, object]) -> tuple[StrategyDecision, ...]:
             evaluated_at=EVALUATED_AT,
             fields=fields,
         ),
+    )
+
+
+def test_portfolio_renderer_is_version_neutral_with_v1_alias() -> None:
+    assert PortfolioAllocationV1Renderer is PortfolioAllocationRenderer
+    assert isinstance(
+        RendererFactory.get_renderer("portfolio_allocation_v1"),
+        PortfolioAllocationRenderer,
+    )
+    assert isinstance(
+        RendererFactory.get_renderer("portfolio_allocation_v2"),
+        PortfolioAllocationRenderer,
     )
 
 
@@ -129,16 +145,126 @@ def test_renderer_factory_renders_compact_portfolio_allocation_summary() -> None
         )
     )
 
-    assert "投資組合配置（PAE v1.1.5）" in rendered
+    assert "投資組合配置（PAE v1.2.1）" in rendered
     assert "COLD_START" in rendered
     assert "必要報酬" in rendered
     assert "目標現金" in rendered
     assert "持股基準" in rendered
     assert "SYMBOL_ONLY_EQUAL_WEIGHT" in rendered
-    assert "Absolute Strategic 1" in rendered
-    assert "Absolute Executable 1" in rendered
+    assert "進出場訊號 1" in rendered
+    assert "已篩選 0" in rendered
     assert "2330" in rendered
     assert "ADD" in rendered
+
+
+def test_portfolio_renderer_reads_v2_model_version_from_decision() -> None:
+    renderer = RendererFactory.get_renderer("portfolio_allocation_v2")
+    rendered = renderer.render(
+        decisions(
+            {
+                "證券代號": "2330",
+                "證券名稱": "台積電",
+                "PAE Status": "SUCCESS",
+                "PAE Mode": "DIRECT_SELECTION",
+                "PAE Binding": "NON_BINDING",
+                "PAE Role": "CANDIDATE",
+                "PAE CER": 0.17,
+                "PAE Required Return": 0.10,
+                "PAE Strategic Candidate": True,
+                "PAE Executable Candidate": True,
+                "PAE Target Weight": 0.10,
+                "PAE Target Cash Weight": 0.90,
+                "PAE Decision": "STARTER",
+                "PAE Reason": "LES_DIRECT_SELECTION_NON_BINDING",
+                "PAE Model Version": "2.0.0",
+                "PAE Schema Version": "pae.portfolio_decision.v2",
+            }
+        )
+    )
+
+    assert "投資組合配置（PAE v2.0.0）" in rendered
+    assert "NON_BINDING" in rendered
+    assert "DIRECT_SELECTION" in rendered
+    assert "PAE v1.2.1" not in rendered
+
+
+def test_portfolio_renderer_hides_non_actionable_candidates() -> None:
+    renderer = RendererFactory.get_renderer("portfolio_allocation_v1")
+    rows = tuple(
+        decisions(
+            {
+                "證券代號": symbol,
+                "證券名稱": f"候選{symbol}",
+                "PAE Status": "SUCCESS",
+                "PAE Mode": "STEADY_STATE",
+                "PAE Role": "CANDIDATE",
+                "PAE CER": cer,
+                "PAE Quality Score": quality,
+                "PAE Strategic Candidate": True,
+                "PAE Executable Candidate": False,
+                "PAE Capital Claim": 0.0,
+                "PAE Best Strategic Alternative": "1001",
+                "PAE Best Executable Alternative": None,
+                "PAE Target Weight": 0.0,
+                "PAE Decision": "STRATEGIC_WATCH",
+                "PAE Reason": "STRATEGIC_NOT_EXECUTABLE_OR_SLOT_UNAVAILABLE",
+            }
+        )[0]
+        for symbol, quality, cer in (
+            ("1001", 90, 0.14),
+            ("1002", 89, 0.13),
+            ("1003", 88, 0.12),
+            ("1004", 87, 0.11),
+        )
+    )
+
+    rendered = renderer.render(rows)
+
+    assert "STRATEGIC_WATCH" not in rendered
+    assert "1001" not in rendered
+    assert "本次沒有涉及進場、加碼、輪動、減碼或退出的 PAE 訊號" in rendered
+
+
+def test_portfolio_renderer_only_shows_requested_action_signals() -> None:
+    renderer = RendererFactory.get_renderer("portfolio_allocation_v1")
+    allowed = (
+        "ADD",
+        "STRONG_ADD",
+        "ROTATE_25",
+        "ROTATE_50",
+        "ROTATE_75",
+        "FAST_TRACK_ROTATE",
+        "EXIT",
+        "EXIT_AND_REALLOCATE",
+        "EXIT_TO_CASH",
+        "REDUCE_25",
+        "STARTER",
+    )
+    hidden = ("HOLD", "HOLD_REVIEW", "STRATEGIC_WATCH")
+    rows = tuple(
+        decisions(
+            {
+                "證券代號": str(2000 + index),
+                "證券名稱": action,
+                "PAE Status": "SUCCESS",
+                "PAE Mode": "STEADY_STATE",
+                "PAE Role": "CANDIDATE",
+                "PAE Decision": action,
+                "PAE Target Weight": 0.1,
+            }
+        )[0]
+        for index, action in enumerate(allowed + hidden)
+    )
+
+    rendered = renderer.render(rows)
+
+    for index, action in enumerate(allowed):
+        assert action in rendered
+        assert str(2000 + index) in rendered
+    for index, action in enumerate(hidden, start=len(allowed)):
+        assert action not in rendered
+        assert str(2000 + index) not in rendered
+    assert "進出場訊號 11" in rendered
 
 
 def test_portfolio_renderer_explains_building_mode() -> None:
@@ -159,6 +285,9 @@ def test_portfolio_renderer_explains_building_mode() -> None:
     assert "BUILDING" in rendered
     assert "目前 1 檔有效持股" in rendered
     assert "不套用成對支配與輪動門檻" in rendered
+    assert "2330" not in rendered
+    assert "HOLD" not in rendered
+    assert "本次沒有涉及進場、加碼、輪動、減碼或退出的 PAE 訊號" in rendered
 
 
 def test_daily_email_renders_each_decision_card_and_stock_once() -> None:
@@ -198,8 +327,133 @@ def test_daily_email_renders_each_decision_card_and_stock_once() -> None:
         'data-section="portfolio-allocation"',
         1,
     )[1].split("</section>", 1)[0]
-    assert portfolio_card.count("2330") == 1
+    assert "2330" not in portfolio_card
+    assert "HOLD" not in portfolio_card
     assert "分析 1 檔" in portfolio_card
+
+
+def test_daily_email_stacks_decision_tables_with_labels_on_mobile() -> None:
+    rendered = RendererFactory.get_renderer("daily_strategy_email").render(
+        decisions(
+            {
+                "證券代號": "2330",
+                "證券名稱": "台積電",
+                "收盤": 1000.0,
+                "低點分數": 82,
+                "低點決策": "BUY",
+                "EREM 分數": 78,
+                "EREM 決策訊號": "HOLD",
+                "PAE Status": "SUCCESS",
+                "PAE Mode": "COLD_START",
+                "PAE Role": "CANDIDATE",
+                "PAE Quality Score": 88,
+                "PAE CER": 0.16,
+                "PAE Required Return": 0.10,
+                "PAE Current Weight": 0.0,
+                "PAE Target Weight": 0.30,
+                "PAE Target Cash Weight": 0.70,
+                "PAE Portfolio Expected CER": 0.16,
+                "PAE Decision": "ADD",
+                "PAE Reason": "COLD_START_EXECUTABLE",
+            }
+        )
+    )
+
+    assert '<main class="twse-daily-report">' in rendered
+    assert "@media only screen and (max-width: 720px)" in rendered
+    assert "grid-template-columns: minmax(104px, 35%) minmax(0, 1fr)" in rendered
+    assert rendered.count('class="responsive-decision-table"') == 3
+    assert 'aria-label="可執行進場決策"' in rendered
+    assert 'aria-label="投資組合配置決策"' in rendered
+    assert 'aria-label="Low-Entry 與 EREM 決策總覽"' in rendered
+    for label in (
+        "股票",
+        "進場決策",
+        "品質／CER",
+        "PAE 決策",
+        "EREM v3 持有分數",
+        "EREM 出場決策",
+    ):
+        assert 'data-label="{}"'.format(label) in rendered
+
+
+def test_low_entry_v5_explains_no_entry_state_with_top_candidates() -> None:
+    renderer = RendererFactory.get_renderer("low_entry_score_v5")
+    rows = tuple(
+        decisions(values)[0]
+        for values in (
+            {
+                "證券代號": "2330",
+                "證券名稱": "台積電",
+                "低點分數": 74,
+                "Required Technical Score": 75,
+                "低點決策": "WATCH",
+                "LES v5 Final Quality Status": "QUALITY_CONFIRMED",
+                "Valuation Gate": "PASS",
+                "Falling Knife State": "CLEAR",
+                "LES v5 Trigger": 0,
+                "Risk Gate": "PASS",
+            },
+            {
+                "證券代號": "2454",
+                "證券名稱": "聯發科",
+                "低點分數": 88,
+                "Required Technical Score": 75,
+                "低點決策": "NO_BUY",
+                "LES v5 Final Quality Status": "QUALITY_CONFIRMED",
+                "Valuation Gate": "FAIL",
+                "Falling Knife State": "CLEAR",
+                "LES v5 Trigger": 1,
+                "Risk Gate": "PASS",
+            },
+            {
+                "證券代號": "2317",
+                "證券名稱": "鴻海",
+                "低點分數": 51,
+                "Required Technical Score": 75,
+                "低點決策": "AVOID",
+                "LES v5 Final Quality Status": "QUALITY_CONFIRMED",
+                "Valuation Gate": "PASS",
+                "Falling Knife State": "CLEAR",
+                "LES v5 Trigger": 0,
+                "Risk Gate": "FAIL",
+            },
+            {
+                "證券代號": "2382",
+                "證券名稱": "廣達",
+                "低點決策": "DATA_INSUFFICIENT",
+                "LES v5 Final Quality Status": "UNKNOWN",
+                "Valuation Gate": "UNKNOWN",
+                "Falling Knife State": "DATA_INSUFFICIENT",
+                "Risk Gate": "UNKNOWN",
+            },
+        )
+    )
+
+    rendered = renderer.render_entry_summary(rows)
+
+    assert "共分析 <strong>4</strong> 檔" in rendered
+    assert "沒有 BUY / EARLY_BUY / BUY_SMALL 可執行訊號" in rendered
+    assert "決策分布：AVOID <strong>1</strong>" in rendered
+    assert "DATA_INSUFFICIENT <strong>1</strong>" in rendered
+    assert "NO_BUY <strong>1</strong>" in rendered
+    assert "WATCH <strong>1</strong>" in rendered
+    assert 'aria-label="未執行候選診斷"' in rendered
+    assert "最高 LES 非執行候選" in rendered
+    assert rendered.index("2454") < rendered.index("2330")
+    assert rendered.index("2330") < rendered.index("2317")
+    assert "2382" not in rendered
+    assert "實際 <strong>88</strong>／門檻 75｜高於門檻 13 分" in rendered
+    assert "Valuation Gate" not in rendered
+    assert "FAIL" in rendered
+    assert "僅用於定位阻擋狀態，不代表可執行" in rendered
+    for label in (
+        "目前決策",
+        "LES／門檻",
+        "Falling-Knife",
+        "Trigger／Risk",
+    ):
+        assert 'data-label="{}"'.format(label) in rendered
 
 
 def test_renderer_factory_renders_low_entry_v4_gates() -> None:
@@ -378,10 +632,13 @@ def test_renderer_factory_renders_low_entry_v5_quality_and_panic_state() -> None
     assert "Low-Entry Model v5｜進場模式" in rendered
     assert "EREM v3｜出場模式" in rendered
     assert "高分不能抵銷 Hard Reject" in rendered
-    assert "40–54 REDUCE 25%" in rendered
-    assert "低於 40 EXIT" in rendered
-    assert "進場決策彙整（BUY / BUY_SMALL）" in rendered
-    assert "本次沒有 BUY / BUY_SMALL 可執行訊號" in rendered
+    assert "40–54 REDUCE 25%–50%（HC 越低減越多）" in rendered
+    assert "低於 40 立即 EXIT" in rendered
+    assert "BUY 且 Entry LES≥75 的一般 REDUCE 寬限 3 個持有交易日" in rendered
+    assert "BUY_SMALL 寬限 2 日" in rendered
+    assert "EARLY_BUY 採保守 2 個持有交易日寬限" in rendered
+    assert "進場決策彙整（BUY / EARLY_BUY / BUY_SMALL）" in rendered
+    assert "本次沒有 BUY / EARLY_BUY / BUY_SMALL 可執行訊號" in rendered
     assert "Quality-First Panic Reversal" in rendered
     assert "QUALITY_CONFIRMED" in rendered
     assert "REVERSAL_WATCH" in rendered
@@ -389,7 +646,14 @@ def test_renderer_factory_renders_low_entry_v5_quality_and_panic_state() -> None
     assert "LES v5 進場分數" in rendered
     assert "EREM v3 持有分數" in rendered
     assert "即時 <strong>72</strong>／100" in rendered
-    summary_row = rendered.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+    summary_table = rendered.split(
+        'aria-label="Low-Entry 與 EREM 決策總覽"',
+        1,
+    )[1]
+    summary_row = summary_table.split("<tbody>", 1)[1].split(
+        "</tbody>",
+        1,
+    )[0]
     assert "實際 <strong>84</strong>／100" in summary_row
     assert "本次門檻" not in summary_row
     assert "持有信心" not in summary_row
@@ -471,6 +735,26 @@ def test_low_entry_v5_renders_buy_decisions_in_a_separate_readable_summary() -> 
             "EREM 決策訊號": "HOLD",
         }
     )
+    early_buy = decisions(
+        {
+            "證券代號": "2454",
+            "證券名稱": "聯發科",
+            "收盤": 1400.0,
+            "Entry Candidate": 1410.0,
+            "Entry Rule": "NEXT_DAY_REVERSAL_CONFIRMATION",
+            "Position Fraction": 0.1625,
+            "建議股數": 100,
+            "策略停損": 1350.0,
+            "策略停利": 1520.0,
+            "RewardRisk": 2.1,
+            "低點分數": 74,
+            "Required Technical Score": 75,
+            "LES v5 Trigger": 1,
+            "Risk Gate": "PASS",
+            "低點決策": "EARLY_BUY",
+            "EREM 決策訊號": "HOLD",
+        }
+    )
     watch = decisions(
         {
             "證券代號": "2382",
@@ -481,19 +765,22 @@ def test_low_entry_v5_renders_buy_decisions_in_a_separate_readable_summary() -> 
         }
     )
 
-    rendered = renderer.render(watch + buy_small + buy)
+    rendered = renderer.render(watch + buy_small + early_buy + buy)
     entry_section = rendered.split(
         'data-section="entry-decisions"',
         1,
     )[1].split("</section>", 1)[0]
 
-    assert "共 <strong>2</strong> 檔" in entry_section
+    assert "共 <strong>3</strong> 檔" in entry_section
     assert "BUY <strong>1</strong>" in entry_section
+    assert "EARLY_BUY <strong>1</strong>" in entry_section
     assert "BUY_SMALL <strong>1</strong>" in entry_section
     assert "2330" in entry_section
+    assert "2454" in entry_section
     assert "2317" in entry_section
     assert "2382" not in entry_section
-    assert entry_section.index("2330") < entry_section.index("2317")
+    assert entry_section.index("2330") < entry_section.index("2454")
+    assert entry_section.index("2454") < entry_section.index("2317")
     assert "觸發 1,010" in entry_section
     assert "1,000 股" in entry_section
     assert "停損 960" in entry_section
@@ -501,4 +788,5 @@ def test_low_entry_v5_renders_buy_decisions_in_a_separate_readable_summary() -> 
     assert "RR 2.3" in entry_section
     assert "LES 進場分數 <strong>84</strong>" in entry_section
     assert "本次門檻 80｜高於門檻 4 分" in entry_section
-    assert "BUY_SMALL 為縮小部位訊號" in entry_section
+    assert "EARLY_BUY 採 0.65 execution factor" in entry_section
+    assert "BUY_SMALL 採縮小部位配置" in entry_section

@@ -45,6 +45,28 @@ class FakeTwseClient:
         return self.taiex_by_date.get(date_time, 20000.0)
 
 
+class MarketAwareFakeTwseClient(FakeTwseClient):
+    def __init__(
+        self,
+        rows_by_market_and_date: dict[
+            tuple[int | str, str],
+            stockanalysis.StockRows,
+        ],
+    ) -> None:
+        super().__init__({})
+        self.rows_by_market_and_date = rows_by_market_and_date
+        self.market_stock_calls: list[tuple[int | str, str]] = []
+
+    def get_daily_stock_rows(
+        self,
+        date_time: str,
+        stocktype: int | str,
+    ) -> stockanalysis.StockRows:
+        self.stock_calls.append(date_time)
+        self.market_stock_calls.append((stocktype, date_time))
+        return self.rows_by_market_and_date[(stocktype, date_time)]
+
+
 class CapturingTwseCrawler(stockanalysis.TwseCrawker):
     def __init__(
         self,
@@ -138,6 +160,97 @@ def test_market_history_cache_fetches_only_missing_dates(tmp_path) -> None:
             market_type="13",
         )
     ) == {"20260525", "20260526"}
+
+
+def test_portfolio_stock_outside_selected_sector_uses_full_market_rows() -> None:
+    sector_row = twse_row(
+        "100", "105", "99", "104",
+        stock_no="2330", stock_name="台積電",
+    )
+    holding_row = twse_row(
+        "91", "93", "90", "92",
+        stock_no="2881", stock_name="富邦金",
+    )
+    client = MarketAwareFakeTwseClient({
+        (13, "20260825"): [sector_row],
+        (stockanalysis.FULL_MARKET_TYPE, "20260825"): [
+            sector_row,
+            holding_row,
+        ],
+    })
+    crawler = CapturingTwseCrawler(2)
+    crawler.twse_client = client
+    crawler.explicit_stock_numbers = {"2881"}
+    crawler.iso_scheduled_times = ["2026-08-25"]
+
+    crawler.get_twse_daily_stocks(
+        "shirong",
+        DummyStockType,
+        ["0", "2881"],
+    )
+
+    assert client.market_stock_calls == [
+        (13, "20260825"),
+        (stockanalysis.FULL_MARKET_TYPE, "20260825"),
+    ]
+    assert crawler.stocknumbers == ["2330", "2881"]
+    assert crawler.daily_closes == [[104_000.0], [92_000.0]]
+
+
+def test_portfolio_stock_uses_filtered_full_market_cache(tmp_path) -> None:
+    sector_row = twse_row(
+        "100", "105", "99", "104",
+        stock_no="2330", stock_name="台積電",
+    )
+    holding_row = twse_row(
+        "91", "93", "90", "92",
+        stock_no="2881", stock_name="富邦金",
+    )
+    cache = SQLiteMarketHistoryCache(tmp_path / "market_history.sqlite3")
+    cache.upsert_day(
+        CachedMarketDay("20260825", [sector_row], 24_000.0),
+        market_type="13",
+    )
+    cache.upsert_day(
+        CachedMarketDay(
+            "20260825",
+            [sector_row, holding_row],
+            24_000.0,
+        ),
+        market_type=stockanalysis.FULL_MARKET_TYPE,
+    )
+    crawler = CapturingTwseCrawler(2, market_history_cache=cache)
+    crawler.explicit_stock_numbers = {"2881"}
+    crawler.iso_scheduled_times = ["2026-08-25"]
+
+    crawler.get_twse_daily_stocks(
+        "shirong",
+        DummyStockType,
+        ["2330", "2881"],
+    )
+
+    assert crawler.twse_client.stock_calls == []
+    assert crawler.stocknumbers == ["2330", "2881"]
+    assert crawler.daily_closes == [[104_000.0], [92_000.0]]
+
+
+def test_portfolio_stock_already_in_sector_is_not_duplicated() -> None:
+    sector_row = twse_row(
+        "100", "105", "99", "104",
+        stock_no="2330", stock_name="台積電",
+    )
+    crawler = CapturingTwseCrawler(2, {"20260825": [sector_row]})
+    crawler.explicit_stock_numbers = {"2330"}
+    crawler.iso_scheduled_times = ["2026-08-25"]
+
+    crawler.get_twse_daily_stocks(
+        "shirong",
+        DummyStockType,
+        ["0", "2330"],
+    )
+
+    assert crawler.stocknumbers == ["2330", ""]
+    assert crawler.daily_closes == [[104_000.0], []]
 
 
 def test_market_history_cache_refreshes_current_reference_date(tmp_path) -> None:
@@ -252,6 +365,40 @@ def test_missing_ohlc_logs_debug_details_and_one_release_summary(
     )
 
 
+def test_max_profit_missing_prices_logs_symbols_without_internal_indexes(
+    caplog,
+) -> None:
+    crawler = CapturingTwseCrawler(3)
+    crawler.tracked_stock_numbers = ["2321", "2382", None]
+
+    with caplog.at_level(logging.DEBUG):
+        maxprofits = crawler.cal_max_profit()
+
+    details = [
+        record
+        for record in caplog.records
+        if getattr(record, "status", None) == "MAX_PROFIT_PRICE_MISSING"
+    ]
+    summaries = [
+        record
+        for record in caplog.records
+        if getattr(record, "status", None)
+        == "MAX_PROFIT_PRICE_MISSING_SUMMARY"
+    ]
+
+    assert maxprofits == [
+        [0, 0, 0, 0, None],
+        [0, 0, 0, 0, None],
+        [0, 0, 0, 0, None],
+    ]
+    assert [record.symbol for record in details] == ["2321", "2382", None]
+    assert all(record.levelno == logging.DEBUG for record in details)
+    assert len(summaries) == 1
+    assert summaries[0].levelno == logging.WARNING
+    assert "stocks=3 symbols=2321,2382 unresolved=1" in summaries[0].getMessage()
+    assert "stock index" not in caplog.text
+
+
 def test_no_data_date_logs_one_final_warning_and_is_collected(caplog) -> None:
     rows_by_date = {
         "20260525": [],
@@ -357,6 +504,26 @@ def test_legacy_index_selector_locks_stock_number_when_twse_order_changes() -> N
     assert crawler.stocknames == ["廣達"]
     assert crawler.daily_closes == [[104000.0, 109000.0]]
     assert crawler.daily_taiex_closes == [[20000.0, 20000.0]]
+
+
+def test_legacy_index_selectors_do_not_track_the_same_symbol_twice() -> None:
+    first_day = [
+        twse_row("100", "105", "99", "104", stock_no="2382", stock_name="廣達"),
+    ]
+    second_day = [
+        twse_row("100", "105", "99", "104", stock_no="2382", stock_name="廣達"),
+        twse_row("100", "105", "99", "104", stock_no="2382", stock_name="廣達"),
+    ]
+    crawler = CapturingTwseCrawler(2, {
+        "20260616": first_day,
+        "20260617": second_day,
+    })
+    crawler.iso_scheduled_times = ["2026-06-16", "2026-06-17"]
+
+    crawler.get_twse_daily_stocks("shirong", DummyStockType, ["0", "1"])
+
+    assert crawler.tracked_stock_numbers == ["2382", None]
+    assert [row[0] for _date, rows in crawler.records for row in rows if row] == ["2382", "2382"]
 
 
 def test_stock_number_selector_does_not_depend_on_twse_row_index() -> None:
@@ -644,6 +811,11 @@ def test_daily_analysis_dataset_uses_low_entry_score_v5() -> None:
         "STRONG HOLD",
         "HOLD",
         "REDUCE 25%",
+        "REDUCE 30%",
+        "REDUCE 35%",
+        "REDUCE 40%",
+        "REDUCE 45%",
+        "REDUCE 50%",
         "EXIT",
     }
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import time
 from collections.abc import Callable
 
 import pandas as pd
@@ -23,8 +24,10 @@ from application.fundamental_ports import FundamentalRepositoryPort
 from application.fundamental_ports import FundamentalUnitOfWork
 from domain.base_quality_features import BaseQualityFeatureProducer
 from domain.errors import DataSourceError
+from domain.errors import DataErrorCategory
 from domain.errors import NoDataError
 from domain.fundamental_derivation import FUNDAMENTAL_DERIVATION_VERSION
+from domain.fundamental_derivation import CachedFundamentalBundle
 from domain.fundamental_derivation import FundamentalBundle
 from domain.fundamental_derivation import derive_fundamentals
 from domain.fundamental_models import FilingAnnouncement
@@ -99,6 +102,7 @@ class MopsFundamentalService:
             dict[tuple[int, int], FilingCorrection],
         ] = {}
         self._individual_scope_fallback_symbols: set[str] = set()
+        self._access_blocked_cache_fallback_symbols: set[str] = set()
 
     def reset_scope_fallback_diagnostics(self) -> None:
         self._individual_scope_fallback_symbols.clear()
@@ -106,6 +110,14 @@ class MopsFundamentalService:
     def consume_scope_fallback_symbols(self) -> tuple[str, ...]:
         symbols = tuple(sorted(self._individual_scope_fallback_symbols))
         self._individual_scope_fallback_symbols.clear()
+        return symbols
+
+    def reset_access_blocked_diagnostics(self) -> None:
+        self._access_blocked_cache_fallback_symbols.clear()
+
+    def consume_access_blocked_cache_fallback_symbols(self) -> tuple[str, ...]:
+        symbols = tuple(sorted(self._access_blocked_cache_fallback_symbols))
+        self._access_blocked_cache_fallback_symbols.clear()
         return symbols
 
     def prepare_daily_batch(self, observed_at: dt.datetime) -> int:
@@ -181,12 +193,16 @@ class MopsFundamentalService:
             for symbol in dict.fromkeys(str(item).strip() for item in symbols)
             if symbol
         }
+        preload_started = time.perf_counter()
         cached = self.repository.load_cached_bundles(
             symbol_sectors,
             as_of=effective_signal.isoformat(),
             derivation_version=FUNDAMENTAL_DERIVATION_VERSION,
         )
-        reusable: dict[str, FundamentalBundle] = {}
+        eligible: dict[
+            str,
+            tuple[CachedFundamentalBundle, FundamentalSnapshot | None],
+        ] = {}
         for symbol, entry in cached.items():
             if entry.annual_history_years < history_years:
                 continue
@@ -207,53 +223,71 @@ class MopsFundamentalService:
                 and current_batch.period > entry.latest_period
             ):
                 continue
+            eligible[symbol] = (entry, current_batch)
 
+        reusable: dict[str, FundamentalBundle] = {}
+        eligible_symbols = list(eligible)
+        if eligible_symbols:
             with self.repository.unit_of_work() as uow:
-                resolution = self._resolve_batch_snapshot(
-                    symbol,
-                    effective_signal,
-                    uow=uow,
-                )
-                bundle = self.snapshot_assembler.attach_base_evidence(
-                    self.point_in_time.bundle_as_of(
-                        entry.bundle,
-                        effective_signal,
-                    ),
-                    resolution,
-                    symbol=symbol,
-                    signal_time=effective_signal,
-                    uow=uow,
-                )
-                batch_state = self.repository.load_financial_batch_state(
-                    symbol,
-                    uow=uow,
-                )
-                if (
-                    current_batch is not None
-                    and entry.latest_period >= current_batch.period
-                    and batch_state is None
-                ):
-                    self.snapshot_assembler.save_batch_state(
-                        symbol,
-                        current_batch,
+                histories = (
+                    self.repository.load_financial_batch_snapshots_many(
+                        eligible_symbols,
+                        as_of=effective_signal.isoformat(),
                         uow=uow,
                     )
-            snapshot = dict(bundle.snapshot)
-            snapshot["remote_refresh_skipped"] = True
-            reusable[symbol] = FundamentalBundle(
-                annual_fundamentals=bundle.annual_fundamentals,
-                snapshot=snapshot,
-                as_of=bundle.as_of,
-            )
+                )
+                batch_states = self.repository.load_financial_batch_states(
+                    eligible_symbols,
+                    uow=uow,
+                )
+                for symbol, (entry, current_batch) in eligible.items():
+                    history = histories.get(symbol, [])
+                    resolution = self._resolve_batch_snapshot(
+                        symbol,
+                        effective_signal,
+                        uow=uow,
+                        history=history,
+                    )
+                    bundle = self.snapshot_assembler.attach_base_evidence(
+                        self.point_in_time.bundle_as_of(
+                            entry.bundle,
+                            effective_signal,
+                        ),
+                        resolution,
+                        symbol=symbol,
+                        signal_time=effective_signal,
+                        uow=uow,
+                        history=history,
+                        persist_snapshot=False,
+                    )
+                    batch_state = batch_states.get(symbol)
+                    if (
+                        current_batch is not None
+                        and entry.latest_period >= current_batch.period
+                        and batch_state is None
+                    ):
+                        self.snapshot_assembler.save_batch_state(
+                            symbol,
+                            current_batch,
+                            uow=uow,
+                        )
+                    snapshot = dict(bundle.snapshot)
+                    snapshot["remote_refresh_skipped"] = True
+                    reusable[symbol] = FundamentalBundle(
+                        annual_fundamentals=bundle.annual_fundamentals,
+                        snapshot=snapshot,
+                        as_of=bundle.as_of,
+                    )
 
         logging.debug(
             "MOPS snapshot preload requested=%s candidates=%s reused=%s "
-            "fallback=%s derivation_version=%s",
+            "fallback=%s derivation_version=%s duration_seconds=%.3f",
             len(symbol_sectors),
             len(cached),
             len(reusable),
             len(symbol_sectors) - len(reusable),
             FUNDAMENTAL_DERIVATION_VERSION,
+            time.perf_counter() - preload_started,
             extra={
                 "source": "MOPS_CACHE",
                 "status": "BULK_PRELOAD",
@@ -575,12 +609,14 @@ class MopsFundamentalService:
         signal_time: pd.Timestamp,
         *,
         uow: FundamentalUnitOfWork,
+        history: list[FundamentalSnapshot] | None = None,
     ) -> BatchSnapshotResolution:
         return self.snapshot_assembler.resolve(
             self._daily_financials,
             symbol,
             signal_time,
             uow=uow,
+            history=history,
         )
 
     def _load_cached_fallback(
@@ -621,15 +657,32 @@ class MopsFundamentalService:
             signal_time=parsed_signal,
             uow=uow,
         )
-        logging.warning(
-            "MOPS refresh status=%s symbol=%s cache_fallback=true filings=%s "
-            "bundle_cache_hit=%s detail=%s",
-            refresh_error.category.value.upper(),
-            symbol,
-            len(filed_financials),
-            cache_hit,
-            refresh_error,
-        )
+        if refresh_error.category is DataErrorCategory.ACCESS_BLOCKED:
+            self._access_blocked_cache_fallback_symbols.add(symbol)
+            logging.debug(
+                "MOPS refresh status=ACCESS_BLOCKED symbol=%s "
+                "cache_fallback=true filings=%s bundle_cache_hit=%s detail=%s",
+                symbol,
+                len(filed_financials),
+                cache_hit,
+                refresh_error,
+                extra={
+                    "symbol": symbol,
+                    "source": "MOPS_CACHE",
+                    "status": "ACCESS_BLOCKED",
+                    "cache_hit": True,
+                },
+            )
+        else:
+            logging.warning(
+                "MOPS refresh status=%s symbol=%s cache_fallback=true "
+                "filings=%s bundle_cache_hit=%s detail=%s",
+                refresh_error.category.value.upper(),
+                symbol,
+                len(filed_financials),
+                cache_hit,
+                refresh_error,
+            )
         return bundle
 
     @staticmethod

@@ -113,6 +113,7 @@ def _quality_snapshot(**overrides: object) -> dict[str, object]:
 def _air_quality_snapshot(**overrides: object) -> dict[str, object]:
     snapshot = _quality_snapshot(
         sector="15",
+        issuer_symbol="2610",
         twse_debt_ratio=0.7306,
         twse_current_ratio=0.6684,
         twse_roe_ytd_end_balance=0.0658,
@@ -461,7 +462,7 @@ def test_next_day_confirmation_requires_price_risk_and_positive_clv() -> None:
     assert confirmed.tolist() == [False, True]
 
 
-def test_next_day_confirmation_emits_buy_small_and_never_early_buy() -> None:
+def test_next_day_confirmation_emits_early_buy_with_normal_les_cap() -> None:
     strategy = LowEntryScoreV5Strategy()
     assert strategy.rule_engine is not None
     quality = evaluate_v5_quality(
@@ -497,9 +498,8 @@ def test_next_day_confirmation_emits_buy_small_and_never_early_buy() -> None:
         pd.Series([False, False], index=index),
     )
 
-    assert decision.tolist() == ["BUY_SMALL", "BUY"]
-    assert "EARLY_BUY" not in set(decision)
-    assert fraction.iloc[0] == pytest.approx(1 / 8)
+    assert decision.tolist() == ["EARLY_BUY", "BUY"]
+    assert fraction.iloc[0] == pytest.approx(1 / 3)
     assert fraction.iloc[1] == pytest.approx(1 / 3)
 
 
@@ -1122,7 +1122,7 @@ def test_v5_broad_rally_path_emits_only_conditional_buy_small() -> None:
     assert fraction.loc[0] == pytest.approx(1 / 8)
 
 
-def test_v5_strong_breadth_reversal_can_emit_conditional_buy() -> None:
+def test_v5_strong_breadth_reversal_keeps_buy_at_or_above_75() -> None:
     strategy = LowEntryScoreV5Strategy()
     assert strategy.rule_engine is not None
     confirmed = evaluate_v5_quality(
@@ -1143,7 +1143,6 @@ def test_v5_strong_breadth_reversal_can_emit_conditional_buy() -> None:
     )
     index = pd.RangeIndex(1)
     common = {
-        "score": pd.Series([37.0], index=index),
         "quality": fallback,
         "valuation": pd.Series([ValuationStatus.PASS.value], index=index),
         "falling_state": pd.Series(
@@ -1162,6 +1161,7 @@ def test_v5_strong_breadth_reversal_can_emit_conditional_buy() -> None:
 
     decision = strategy.rule_engine.resolve_decision(
         **common,
+        score=pd.Series([75.0], index=index),
         risk_gate=pd.Series(["PASS"], index=index),
     )
     fraction = strategy.rule_engine.position_fraction(
@@ -1172,12 +1172,19 @@ def test_v5_strong_breadth_reversal_can_emit_conditional_buy() -> None:
     )
     risk_failed = strategy.rule_engine.resolve_decision(
         **common,
+        score=pd.Series([75.0], index=index),
         risk_gate=pd.Series(["FAIL"], index=index),
+    )
+    below_buy_floor = strategy.rule_engine.resolve_decision(
+        **common,
+        score=pd.Series([74.999], index=index),
+        risk_gate=pd.Series(["PASS"], index=index),
     )
 
     assert decision.loc[0] == "BUY"
     assert fraction.loc[0] == pytest.approx(1 / 4)
     assert risk_failed.loc[0] == "BUY_SMALL"
+    assert below_buy_floor.loc[0] == "BUY_SMALL"
 
 
 def test_v5_balanced_profile_uses_75_point_entry_and_1_7_reward_risk() -> None:
@@ -1206,6 +1213,258 @@ def test_v5_balanced_profile_uses_75_point_entry_and_1_7_reward_risk() -> None:
     assert config.quality_pullback_minimum_raw_score == 50
     assert config.quality_pullback_minimum_clv == pytest.approx(0.20)
     assert config.quality_pullback_minimum_volume_ratio == pytest.approx(0.50)
+    assert config.high_quality_reversal_minimum_quality_score == 85
+    assert config.high_quality_reversal_minimum_clv == pytest.approx(-0.10)
+    assert config.high_quality_reversal_minimum_volume_ratio == pytest.approx(0.25)
+    assert config.high_quality_reversal_minimum_reversals == 2
+    assert config.air_cycle_minimum_quality_score == 85
+    assert config.air_cycle_score_threshold == 35
+    assert config.air_cycle_minimum_raw_score == 45
+
+
+def test_sector_15_shipping_issuer_does_not_use_airline_quality_relaxation() -> None:
+    shipping = evaluate_v5_quality(
+        _annual_fundamentals(),
+        _air_quality_snapshot(issuer_symbol="2603"),
+        SIGNAL_DATE,
+    )
+
+    assert "AIR_QUALITY_PROFILE_ACTIVE" not in shipping.warnings
+    assert shipping.base_status is BaseQualityStatus.REJECT
+    assert shipping.final_status is FinalQualityStatus.HARD_NO_BUY
+
+
+def test_air_cycle_confirmation_emits_only_one_eighth_buy_small() -> None:
+    strategy = LowEntryScoreV5Strategy()
+    assert strategy.rule_engine is not None
+    confirmed = evaluate_v5_quality(
+        _annual_fundamentals(),
+        _air_quality_snapshot(),
+        SIGNAL_DATE,
+    )
+    quality = replace(
+        confirmed,
+        final_status=FinalQualityStatus.CONFIRMED,
+        final_score=90.0,
+        hard_rejects=(),
+    )
+    index = pd.RangeIndex(1)
+    common = {
+        "score": pd.Series([39.0], index=index),
+        "quality": quality,
+        "valuation": pd.Series(
+            [ValuationStatus.SUPPORTIVE.value], index=index
+        ),
+        "falling_state": pd.Series(
+            [FallingKnifeState.CLEAR.value], index=index
+        ),
+        "next_day_confirmation": pd.Series([True], index=index),
+        "trigger": pd.Series([False], index=index),
+        "risk_gate": pd.Series(["PASS"], index=index),
+        "market_gate": pd.Series(["PASS"], index=index),
+        "required_score": pd.Series([75.0], index=index),
+        "broad_rally_trigger": pd.Series([False], index=index),
+        "broad_rally_risk_gate": pd.Series(["PASS"], index=index),
+        "raw_score": pd.Series([49.0], index=index),
+        "broad_rally_active": pd.Series([False], index=index),
+    }
+
+    decision = strategy.rule_engine.resolve_decision(**common)
+    fraction = strategy.rule_engine.position_fraction(
+        decision,
+        quality,
+        pd.Series([False], index=index),
+    )
+    not_confirmed = strategy.rule_engine.resolve_decision(
+        **(common | {"next_day_confirmation": pd.Series([False], index=index)})
+    )
+    risk_failed = strategy.rule_engine.resolve_decision(
+        **(common | {"risk_gate": pd.Series(["FAIL"], index=index)})
+    )
+
+    assert decision.loc[0] == "BUY_SMALL"
+    assert fraction.loc[0] == pytest.approx(1 / 8)
+    assert not_confirmed.loc[0] == "AVOID"
+    assert risk_failed.loc[0] == "AVOID"
+
+
+def test_air_cycle_weak_bar_arms_watch_and_positive_bar_clears_for_confirmation() -> None:
+    strategy = LowEntryScoreV5Strategy()
+    assert strategy.rule_engine is not None
+    quality = evaluate_v5_quality(
+        _annual_fundamentals(),
+        _air_quality_snapshot(),
+        SIGNAL_DATE,
+    )
+    indicators = pd.DataFrame(
+        {
+            "pe": [8.0, 8.0],
+            "pe_median60": [9.0, 9.0],
+            "drawdown60": [-0.15, -0.12],
+            "price_position60": [0.25, 0.28],
+            "close": [90.0, 91.0],
+            "previous_high": [91.0, 91.0],
+            "previous_low20": [88.0, 88.0],
+            "clv": [-0.20, 0.30],
+            "low": [89.0, 89.0],
+            "open": [90.2, 90.0],
+            "new_low_count3": [0, 0],
+            "volume_ratio": [0.8, 0.8],
+            "weak_clv3": [False, False],
+            "ema5_slope": [-0.02, 0.01],
+            "r5": [-0.02, 0.01],
+            "atr_percent": [0.03, 0.03],
+            "drawdown20": [-0.10, -0.08],
+            "true_range": [2.0, 3.0],
+            "atr14": [3.0, 3.0],
+            "previous_midpoint": [90.0, 90.0],
+            "lower_shadow_ratio": [0.2, 0.2],
+            "cmf20": [-0.2, -0.1],
+            "broad_rally_regime": [False, False],
+            "high": [91.0, 92.0],
+        }
+    )
+    valuation = pd.Series([ValuationStatus.SUPPORTIVE.value] * 2)
+
+    panic = strategy.rule_engine.evaluate_panic(
+        indicators,
+        quality,
+        valuation,
+    )
+    confirmation = strategy.rule_engine.next_day_confirmation(
+        indicators,
+        pd.DataFrame({"reward_risk": [2.0, 2.0]}),
+        panic["state"],
+    )
+
+    assert panic["air_cycle_watch"].tolist() == [True, False]
+    assert panic["state"].tolist() == [
+        FallingKnifeState.REVERSAL_WATCH.value,
+        FallingKnifeState.CLEAR.value,
+    ]
+    assert confirmation.tolist() == [False, True]
+
+
+def test_high_quality_quiet_reversal_arms_conditional_pullback_starter() -> None:
+    strategy = LowEntryScoreV5Strategy()
+    assert strategy.rule_engine is not None
+    confirmed = evaluate_v5_quality(
+        _annual_fundamentals(),
+        _quality_snapshot(),
+        SIGNAL_DATE,
+    )
+    high_quality = replace(
+        confirmed,
+        final_status=FinalQualityStatus.CONFIRMED,
+        final_score=90.0,
+        hard_rejects=(),
+    )
+    indicators = pd.DataFrame(
+        {
+            "pe": [10.0, 9.5],
+            "pe_median60": [12.0, 12.0],
+            "drawdown60": [-0.10, -0.12],
+            "price_position60": [0.30, 0.20],
+            "close": [98.0, 99.0],
+            "previous_high": [100.0, 100.0],
+            "previous_low20": [97.0, 97.0],
+            "clv": [-0.20, 0.00],
+            "low": [97.5, 98.0],
+            "open": [98.2, 98.5],
+            "new_low_count3": [1, 1],
+            "volume_ratio": [0.30, 0.30],
+            "weak_clv3": [False, False],
+            "ema5_slope": [-0.02, -0.01],
+            "ema5": [99.0, 99.5],
+            "higher_low": [False, False],
+            "cmf20_improving": [False, False],
+            "normalized_obv_slope5": [-0.1, -0.1],
+            "r5": [-0.03, -0.02],
+            "atr_percent": [0.03, 0.03],
+            "drawdown20": [-0.10, -0.10],
+            "true_range": [2.0, 2.0],
+            "atr14": [3.0, 3.0],
+            "previous_midpoint": [98.5, 98.5],
+            "lower_shadow_ratio": [0.20, 0.20],
+            "cmf20": [-0.20, -0.15],
+            "broad_rally_regime": [False, False],
+            "high": [99.0, 100.0],
+        }
+    )
+    valuation = pd.Series([ValuationStatus.SUPPORTIVE.value] * 2)
+
+    panic = strategy.rule_engine.evaluate_panic(
+        indicators,
+        high_quality,
+        valuation,
+    )
+    lower_quality = strategy.rule_engine.evaluate_panic(
+        indicators,
+        replace(high_quality, final_score=84.99),
+        valuation,
+    )
+
+    assert panic["high_quality_reversal_trigger"].tolist() == [False, True]
+    assert panic["quality_pullback_trigger"].tolist() == [False, True]
+    assert panic["state"].iloc[-1] == FallingKnifeState.CLEAR.value
+    assert not lower_quality["high_quality_reversal_trigger"].iloc[-1]
+
+
+def test_high_quality_reversal_does_not_override_unresolved_support_break() -> None:
+    strategy = LowEntryScoreV5Strategy()
+    assert strategy.rule_engine is not None
+    confirmed = evaluate_v5_quality(
+        _annual_fundamentals(),
+        _quality_snapshot(),
+        SIGNAL_DATE,
+    )
+    high_quality = replace(
+        confirmed,
+        final_status=FinalQualityStatus.CONFIRMED,
+        final_score=90.0,
+        hard_rejects=(),
+    )
+    indicators = pd.DataFrame(
+        {
+            "pe": [9.5],
+            "pe_median60": [12.0],
+            "drawdown60": [-0.12],
+            "price_position60": [0.20],
+            "close": [96.5],
+            "previous_high": [100.0],
+            "previous_low20": [97.0],
+            "clv": [0.00],
+            "low": [95.5],
+            "open": [96.0],
+            "new_low_count3": [1],
+            "volume_ratio": [0.30],
+            "weak_clv3": [False],
+            "ema5_slope": [-0.01],
+            "ema5": [99.5],
+            "higher_low": [False],
+            "cmf20_improving": [False],
+            "normalized_obv_slope5": [-0.1],
+            "r5": [-0.02],
+            "atr_percent": [0.03],
+            "drawdown20": [-0.10],
+            "true_range": [2.0],
+            "atr14": [3.0],
+            "previous_midpoint": [96.0],
+            "lower_shadow_ratio": [0.40],
+            "cmf20": [-0.15],
+            "broad_rally_regime": [False],
+            "high": [97.5],
+        }
+    )
+
+    panic = strategy.rule_engine.evaluate_panic(
+        indicators,
+        high_quality,
+        pd.Series([ValuationStatus.SUPPORTIVE.value]),
+    )
+
+    assert not panic["high_quality_reversal_trigger"].iloc[0]
+    assert not panic["quality_pullback_trigger"].iloc[0]
 
 
 def test_v5_supportive_non_broad_path_emits_conditional_buy_small() -> None:

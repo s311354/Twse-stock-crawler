@@ -12,6 +12,7 @@ import requests
 from requests import Response
 from requests import exceptions as requests_exceptions
 from config.settings import AppSettings
+from domain.errors import AccessBlockedError
 from domain.errors import DataErrorCategory
 from domain.errors import DataSourceError
 from domain.errors import MarketClosedError
@@ -26,6 +27,7 @@ TwseMarketClosedError = MarketClosedError
 TwseNoDataError = NoDataError
 TwseSchemaChangedError = SchemaChangedError
 TwseNetworkError = NetworkError
+TwseAccessBlockedError = AccessBlockedError
 
 
 @dataclasses.dataclass(frozen=True)
@@ -286,6 +288,16 @@ class TwseHttpClient:
                     f"{context} failed during SSL compatibility fallback",
                     retryable=True,
                 ) from fallback_error
+        except requests_exceptions.TooManyRedirects as error:
+            # TWSE can poison a long-lived keep-alive session with a
+            # self-redirecting 308 response after many historical requests.
+            # A fresh session recovers the same bounded request without
+            # weakening TLS or changing the requested market dataset.
+            self.reset_session()
+            raise TwseNetworkError(
+                f"{context} exceeded redirects; HTTP session reset",
+                retryable=True,
+            ) from error
         except requests_exceptions.RequestException as error:
             raise TwseNetworkError(
                 f"{context} network request failed: {error}",

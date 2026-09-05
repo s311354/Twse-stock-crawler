@@ -35,6 +35,27 @@ from domain.strategies.portfolio_allocation_v1 import PortfolioAllocationRequest
 from domain.strategies.portfolio_allocation_v1 import PortfolioAllocationV1Strategy
 from domain.strategies.portfolio_allocation_v1 import PortfolioCandidateEvaluator
 from domain.strategies.portfolio_allocation_v1 import WeightAllocator
+from domain.strategies.portfolio_allocation_v2 import PAE_V2_MODEL_VERSION
+from domain.strategies.portfolio_allocation_v2 import PersistenceEvidenceV2
+from domain.strategies.portfolio_allocation_v2 import PortfolioActionV2
+from domain.strategies.portfolio_allocation_v2 import (
+    PortfolioAllocationDecisionV2,
+)
+from domain.strategies.portfolio_allocation_v2 import (
+    PortfolioAllocationEngineV2,
+)
+from domain.strategies.portfolio_allocation_v2 import (
+    PortfolioAllocationRequestV2,
+)
+from domain.strategies.portfolio_allocation_v2 import (
+    PortfolioAllocationV2Config,
+)
+from domain.strategies.portfolio_allocation_v2 import (
+    PortfolioAllocationV2Strategy,
+)
+from domain.strategies.portfolio_allocation_v2 import PortfolioBindingV2
+from domain.strategies.portfolio_allocation_v2 import PortfolioModeV2
+from domain.strategies.portfolio_allocation_v2 import PortfolioSecurityV2
 
 __all__ = [
     "ExpectedReturnExitStrategy",
@@ -72,4 +93,15 @@ __all__ = [
     "PortfolioAllocationV1Strategy",
     "PortfolioCandidateEvaluator",
     "WeightAllocator",
+    "PAE_V2_MODEL_VERSION",
+    "PersistenceEvidenceV2",
+    "PortfolioActionV2",
+    "PortfolioAllocationDecisionV2",
+    "PortfolioAllocationEngineV2",
+    "PortfolioAllocationRequestV2",
+    "PortfolioAllocationV2Config",
+    "PortfolioAllocationV2Strategy",
+    "PortfolioBindingV2",
+    "PortfolioModeV2",
+    "PortfolioSecurityV2",
 ]

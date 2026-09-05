@@ -3,34 +3,21 @@
 from __future__ import annotations
 
 import html
-from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections import Counter
 from collections.abc import Sequence
-from dataclasses import dataclass
 
 import pandas as pd
 from tabulate import tabulate
 
 from domain.model_contracts import StrategyDecision
-from domain.strategies.portfolio_allocation_v1 import PAE_V1_MODEL_VERSION
-
-
-@dataclass(frozen=True)
-class MetricColumn:
-    label: str
-    column: str
-    precision: int = 2
-
-
-class HtmlRenderer(ABC):
-    """Base renderer for strategy output embedded in email reports."""
-
-    @abstractmethod
-    def render(
-        self,
-        decisions: Sequence[StrategyDecision],
-    ) -> str:
-        pass
+from infrastructure.report.contracts import HtmlRenderer
+from infrastructure.report.contracts import MetricColumn
+from infrastructure.report.portfolio_renderer import (
+    PortfolioAllocationRenderer,
+)
+from infrastructure.report.portfolio_renderer import (
+    PortfolioAllocationV1Renderer,
+)
 
 
 class LowEntryHtmlRenderer(HtmlRenderer):
@@ -232,7 +219,13 @@ class ExpectedReturnExitV3Renderer(LowEntryHtmlRenderer):
             decision_note=(
                 "<strong>低點進場判斷決策</strong>：BUY &gt;= 75；WATCH = 60-74；WAIT &lt; 60。"
                 "<br><strong>預期報酬出場判斷決策</strong>（依 Holding Confidence）：STRONG HOLD &gt;= 85；"
-                "HOLD = 70-84；HOLD = 55-69；REDUCE 25% = 40-54；EXIT &lt; 40。"
+                "HOLD = 70-84；HOLD = 55-69；REDUCE 25%-50% = 40-54（HC 越低減越多）；"
+                "EXIT &lt; 40 立即退出。"
+                "BUY 且 Entry LES≥75：前 3 個持有交易日僅暫緩一般 REDUCE；"
+                "EARLY_BUY：前 2 個持有交易日採保守寬限；"
+                "BUY_SMALL：前 2 個持有交易日僅暫緩一般 REDUCE。"
+                "Entry LES 或成交訊號缺失不給寬限；"
+                "硬停損與基本面 Hard Risk 仍立即生效。"
                 "此分級以降低不必要換手與過度交易。"
                 "<br>風控採 ATR14：策略停損 = 收盤 - 2*ATR14；策略停利 = 收盤 + 3*ATR14。"
             ),
@@ -380,7 +373,12 @@ class LowEntryV41Renderer(LowEntryHtmlRenderer):
 
 
 class LowEntryV5Renderer(LowEntryHtmlRenderer):
-    _ENTRY_DECISIONS = frozenset({"BUY", "BUY_SMALL"})
+    _ENTRY_DECISIONS = frozenset({"BUY", "EARLY_BUY", "BUY_SMALL"})
+    _ENTRY_DECISION_ORDER = {
+        "BUY": 0,
+        "EARLY_BUY": 1,
+        "BUY_SMALL": 2,
+    }
 
     def __init__(self) -> None:
         super().__init__(
@@ -396,14 +394,19 @@ class LowEntryV5Renderer(LowEntryHtmlRenderer):
                 '<span style="color:#52665f">（Quality-First Panic Reversal）</span><br>'
                 "品質與估值先過關，再等待恐慌賣壓後的反轉確認。"
                 "只有 Trigger、Risk、流動性與市場資料 Gate 全部通過，"
-                "才產生 BUY／BUY_SMALL；高分不能抵銷 Hard Reject 或 Falling-Knife Veto。"
+                "才產生 BUY／EARLY_BUY／BUY_SMALL；高分不能抵銷 Hard Reject 或 "
+                "Falling-Knife Veto。"
                 "</div>"
                 '<div style="border-left:5px solid #356a9a;background:#f3f7fb;'
                 'padding:10px 12px">'
                 '<strong>EREM v3｜出場模式</strong><br>'
                 "評估趨勢、動能、波動、籌碼與剩餘報酬，目的是讓強勢部位續抱、"
                 "避免因正常回檔過度交易。85–100 STRONG HOLD；70–84 HOLD；"
-                "55–69 HOLD；40–54 REDUCE 25%；低於 40 EXIT。"
+                "55–69 HOLD；40–54 REDUCE 25%–50%（HC 越低減越多）；"
+                "低於 40 立即 EXIT。"
+                "BUY 且 Entry LES≥75 的一般 REDUCE 寬限 3 個持有交易日；BUY_SMALL 寬限 2 日；"
+                "EARLY_BUY 採保守 2 個持有交易日寬限；"
+                "Entry LES 或成交訊號缺失不給寬限，硬風控仍可立即退出。"
                 "</div></section>"
             ),
             metrics=[],
@@ -453,8 +456,8 @@ class LowEntryV5Renderer(LowEntryHtmlRenderer):
         {}
         <div>{}</div>
         <h4 style="margin:16px 0 6px">決策總覽</h4>
-        <div style="overflow-x:auto">
-          <table style="border-collapse:collapse;width:100%;font-size:13px" border="1" cellpadding="6">
+        <div class="decision-table-scroll" style="overflow-x:auto">
+          <table class="responsive-decision-table" aria-label="Low-Entry 與 EREM 決策總覽" style="border-collapse:collapse;width:100%;font-size:13px" border="1" cellpadding="6">
             <thead style="background:#eaf2ef">
               <tr>
                 <th>股票</th><th>現價</th><th>品質</th><th>估值</th>
@@ -495,35 +498,34 @@ class LowEntryV5Renderer(LowEntryHtmlRenderer):
                 if self._entry_decision(decision) in self._ENTRY_DECISIONS
             ),
             key=lambda decision: (
-                0 if self._entry_decision(decision) == "BUY" else 1,
+                self._ENTRY_DECISION_ORDER[self._entry_decision(decision)],
                 str(decision.value("證券代號", "")),
             ),
         )
         if not selected:
-            return """
-            <section data-section="entry-decisions" style="margin:14px 0;padding:12px;border:1px solid #d7dfdc;border-left:5px solid #6f7f79;background:#f7f9f8">
-              <h3 style="margin:0 0 6px;color:#174f43">進場決策彙整（BUY / BUY_SMALL）</h3>
-              <div>本次沒有 BUY / BUY_SMALL 可執行訊號。</div>
-            </section>
-            """
+            return self._render_no_entry_diagnostics(decisions)
 
         buy_count = sum(
             self._entry_decision(decision) == "BUY"
             for decision in selected
         )
-        buy_small_count = len(selected) - buy_count
+        early_buy_count = sum(
+            self._entry_decision(decision) == "EARLY_BUY"
+            for decision in selected
+        )
+        buy_small_count = len(selected) - buy_count - early_buy_count
         rows = "".join(
             self._render_entry_decision_row(decision)
             for decision in selected
         )
         return """
         <section data-section="entry-decisions" style="margin:14px 0;padding:12px;border:1px solid #b9d8cc;border-left:5px solid #176b4d;background:#f3faf7">
-          <h3 style="margin:0 0 5px;color:#174f43">進場決策彙整（BUY / BUY_SMALL）</h3>
+          <h3 style="margin:0 0 5px;color:#174f43">進場決策彙整（BUY / EARLY_BUY / BUY_SMALL）</h3>
           <div style="margin-bottom:8px;color:#38554b">
-            共 <strong>{}</strong> 檔｜BUY <strong>{}</strong>｜BUY_SMALL <strong>{}</strong>；僅列正式進場訊號。
+            共 <strong>{}</strong> 檔｜BUY <strong>{}</strong>｜EARLY_BUY <strong>{}</strong>｜BUY_SMALL <strong>{}</strong>；僅列可執行進場訊號。
           </div>
-          <div style="overflow-x:auto">
-            <table style="border-collapse:collapse;width:100%;font-size:13px;background:#fff" border="1" cellpadding="6">
+          <div class="decision-table-scroll" style="overflow-x:auto">
+            <table class="responsive-decision-table" aria-label="可執行進場決策" style="border-collapse:collapse;width:100%;font-size:13px;background:#fff" border="1" cellpadding="6">
               <thead style="background:#dcefe7">
                 <tr>
                   <th>股票</th><th>進場決策</th><th>執行價格</th>
@@ -534,10 +536,133 @@ class LowEntryV5Renderer(LowEntryHtmlRenderer):
             </table>
           </div>
           <div style="margin-top:7px;font-size:12px;color:#52665f">
-            BUY_SMALL 為縮小部位訊號；實際成交仍依 Entry Rule 與下一交易日價格確認。
+            EARLY_BUY 採 0.65 execution factor；BUY_SMALL 採縮小部位配置。實際成交仍依 Entry Rule 與下一交易日價格確認。
           </div>
         </section>
-        """.format(len(selected), buy_count, buy_small_count, rows)
+        """.format(
+            len(selected),
+            buy_count,
+            early_buy_count,
+            buy_small_count,
+            rows,
+        )
+
+    def _render_no_entry_diagnostics(
+        self,
+        decisions: Sequence[StrategyDecision],
+    ) -> str:
+        """Explain the no-action state without changing model decisions."""
+        decision_counts = Counter(
+            self._entry_decision(decision) or "UNKNOWN"
+            for decision in decisions
+        )
+        distribution = "｜".join(
+            "{} <strong>{}</strong>".format(html.escape(name), count)
+            for name, count in sorted(
+                decision_counts.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+        )
+        candidates = sorted(
+            decisions,
+            key=lambda decision: (
+                -self._numeric_score(decision.value("低點分數")),
+                str(decision.value("證券代號", "")),
+            ),
+        )[:3]
+        rows = "".join(
+            self._render_no_entry_diagnostic_row(decision)
+            for decision in candidates
+        )
+        diagnostic_table = ""
+        if rows:
+            diagnostic_table = """
+            <div style="margin:9px 0 5px;font-weight:700;color:#38554b">最高 LES 非執行候選</div>
+            <div class="decision-table-scroll" style="overflow-x:auto">
+              <table class="responsive-decision-table" aria-label="未執行候選診斷" style="border-collapse:collapse;width:100%;font-size:13px;background:#fff" border="1" cellpadding="6">
+                <thead style="background:#edf1ef">
+                  <tr>
+                    <th>股票</th><th>目前決策</th><th>LES／門檻</th>
+                    <th>品質</th><th>估值</th><th>Falling-Knife</th>
+                    <th>Trigger／Risk</th>
+                  </tr>
+                </thead>
+                <tbody>{}</tbody>
+              </table>
+            </div>
+            <div style="margin-top:6px;font-size:12px;color:#5f6d68">
+              依 LES 分數列出最多三檔，僅用於定位阻擋狀態，不代表可執行或可繞過任何 Gate。
+            </div>
+            """.format(rows)
+
+        return """
+        <section data-section="entry-decisions" style="margin:14px 0;padding:12px;border:1px solid #d7dfdc;border-left:5px solid #6f7f79;background:#f7f9f8">
+          <h3 style="margin:0 0 6px;color:#174f43">進場決策彙整（BUY / EARLY_BUY / BUY_SMALL）</h3>
+          <div>本次沒有 BUY / EARLY_BUY / BUY_SMALL 可執行訊號；共分析 <strong>{}</strong> 檔。</div>
+          <div style="margin-top:7px;color:#52665f">決策分布：{}</div>
+          {}
+        </section>
+        """.format(
+            len(decisions),
+            distribution or "無可用決策",
+            diagnostic_table,
+        )
+
+    def _render_no_entry_diagnostic_row(
+        self,
+        decision: StrategyDecision,
+    ) -> str:
+        cells = (
+            "<strong>{}</strong><br><small>{}</small>".format(
+                self._safe_text(decision.value("證券代號")),
+                self._safe_text(decision.value("證券名稱")),
+            ),
+            self._badge(self._entry_decision(decision) or "UNKNOWN"),
+            "實際 <strong>{}</strong>／門檻 {}{}".format(
+                self._format_value(decision.value("低點分數"), 0),
+                self._format_value(
+                    decision.value("Required Technical Score"),
+                    0,
+                ),
+                self._score_gap_text(
+                    decision.value("低點分數"),
+                    decision.value("Required Technical Score"),
+                ),
+            ),
+            self._badge(decision.value("LES v5 Final Quality Status")),
+            self._badge(decision.value("Valuation Gate")),
+            self._badge(decision.value("Falling Knife State")),
+            "Trigger {}<br>{}".format(
+                self._format_flag(decision.value("LES v5 Trigger")),
+                self._badge(decision.value("Risk Gate")),
+            ),
+        )
+        labels = (
+            "股票",
+            "目前決策",
+            "LES／門檻",
+            "品質",
+            "估值",
+            "Falling-Knife",
+            "Trigger／Risk",
+        )
+        return "<tr>{}</tr>".format(
+            "".join(
+                '<td data-label="{}" style="vertical-align:top">{}</td>'.format(
+                    html.escape(label),
+                    cell,
+                )
+                for label, cell in zip(labels, cells)
+            )
+        )
+
+    def _numeric_score(self, value: object) -> float:
+        if self._is_missing(value):
+            return float("-inf")
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("-inf")
 
     def _render_entry_decision_row(
         self,
@@ -583,10 +708,21 @@ class LowEntryV5Renderer(LowEntryHtmlRenderer):
             risk,
             confirmation,
         )
+        labels = (
+            "股票",
+            "進場決策",
+            "執行價格",
+            "部位",
+            "風控",
+            "訊號確認",
+        )
         return "<tr>{}</tr>".format(
             "".join(
-                '<td style="vertical-align:top">{}</td>'.format(cell)
-                for cell in cells
+                '<td data-label="{}" style="vertical-align:top">{}</td>'.format(
+                    html.escape(label),
+                    cell,
+                )
+                for label, cell in zip(labels, cells)
             )
         )
 
@@ -596,11 +732,11 @@ class LowEntryV5Renderer(LowEntryHtmlRenderer):
 
     @staticmethod
     def _entry_decision_badge(decision: str) -> str:
-        colors = (
-            ("#176b4d", "#dff3e9")
-            if decision == "BUY"
-            else ("#8a5700", "#fff0c2")
-        )
+        colors = {
+            "BUY": ("#176b4d", "#dff3e9"),
+            "EARLY_BUY": ("#285a8a", "#e4f0fb"),
+            "BUY_SMALL": ("#8a5700", "#fff0c2"),
+        }.get(decision, ("#4c5c56", "#edf1ef"))
         return (
             '<span style="display:inline-block;padding:3px 8px;'
             'border-radius:10px;font-weight:700;color:{};background:{}">{}</span>'
@@ -668,10 +804,26 @@ class LowEntryV5Renderer(LowEntryHtmlRenderer):
             self._badge(decision.value("低點決策")),
             self._badge(decision.value("EREM 決策訊號")),
         )
+        labels = (
+            "股票",
+            "現價",
+            "品質",
+            "估值",
+            "反轉狀態",
+            "LES v5 進場分數",
+            "EREM v3 持有分數",
+            "Trigger／Risk",
+            "部位與價格",
+            "進場決策",
+            "EREM 出場決策",
+        )
         return "<tr>{}</tr>".format(
             "".join(
-                '<td style="vertical-align:top">{}</td>'.format(cell)
-                for cell in cells
+                '<td data-label="{}" style="vertical-align:top">{}</td>'.format(
+                    html.escape(label),
+                    cell,
+                )
+                for label, cell in zip(labels, cells)
             )
         )
 
@@ -875,376 +1027,85 @@ class LowEntryV5Renderer(LowEntryHtmlRenderer):
             return False
 
 
-class PortfolioAllocationV1Renderer(HtmlRenderer):
-    """Render the aggregate PAE decision without recalculating its rules."""
-
-    _MATERIAL_ACTIONS = frozenset(
-        {
-            "STRONG_ADD",
-            "ADD",
-            "STARTER",
-            "HOLD_REVIEW",
-            "REDUCE_25",
-            "ROTATE_25",
-            "ROTATE_50",
-            "ROTATE_75",
-            "FAST_TRACK_ROTATE",
-            "EXIT",
-            "EXIT_AND_REALLOCATE",
-            "EXIT_TO_CASH",
-        }
-    )
-
-    def render(
-        self,
-        decisions: Sequence[StrategyDecision],
-    ) -> str:
-        for decision in decisions:
-            if not isinstance(decision, StrategyDecision):
-                raise TypeError(
-                    "HtmlRenderer accepts StrategyDecision objects only"
-                )
-        pae_decisions = self.latest_by_symbol(
-            decision
-            for decision in decisions
-            if decision.value("PAE Status") is not None
-        )
-        if not pae_decisions:
-            return ""
-
-        first = pae_decisions[0]
-        strategic_count = sum(
-            self._truth(decision.value("PAE Strategic Candidate"))
-            for decision in pae_decisions
-        )
-        executable_count = sum(
-            self._truth(decision.value("PAE Executable Candidate"))
-            for decision in pae_decisions
-        )
-        selected = self._selected(pae_decisions)
-        rows = "".join(self._row(decision) for decision in selected)
-        mode = self._text(first.value("PAE Mode"))
-        mode_note = {
-            "COLD_START": (
-                "目前 0 檔有效持股；只有完整通過 Quality、Valuation、CER、LES 與風控的候選才配置資金。"
-            ),
-            "BUILDING": (
-                "目前 1 檔有效持股，處於第二檔建構期；候選須通過絕對品質、估值、CER、LES 與風控門檻，但不套用成對支配與輪動門檻。"
-            ),
-            "STEADY_STATE": (
-                "目前至少 2 檔有效持股；新標的必須通過品質優勢與 Switch Hurdle 的 CER 優勢，才可取得資金。"
-            ),
-        }.get(mode, "無法判定投資組合階段；本次結果僅供資料檢查。")
-        candidate_label = (
-            "Dual" if mode == "STEADY_STATE" else "Absolute"
-        )
-        summary_note = (
-            "僅列持股、配置異動與最佳雙重支配候選。"
-            if mode == "STEADY_STATE"
-            else "僅列持股、配置異動與最佳絕對合格候選。"
-        )
-        table = (
-            """
-            <div style="overflow-x:auto">
-              <table style="border-collapse:collapse;width:100%;font-size:13px;background:#fff" border="1" cellpadding="6">
-                <thead style="background:#edf3f7">
-                  <tr>
-                    <th>股票／角色</th><th>品質／CER</th><th>候選資格</th>
-                    <th>目前 → 目標</th><th>品質＋CER 支配證據</th><th>PAE 決策</th>
-                  </tr>
-                </thead>
-                <tbody>{}</tbody>
-              </table>
-            </div>
-            """.format(rows)
-            if rows
-            else (
-                '<div style="padding:9px;background:#fff">'
-                "本次沒有需要列出的持股或可執行配置；未使用資金維持現金。"
-                "</div>"
-            )
-        )
-        return """
-        <section data-section="portfolio-allocation" style="margin:16px 0;padding:12px;border:1px solid #bfd0dc;border-left:5px solid #295f7a;background:#f5f9fb">
-          <h3 style="margin:0 0 6px;color:#204f66">投資組合配置（PAE v{}）</h3>
-          <div style="margin-bottom:9px;color:#3f5662">
-            <strong>{}</strong>：{} PAE 消費 LES v5／EREM v3 已發布決策，不重算技術指標。
-          </div>
-          <div style="display:flex;flex-wrap:wrap;gap:7px;margin-bottom:10px">
-            {}
-            {}
-            {}
-            {}
-            {}
-            {}
-          </div>
-          <div style="margin-bottom:8px;font-size:12px;color:#526770">
-            分析 {} 檔｜{} Strategic {}｜{} Executable {}｜{}
-          </div>
-          {}
-        </section>
-        """.format(
-            html.escape(PAE_V1_MODEL_VERSION),
-            html.escape(mode or "DATA_INSUFFICIENT"),
-            html.escape(mode_note),
-            self._metric(
-                "必要報酬",
-                self._percent(first.value("PAE Required Return")),
-            ),
-            self._metric(
-                "目標現金",
-                self._percent(first.value("PAE Target Cash Weight")),
-            ),
-            self._metric(
-                "組合 CER",
-                self._percent(first.value("PAE Portfolio Expected CER")),
-            ),
-            self._metric(
-                "最佳可執行",
-                self._text(first.value("PAE Best Executable Alternative")),
-            ),
-            self._metric("狀態", self._text(first.value("PAE Status"))),
-            self._metric(
-                "持股基準",
-                self._text(first.value("PAE Portfolio Input")),
-            ),
-            len(pae_decisions),
-            candidate_label,
-            strategic_count,
-            candidate_label,
-            executable_count,
-            summary_note,
-            table,
-        )
-
-    @classmethod
-    def latest_by_symbol(
-        cls,
-        decisions: Iterable[StrategyDecision],
-    ) -> tuple[StrategyDecision, ...]:
-        """Keep one deterministic PAE row per stock code."""
-        latest: dict[str, StrategyDecision] = {}
-        for decision in decisions:
-            symbol = cls._raw_text(decision.value("證券代號"))
-            if not symbol:
-                continue
-            current = latest.get(symbol)
-            if current is None or decision.evaluated_at >= current.evaluated_at:
-                latest[symbol] = decision
-        return tuple(latest[symbol] for symbol in sorted(latest))
-
-    @staticmethod
-    def _raw_text(value: object) -> str:
-        if value is None:
-            return ""
-        try:
-            if bool(pd.isna(value)):
-                return ""
-        except (TypeError, ValueError):
-            pass
-        return str(value).strip()
-
-    def _selected(
-        self,
-        decisions: Sequence[StrategyDecision],
-    ) -> tuple[StrategyDecision, ...]:
-        first = decisions[0]
-        alternatives = {
-            self._text(first.value("PAE Best Strategic Alternative")),
-            self._text(first.value("PAE Best Executable Alternative")),
-        }
-        selected = [
-            decision
-            for decision in decisions
-            if self._text(decision.value("PAE Role")) == "HOLDING"
-            or self._number(decision.value("PAE Target Weight")) > 0
-            or self._text(decision.value("PAE Decision")) in self._MATERIAL_ACTIONS
-            or self._text(decision.value("證券代號")) in alternatives
-        ]
-        return tuple(
-            sorted(
-                selected,
-                key=lambda decision: (
-                    0
-                    if self._text(decision.value("PAE Role")) == "HOLDING"
-                    else 1,
-                    -self._number(decision.value("PAE Target Weight")),
-                    self._text(decision.value("證券代號")),
-                ),
-            )[:12]
-        )
-
-    def _row(self, decision: StrategyDecision) -> str:
-        stock = "<strong>{}</strong><br><small>{}</small><br>{}".format(
-            self._text(decision.value("證券代號")),
-            self._text(decision.value("證券名稱")),
-            self._badge(decision.value("PAE Role")),
-        )
-        returns = "Quality <strong>{}</strong><br>CER <strong>{}</strong><br><small>Required {}｜Edge {}</small>".format(
-            self._decimal(decision.value("PAE Quality Score"), 2),
-            self._percent(decision.value("PAE CER")),
-            self._percent(decision.value("PAE Required Return")),
-            self._percent(decision.value("PAE Opportunity Edge")),
-        )
-        eligibility = "Strategic {}｜Executable {}<br><small>Dual {}｜Claim {}</small>".format(
-            self._flag(decision.value("PAE Strategic Candidate")),
-            self._flag(decision.value("PAE Executable Candidate")),
-            self._flag(decision.value("PAE Dual Dominance Candidate")),
-            self._decimal(decision.value("PAE Capital Claim"), 4),
-        )
-        weights = "{} → <strong>{}</strong><br><small>Δ {}</small>".format(
-            self._percent(decision.value("PAE Current Weight")),
-            self._percent(decision.value("PAE Target Weight")),
-            self._signed_percent(decision.value("PAE Weight Change")),
-        )
-        replacement = "{} vs {}<br><small>Quality Δ {} / required {} ({})<br>CER excess {} / hurdle {} ({})<br>Dual {}｜Persistence {}</small>".format(
-            self._text(decision.value("PAE Alternative")),
-            self._text(decision.value("PAE Dominance Incumbent")),
-            self._signed_decimal(decision.value("PAE Quality Advantage"), 2),
-            self._decimal(decision.value("PAE Required Quality Advantage"), 2),
-            self._text(decision.value("PAE Quality Dominance Gate")),
-            self._percent(decision.value("PAE Excess Opportunity")),
-            self._percent(decision.value("PAE Switch Hurdle")),
-            self._text(decision.value("PAE CER Dominance Gate")),
-            self._text(decision.value("PAE Dual Dominance Gate")),
-            self._flag(decision.value("PAE Persistence Gate")),
-        )
-        final = (
-            "{}<br><small>{}</small>"
-            "<br><small>QualityProtect {} | Stop {} | EREM Persist {} | "
-            "TrendBreak {} | ValuationBreak {} | Confirm {}/3</small>"
-        ).format(
-            self._badge(decision.value("PAE Decision")),
-            self._text(decision.value("PAE Reason")),
-            self._flag(decision.value("PAE High Quality Protected")),
-            self._flag(decision.value("PAE Strategy Stop Breached")),
-            self._flag(decision.value("PAE EREM Exit Persistent")),
-            self._flag(decision.value("PAE Trend Broken")),
-            self._flag(decision.value("PAE Valuation Broken")),
-            self._decimal(decision.value("PAE Exit Confirmation Count"), 0),
-        )
-        return "<tr>{}</tr>".format(
-            "".join(
-                '<td style="vertical-align:top">{}</td>'.format(cell)
-                for cell in (
-                    stock,
-                    returns,
-                    eligibility,
-                    weights,
-                    replacement,
-                    final,
-                )
-            )
-        )
-
-    @staticmethod
-    def _metric(label: str, value: str) -> str:
-        return (
-            '<div style="min-width:125px;padding:7px 9px;border:1px solid #cad8e1;'
-            'background:#fff"><small style="color:#62737c">{}</small><br>'
-            "<strong>{}</strong></div>"
-        ).format(html.escape(label), value)
-
-    @staticmethod
-    def _text(value: object) -> str:
-        if value is None:
-            return "N/A"
-        try:
-            if bool(pd.isna(value)):
-                return "N/A"
-        except (TypeError, ValueError):
-            pass
-        text = str(value).strip()
-        return html.escape(text) if text else "N/A"
-
-    @staticmethod
-    def _number(value: object) -> float:
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            return 0.0
-        return numeric if pd.notna(numeric) else 0.0
-
-    @classmethod
-    def _percent(cls, value: object) -> str:
-        if value is None:
-            return "N/A"
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            return cls._text(value)
-        if pd.isna(numeric):
-            return "N/A"
-        return "{:.1f}%".format(numeric * 100)
-
-    @classmethod
-    def _signed_percent(cls, value: object) -> str:
-        if value is None:
-            return "N/A"
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            return cls._text(value)
-        if pd.isna(numeric):
-            return "N/A"
-        return "{:+.1f}%".format(numeric * 100)
-
-    @classmethod
-    def _decimal(cls, value: object, precision: int) -> str:
-        if value is None:
-            return "N/A"
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            return cls._text(value)
-        if pd.isna(numeric):
-            return "N/A"
-        return ("{:.%df}" % precision).format(numeric)
-
-    @classmethod
-    def _signed_decimal(cls, value: object, precision: int) -> str:
-        if value is None:
-            return "N/A"
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            return cls._text(value)
-        if pd.isna(numeric):
-            return "N/A"
-        return ("{:+.%df}" % precision).format(numeric)
-
-    @classmethod
-    def _flag(cls, value: object) -> str:
-        return "YES" if cls._truth(value) else "NO"
-
-    @staticmethod
-    def _truth(value: object) -> bool:
-        if isinstance(value, bool):
-            return value
-        return str(value).strip().lower() in {"1", "true", "yes", "pass"}
-
-    @classmethod
-    def _badge(cls, value: object) -> str:
-        text = cls._text(value)
-        normalized = html.unescape(text).upper()
-        if any(token in normalized for token in ("EXIT", "FAIL", "INSUFFICIENT")):
-            colors = ("#8f1d1d", "#fdecec")
-        elif any(token in normalized for token in ("HOLD", "WATCH", "CANDIDATE")):
-            colors = ("#755000", "#fff4d6")
-        else:
-            colors = ("#176b4d", "#e7f5ee")
-        return (
-            '<span style="display:inline-block;padding:2px 6px;border-radius:10px;'
-            'font-weight:600;color:{};background:{}">{}</span>'
-        ).format(colors[0], colors[1], text)
-
-
 class DailyStrategyEmailRenderer(HtmlRenderer):
     """Compose each decision card once, followed by the detailed report."""
 
+    _RESPONSIVE_STYLE = """
+    <style>
+      .twse-daily-report {
+        box-sizing: border-box;
+        color: #263d47;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        line-height: 1.45;
+        margin: 0 auto;
+        max-width: 1180px;
+        width: 100%;
+      }
+      .twse-daily-report *, .twse-daily-report *::before,
+      .twse-daily-report *::after { box-sizing: border-box; }
+      .twse-daily-report .responsive-decision-table th,
+      .twse-daily-report .responsive-decision-table td {
+        overflow-wrap: anywhere;
+      }
+      @media only screen and (max-width: 720px) {
+        .twse-daily-report { font-size: 15px; }
+        .twse-daily-report .decision-table-scroll { overflow: visible !important; }
+        .twse-daily-report .responsive-decision-table,
+        .twse-daily-report .responsive-decision-table tbody,
+        .twse-daily-report .responsive-decision-table tr,
+        .twse-daily-report .responsive-decision-table td {
+          display: block !important;
+          width: 100% !important;
+        }
+        .twse-daily-report .responsive-decision-table thead {
+          border: 0 !important;
+          clip: rect(0 0 0 0) !important;
+          height: 1px !important;
+          margin: -1px !important;
+          overflow: hidden !important;
+          padding: 0 !important;
+          position: absolute !important;
+          width: 1px !important;
+        }
+        .twse-daily-report .responsive-decision-table {
+          background: transparent !important;
+          border: 0 !important;
+        }
+        .twse-daily-report .responsive-decision-table tr {
+          background: #fff;
+          border: 1px solid #cbd8d3;
+          border-radius: 8px;
+          margin: 0 0 12px;
+          overflow: hidden;
+        }
+        .twse-daily-report .responsive-decision-table td {
+          border: 0 !important;
+          border-bottom: 1px solid #e5ece9 !important;
+          display: grid !important;
+          gap: 8px;
+          grid-template-columns: minmax(104px, 35%) minmax(0, 1fr);
+          min-height: 42px;
+          padding: 9px 10px !important;
+          text-align: left !important;
+        }
+        .twse-daily-report .responsive-decision-table td:last-child {
+          border-bottom: 0 !important;
+        }
+        .twse-daily-report .responsive-decision-table td::before {
+          color: #52665f;
+          content: attr(data-label);
+          font-size: 12px;
+          font-weight: 700;
+          letter-spacing: .02em;
+        }
+        .twse-daily-report section { padding-left: 10px !important; padding-right: 10px !important; }
+      }
+    </style>
+    """
+
     def __init__(self) -> None:
         self.entry_renderer = LowEntryV5Renderer()
-        self.portfolio_renderer = PortfolioAllocationV1Renderer()
+        self.portfolio_renderer = PortfolioAllocationRenderer()
 
     def render(
         self,
@@ -1258,13 +1119,21 @@ class DailyStrategyEmailRenderer(HtmlRenderer):
             include_entry_summary=False,
         )
         return """
-        <section data-section="daily-decision-cards" style="margin:12px 0 18px">
-          <h2 style="margin:0 0 8px;color:#263d47">今日決策卡</h2>
-          {}
-          {}
-        </section>
         {}
-        """.format(entry_card, portfolio_card, details)
+        <main class="twse-daily-report">
+          <section data-section="daily-decision-cards" style="margin:12px 0 18px">
+            <h2 style="margin:0 0 8px;color:#263d47">今日決策卡</h2>
+            {}
+            {}
+          </section>
+          {}
+        </main>
+        """.format(
+            self._RESPONSIVE_STYLE,
+            entry_card,
+            portfolio_card,
+            details,
+        )
 
 
 class RendererFactory:
@@ -1276,7 +1145,8 @@ class RendererFactory:
         "low_entry_score_v4_1": LowEntryV41Renderer(),
         "low_entry_score_v5": LowEntryV5Renderer(),
         "expected_return_exit_v3": ExpectedReturnExitV3Renderer(),
-        "portfolio_allocation_v1": PortfolioAllocationV1Renderer(),
+        "portfolio_allocation_v1": PortfolioAllocationRenderer(),
+        "portfolio_allocation_v2": PortfolioAllocationRenderer(),
         "daily_strategy_email": DailyStrategyEmailRenderer(),
     }
 

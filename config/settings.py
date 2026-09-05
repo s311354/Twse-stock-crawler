@@ -13,8 +13,13 @@ from pathlib import Path
 from domain.models import PortfolioPosition
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = PROJECT_ROOT / "data"
+_SOURCE_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(
+    os.environ.get("TWSE_PROJECT_ROOT", str(_SOURCE_PROJECT_ROOT))
+).expanduser().resolve()
+DATA_DIR = Path(
+    os.environ.get("TWSE_DATA_DIR", str(PROJECT_ROOT / "data"))
+).expanduser().resolve()
 CHART_PATH = PROJECT_ROOT / "max_profit_analysis_chart.png"
 ENV_FILES = (PROJECT_ROOT / ".env", PROJECT_ROOT / ".env.example")
 QUERY_WAIT_SECONDS = 12
@@ -88,6 +93,7 @@ def _parse_pae_positions(values: Mapping[str, str]) -> tuple[PortfolioPosition, 
         "shares",
         "average_cost",
         "entry_les",
+        "entry_decision",
         "entry_date",
         "sector",
         "correlation_cluster",
@@ -128,6 +134,7 @@ def _parse_pae_positions(values: Mapping[str, str]) -> tuple[PortfolioPosition, 
                         if item.get("entry_les") is not None
                         else None
                     ),
+                    entry_decision=item.get("entry_decision"),
                     entry_date=item.get("entry_date"),
                     sector=item.get("sector"),
                     correlation_cluster=item.get("correlation_cluster"),

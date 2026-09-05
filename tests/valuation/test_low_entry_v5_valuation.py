@@ -210,6 +210,7 @@ def test_supportive_tier_rejects_excessive_permanent_loss() -> None:
 def test_air_cycle_profile_allows_only_supportive_tier_near_cycle_value() -> None:
     air_snapshot = _snapshot()
     air_snapshot["sector"] = "15"
+    air_snapshot["issuer_symbol"] = "2610"
     result = LowEntryV5ValuationProducer().produce(
         _annual(),
         air_snapshot,
@@ -233,6 +234,7 @@ def test_air_cycle_profile_allows_only_supportive_tier_near_cycle_value() -> Non
 def test_air_cycle_profile_does_not_make_excessive_downside_supportive() -> None:
     air_snapshot = _snapshot()
     air_snapshot["sector"] = "15"
+    air_snapshot["issuer_symbol"] = "2610"
     result = LowEntryV5ValuationProducer().produce(
         _annual(),
         air_snapshot,

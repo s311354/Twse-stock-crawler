@@ -125,7 +125,7 @@ def _daily_decision() -> StrategyDecision:
         "PAE Portfolio Expected CER": 0.16,
         "PAE Decision": "ADD",
         "PAE Reason": "COLD_START_EXECUTABLE",
-        "PAE Model Version": "1.1.5",
+        "PAE Model Version": "1.2.1",
     }
     fields = tuple(
         DecisionField(

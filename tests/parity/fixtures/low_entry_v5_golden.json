@@ -132,7 +132,7 @@
     "Security Type",
     "Issuer Symbol"
   ],
-  "score": 12.0,
+  "score": 15.0,
   "decision": "PANIC_WATCH",
-  "reason": "Quality=QUALITY_CONFIRMED(Final=100.0；Base=100.0/99.25；Extended=100.0/100.0；Critical=100.0)；Valuation=PASS(NONE)；分數=11/7/0/0/0/4；Penalty=-10；Falling=PANIC_WATCH(HIGH_VOLUME_WEAK_CLOSE；CONFIRMED_SUPPORT_BREAKDOWN；ACCELERATING_DECLINE)；Panic/Reversal=4/0；Trigger=NO；Risk=UNKNOWN(NO_CONFIRMED_SWING_LOW；LIQUIDITY_UNKNOWN)；BroadRally=NO/FAIL/Full=NO/Absorb=NO/MultiDay=NO/Retest=NO/Reclaim=NO；SupportiveNonBroad=NO；QualityPullback=NO；Required=75；決策=PANIC_WATCH"
+  "reason": "Quality=QUALITY_CONFIRMED(Final=100.0；Base=100.0/99.25；Extended=100.0/100.0；Critical=100.0)；Valuation=PASS(NONE)；分數=11/10/0/0/0/4；Penalty=-10；Falling=PANIC_WATCH(HIGH_VOLUME_WEAK_CLOSE；CONFIRMED_SUPPORT_BREAKDOWN；ACCELERATING_DECLINE)；Panic/Reversal=4/0；Trigger=NO；Risk=UNKNOWN(NO_CONFIRMED_SWING_LOW；LIQUIDITY_UNKNOWN)；BroadRally=NO/FAIL/Full=NO/Absorb=NO/MultiDay=NO/Retest=NO/Reclaim=NO；SupportiveNonBroad=NO；QualityPullback=NO；HighQualityReversal=NO；AirCycleWatch=NO；Required=75；決策=PANIC_WATCH"
 }

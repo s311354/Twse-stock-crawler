@@ -35,7 +35,7 @@ def test_list_strategies_shows_version_and_description(capsys):
     assert "Quality-first panic reversal" in captured.out
     
     # Check EREM v3 metadata
-    assert "3.1.0" in captured.out
+    assert "3.2.4" in captured.out
     assert "decaying Entry LES memory" in captured.out
 
 
@@ -54,11 +54,12 @@ def test_available_strategies_returns_all_builtin_names():
     names = available_strategies()
     
     assert isinstance(names, list)
-    assert len(names) == 10  # Should have all 10 builtin strategies
+    assert len(names) == 11
     assert "low_entry_score_v5" in names
     assert "expected_return_exit_v3" in names
     assert "low_entry_score_v4_1" in names
     assert "portfolio_allocation_v1" in names
+    assert "portfolio_allocation_v2" in names
 
 
 def test_strategy_registry_all_method_returns_strategy_objects():

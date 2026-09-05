@@ -24,6 +24,7 @@ def make_history(include_optional_inputs: bool = True) -> pd.DataFrame:
             {
                 "TAIEX Close": [100 + index * 0.03 for index in range(count)],
                 "Entry LES": [math.nan] * (count - 30) + [80.0] + [math.nan] * 29,
+                "Entry Decision": [pd.NA] * (count - 30) + ["BUY"] * 30,
                 "Holding Days": [math.nan] * (count - 30) + list(range(30)),
                 "Turnover": [1.0] * (count - 1) + [2.5],
             }
@@ -39,7 +40,9 @@ def decision_for(score: float) -> str:
     if score >= 55:
         return "HOLD"
     if score >= 40:
-        return "REDUCE 25%"
+        continuous = 25 + ((54 - score) / 14 * 25)
+        percentage = min(50, max(25, math.floor((continuous + 2.5) / 5) * 5))
+        return f"REDUCE {percentage}%"
     return "EXIT"
 
 
@@ -58,7 +61,26 @@ def test_expected_return_exit_v3_decision_boundaries_avoid_overtrading() -> None
         "HOLD",
         "HOLD",
         "REDUCE 25%",
+        "REDUCE 50%",
+        "EXIT",
+    ]
+
+
+def test_expected_return_exit_v3_reduction_scales_with_lower_confidence() -> None:
+    confidence = pd.Series([55, 54, 52, 49, 46, 43, 40, 39.99])
+    strategy = ExpectedReturnExitV3Strategy()
+
+    reduction = strategy._recommended_reduction_percentage(confidence)
+
+    assert reduction.tolist() == [0, 25, 30, 35, 40, 45, 50, 100]
+    assert strategy._decision(confidence, reduction).tolist() == [
+        "HOLD",
         "REDUCE 25%",
+        "REDUCE 30%",
+        "REDUCE 35%",
+        "REDUCE 40%",
+        "REDUCE 45%",
+        "REDUCE 50%",
         "EXIT",
     ]
 
@@ -69,6 +91,141 @@ def test_expected_return_exit_v3_counts_consecutive_exit_warnings() -> None:
     )
 
     assert streak.tolist() == [0, 1, 2, 0, 1]
+
+
+def test_expected_return_exit_v3_exits_immediately_below_40() -> None:
+    strategy = ExpectedReturnExitV3Strategy()
+    confidence = pd.Series([39.0, 39.0])
+    missing = pd.Series([math.nan, math.nan])
+
+    streak, confirmed, grace, profile = strategy._exit_confirmation(
+        holding_confidence=confidence,
+        entry_les=missing,
+        holding_days=missing,
+        entry_decision=pd.Series([pd.NA, pd.NA], dtype="string"),
+    )
+    decision = strategy._decision(
+        confidence,
+        exit_confirmed=confirmed,
+        entry_grace=grace,
+    )
+
+    assert streak.tolist() == [1, 2]
+    assert confirmed.tolist() == [False, True]
+    assert profile.tolist() == ["NONE", "NONE"]
+    assert decision.tolist() == ["EXIT", "EXIT"]
+
+
+def test_expected_return_exit_v3_tracks_streak_without_delaying_exit() -> None:
+    strategy = ExpectedReturnExitV3Strategy()
+    confidence = pd.Series([35.0, 35.0, 35.0, 35.0, 35.0, 35.0])
+    entry_les = pd.Series([math.nan, math.nan, math.nan, 78.0, 78.0, 78.0])
+    holding_days = pd.Series([math.nan, math.nan, math.nan, 0.0, 1.0, 2.0])
+    entry_decision = pd.Series(
+        [pd.NA, pd.NA, pd.NA, "BUY", "BUY", "BUY"],
+        dtype="string",
+    )
+
+    streak, confirmed, grace, profile = strategy._exit_confirmation(
+        holding_confidence=confidence,
+        entry_les=entry_les,
+        holding_days=holding_days,
+        entry_decision=entry_decision,
+    )
+    decision = strategy._decision(
+        confidence,
+        exit_confirmed=confirmed,
+        entry_grace=grace,
+    )
+
+    assert streak.tolist() == [0, 0, 0, 1, 2, 3]
+    assert decision.iloc[3:6].tolist() == ["EXIT", "EXIT", "EXIT"]
+    assert profile.iloc[3:6].tolist() == ["BUY_3_SESSION"] * 3
+
+
+def test_expected_return_exit_v3_new_position_grace_suppresses_early_reduce() -> None:
+    strategy = ExpectedReturnExitV3Strategy()
+    confidence = pd.Series([51.2])
+    confirmed = pd.Series([False])
+    grace = pd.Series([True])
+
+    decision = strategy._decision(
+        confidence,
+        exit_confirmed=confirmed,
+        entry_grace=grace,
+    )
+
+    assert decision.tolist() == ["HOLD_REVIEW"]
+
+
+def test_expected_return_exit_v3_buy_small_gets_two_session_grace() -> None:
+    strategy = ExpectedReturnExitV3Strategy()
+    confidence = pd.Series([45.0, 35.0, 35.0])
+    entry_les = pd.Series([68.0, 68.0, 68.0])
+    holding_days = pd.Series([0.0, 1.0, 2.0])
+    entry_decision = pd.Series(["BUY_SMALL"] * 3, dtype="string")
+
+    streak, confirmed, grace, profile = strategy._exit_confirmation(
+        holding_confidence=confidence,
+        entry_les=entry_les,
+        holding_days=holding_days,
+        entry_decision=entry_decision,
+    )
+    decision = strategy._decision(
+        confidence,
+        exit_confirmed=confirmed,
+        entry_grace=grace,
+    )
+
+    assert grace.tolist() == [True, True, False]
+    assert profile.tolist() == [
+        "BUY_SMALL_2_SESSION",
+        "BUY_SMALL_2_SESSION",
+        "NONE",
+    ]
+    assert streak.tolist() == [0, 1, 2]
+    assert decision.tolist() == ["HOLD_REVIEW", "EXIT", "EXIT"]
+
+
+def test_expected_return_exit_v3_early_buy_gets_conservative_two_session_grace() -> None:
+    strategy = ExpectedReturnExitV3Strategy()
+    confidence = pd.Series([45.0, 45.0, 45.0])
+
+    _, _, grace, profile = strategy._exit_confirmation(
+        holding_confidence=confidence,
+        entry_les=pd.Series([76.0, 76.0, 76.0]),
+        holding_days=pd.Series([0.0, 1.0, 2.0]),
+        entry_decision=pd.Series(
+            ["EARLY_BUY", "EARLY_BUY", "EARLY_BUY"],
+            dtype="string",
+        ),
+    )
+    decision = strategy._decision(confidence, entry_grace=grace)
+
+    assert grace.tolist() == [True, True, False]
+    assert profile.tolist() == [
+        "EARLY_BUY_2_SESSION",
+        "EARLY_BUY_2_SESSION",
+        "NONE",
+    ]
+    assert decision.tolist() == ["HOLD_REVIEW", "HOLD_REVIEW", "REDUCE 40%"]
+
+
+def test_expected_return_exit_v3_missing_execution_metadata_gets_no_grace() -> None:
+    strategy = ExpectedReturnExitV3Strategy()
+    confidence = pd.Series([45.0])
+
+    _, _, grace, profile = strategy._exit_confirmation(
+        holding_confidence=confidence,
+        entry_les=pd.Series([78.0]),
+        holding_days=pd.Series([0.0]),
+        entry_decision=pd.Series([pd.NA], dtype="string"),
+    )
+    decision = strategy._decision(confidence, entry_grace=grace)
+
+    assert grace.tolist() == [False]
+    assert profile.tolist() == ["NONE"]
+    assert decision.tolist() == ["REDUCE 40%"]
 
 
 def test_expected_return_exit_v3_decays_entry_les_weight_with_holding_days() -> None:
@@ -86,6 +243,7 @@ def test_expected_return_exit_v3_decays_entry_les_weight_with_holding_days() -> 
     assert 0 <= latest["EREM Raw Score"] <= EREM_V3_MAX_RAW_SCORE
     assert latest["EREM 分數"] == expected_score
     assert latest["EREM Holding Confidence"] == expected_confidence
+    assert latest["EREM 建議減倉比例"] in {0, 25, 30, 35, 40, 45, 50, 100}
     assert result.iloc[-30]["EREM Entry Weight"] == 0.4
     assert result.iloc[-10]["EREM Entry Weight"] == round(
         max(0.10, 0.40 * math.exp(-20 / 20)),
@@ -103,6 +261,8 @@ def test_expected_return_exit_v3_decays_entry_les_weight_with_holding_days() -> 
     assert latest["EREM Structure Score"] == 5
     assert latest["EREM Entry Quality Score"] == 5
     assert latest["EREM Entry LES"] == 80
+    assert latest["EREM Entry Decision"] == "BUY"
+    assert latest["EREM Grace Profile"] == "NONE"
     assert latest["EREM Exit Streak Count"] >= 0
     assert pd.notna(latest["EREM EMA20 Slope"])
     assert latest["EREM Turnover Score"] == 5

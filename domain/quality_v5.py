@@ -9,6 +9,7 @@ from typing import Any, Callable
 import pandas as pd
 
 from domain.data_provenance import TRUSTED_AVAILABILITY_SOURCES
+from domain.security_identity import is_airline_issuer
 
 
 class BaseQualityStatus(str, Enum):
@@ -81,7 +82,6 @@ class LowEntryV5QualityConfig:
     maximum_extended_weight: float = 0.40
     unsupported_sector_codes: frozenset[str] = frozenset({"17"})
     balance_error_limit: float = 0.01
-    air_sector_codes: frozenset[str] = frozenset({"15"})
     air_max_debt_ratio: float = 0.80
     air_min_current_ratio: float = 0.60
     air_min_roe_ttm: float = 0.08
@@ -157,7 +157,7 @@ def evaluate_v5_quality(
         return _insufficient_result("OFFICIAL_SECTOR_UNKNOWN")
     if sector in cfg.unsupported_sector_codes:
         return _unsupported_result()
-    air_profile = sector in cfg.air_sector_codes
+    air_profile = is_airline_issuer(snapshot.get("issuer_symbol"), sector)
 
     annual = _point_in_time_annual(annual_df, signal)
     base_evidence = _resolve_base_evidence(snapshot, signal)

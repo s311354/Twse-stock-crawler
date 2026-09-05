@@ -1,6 +1,7 @@
 """TWSE crawler infrastructure."""
 """TWSE crawler infrastructure."""
 
+from infrastructure.crawler.twse_http_client import TwseAccessBlockedError
 from infrastructure.crawler.twse_http_client import TwseErrorCategory
 from infrastructure.crawler.twse_http_client import TwseHttpClient
 from infrastructure.crawler.twse_http_client import TwseHttpConfig
@@ -10,6 +11,7 @@ from infrastructure.crawler.twse_http_client import TwseNoDataError
 from infrastructure.crawler.twse_http_client import TwseSchemaChangedError
 
 __all__ = [
+    "TwseAccessBlockedError",
     "TwseErrorCategory",
     "TwseHttpClient",
     "TwseHttpConfig",

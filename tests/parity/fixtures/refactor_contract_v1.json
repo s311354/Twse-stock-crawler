@@ -1,7 +1,7 @@
 {
   "analysis_columns": {
-    "count": 232,
-    "sha256": "b38e96377d7ba01f31c3cb0cd375a80e856beaf12bf316df43c44927d7a95a14"
+    "count": 223,
+    "sha256": "4e6534f9565166e27be3c28c2b3ee03dc36f5853d81a7fee5972aff86e9b5ad2"
   },
   "captured_on": "2026-08-22",
   "cli": {
@@ -22,20 +22,21 @@
       {"choices": null, "dest": "mops_history_years", "nargs": null, "options": ["--mops-history-years"]},
       {"choices": null, "dest": "account_equity", "nargs": null, "options": ["--account-equity"]},
       {"choices": null, "dest": "pae_holdings_file", "nargs": null, "options": ["--pae-holdings-file"]},
+      {"choices": null, "dest": "include_symbols_file", "nargs": null, "options": ["--include-symbols-file"]},
       {"choices": null, "dest": "pae_current_cash", "nargs": null, "options": ["--pae-current-cash"]},
       {"choices": ["release", "debug"], "dest": "mode", "nargs": null, "options": ["--mode"]}
     ],
-    "sha256": "afcb7379d85862e1a20624551ed13d2b13e7d1d4e007cca9b4e7e79cf6e46114"
+    "sha256": "5850cc0233129ab15fc086cf1e79dc557a5d03a854e993314701af7ad56687fc"
   },
   "decision_schema_version": "1.0.0",
   "daily_email": {
     "headings": [
       "今日決策卡",
-      "進場決策彙整（BUY / BUY_SMALL）",
-      "投資組合配置（PAE v1.1.5）",
+      "進場決策彙整（BUY / EARLY_BUY / BUY_SMALL）",
+      "投資組合配置（PAE v1.2.1）",
       "低點進場判斷（Low-Entry Model v5）+ 預期報酬出場判斷（EREM v3）"
     ],
-    "normalized_sha256": "939065d3beed674092f713ae13d54275d3d73cc553fe00dbc81240704e02e778",
+    "normalized_sha256": "9b5c4c0b9c644ff42367b1abab7f2f7905a987ca89d861f13534fbd105e3fa7d",
     "sections": ["daily-decision-cards", "entry-decisions", "portfolio-allocation", "model-guide"]
   },
   "pae_decision": {
@@ -43,7 +44,7 @@
     "best_strategic_alternative": "2330",
     "lines": [
       {
-        "action": "ADD",
+        "action": "STRONG_ADD",
         "cer": 0.174,
         "executable": true,
         "reason": "COLD_START_EXECUTABLE",
@@ -54,17 +55,19 @@
       }
     ],
     "mode": "COLD_START",
-    "model_version": "1.1.5",
+    "model_version": "1.2.1",
     "portfolio_expected_cer": 0.174,
     "reason": "ALLOCATION_COMPLETE",
     "required_return": 0.1,
     "target_cash_weight": 0.666666666667
   },
   "public_imports": {
+    "application.portfolio_contracts": ["PersistenceObservation", "PortfolioAllocationInputError", "PortfolioPersistenceError", "PortfolioRuntimeContext"],
     "application.stock_service": ["StockAnalysisRequest", "StockAnalysisService"],
     "domain.model_contracts": ["DecisionField", "FieldSource", "FieldUnit", "StrategyDecision"],
     "domain.strategy": ["Strategy", "StrategyRegistry", "available_strategies", "get_strategy", "register_strategy"],
     "infrastructure.bootstrap": ["StockAnalysisRuntime", "build_stock_analysis_runtime", "build_stock_analysis_service"],
+    "infrastructure.report.html_renderer": ["HtmlRenderer", "MetricColumn", "PortfolioAllocationRenderer", "PortfolioAllocationV1Renderer", "RendererFactory"],
     "interface.cli": ["build_preflight_summary", "build_request", "build_run_configuration", "create_parser", "load_pae_holdings_file", "main"],
     "stockanalysis": ["TwseCrawker"],
     "twstockcrawler": ["SMTPEmail", "TwStockCrawler"]
@@ -78,7 +81,8 @@
     "low_entry_score_v4",
     "low_entry_score_v4_1",
     "low_entry_score_v5",
-    "portfolio_allocation_v1"
+    "portfolio_allocation_v1",
+    "portfolio_allocation_v2"
   ],
   "sqlite": {
     "market_history": {
@@ -108,13 +112,14 @@
   "strategies": {
     "expected_return_exit": "",
     "expected_return_exit_v2": "",
-    "expected_return_exit_v3": "3.1.0",
+    "expected_return_exit_v3": "3.2.4",
     "low_entry_score": "",
     "low_entry_score_v2": "",
     "low_entry_score_v3": "",
     "low_entry_score_v4": "",
     "low_entry_score_v4_1": "4.1.0",
     "low_entry_score_v5": "5.0.0",
-    "portfolio_allocation_v1": "1.1.5"
+    "portfolio_allocation_v1": "1.2.1",
+    "portfolio_allocation_v2": "2.0.0"
   }
 }

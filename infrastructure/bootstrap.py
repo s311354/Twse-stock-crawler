@@ -10,7 +10,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from application.fundamental_service import MopsFundamentalService
-from application.portfolio_allocation import PortfolioAllocationPipeline
+from application.portfolio_allocation_v2 import PortfolioAllocationV2Pipeline
 from application.stock_service import StockAnalysisService
 from application.use_cases import EvaluateStrategies
 from application.use_cases import FetchMarketData
@@ -30,12 +30,12 @@ from infrastructure.storage.market_history_cache import SQLiteMarketHistoryCache
 from infrastructure.storage.portfolio_persistence import (
     SQLitePortfolioPersistence,
 )
-from infrastructure.stock_analysis_adapters import CrawlerFundamentalAdapter
-from infrastructure.stock_analysis_adapters import CrawlerLineChartAdapter
-from infrastructure.stock_analysis_adapters import CrawlerMarketDataAdapter
-from infrastructure.stock_analysis_adapters import CrawlerNotificationAdapter
-from infrastructure.stock_analysis_adapters import CrawlerReportAdapter
-from infrastructure.stock_analysis_adapters import CrawlerStrategyAdapter
+from infrastructure.runtime.fundamental_adapter import CrawlerFundamentalAdapter
+from infrastructure.runtime.market_data_adapter import CrawlerMarketDataAdapter
+from infrastructure.runtime.output_adapters import CrawlerLineChartAdapter
+from infrastructure.runtime.output_adapters import CrawlerNotificationAdapter
+from infrastructure.runtime.output_adapters import CrawlerReportAdapter
+from infrastructure.runtime.strategy_adapter import CrawlerStrategyAdapter
 
 
 TAIPEI_TIMEZONE = ZoneInfo("Asia/Taipei")
@@ -199,7 +199,7 @@ def build_stock_analysis_runtime(
         evaluate_strategies=EvaluateStrategies(
             CrawlerStrategyAdapter(
                 observer=observer,
-                portfolio_allocator=PortfolioAllocationPipeline(
+                portfolio_allocator=PortfolioAllocationV2Pipeline(
                     persistence=SQLitePortfolioPersistence(
                         effective_settings.pae_persistence_path
                     )

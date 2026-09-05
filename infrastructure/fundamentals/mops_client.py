@@ -14,6 +14,7 @@ from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
 from config.settings import AppSettings
+from infrastructure.crawler.twse_http_client import TwseAccessBlockedError
 from infrastructure.crawler.twse_http_client import TwseHttpClient
 from infrastructure.crawler.twse_http_client import TwseNetworkError
 from infrastructure.crawler.twse_http_client import TwseNoDataError
@@ -40,6 +41,10 @@ HTML_HEADERS = {
     "Referer": MOPS_BASE_URL + "/mops/web/index",
 }
 TAIPEI = ZoneInfo("Asia/Taipei")
+MOPS_ACCESS_BLOCKED_MARKERS = (
+    "因為安全性考量",
+    "所執行的頁面無法呈現",
+)
 
 
 @dataclass
@@ -267,6 +272,10 @@ class MopsClient:
 
             content_text = decode_mops_content(response.content)
             explicit_no_data = "查無資料" in content_text
+            access_blocked = any(
+                marker in content_text
+                for marker in MOPS_ACCESS_BLOCKED_MARKERS
+            )
             parse_detail = (
                 "detected_scopes={} filing_link_rows={} table_rows={}".format(
                     parse_result.scope_summary,
@@ -274,21 +283,40 @@ class MopsClient:
                     parse_result.table_rows,
                 )
             )
+            if access_blocked:
+                response_status = "ACCESS_BLOCKED"
+                response_detail = "MOPS security guard page; {}".format(
+                    parse_detail
+                )
+            elif explicit_no_data:
+                response_status = "NO_DATA"
+                response_detail = "explicit no-data response; {}".format(
+                    parse_detail
+                )
+            else:
+                response_status = "SCHEMA_CHANGED"
+                response_detail = (
+                    "HTML without filing rows or no-data marker; "
+                    "supported_scope_detail={}".format(parse_detail)
+                )
             if attempt < self._catalog_empty_attempts:
                 delay = self._catalog_empty_backoff_seconds * attempt
-                logging.warning(
+                log_retry = logging.debug if access_blocked else logging.warning
+                log_retry(
                     "MOPS status=%s context=%s attempt=%s/%s retrying=true "
                     "reset_session=true backoff_seconds=%s detail=%s",
-                    "NO_DATA" if explicit_no_data else "SCHEMA_CHANGED",
+                    response_status,
                     context,
                     attempt,
                     self._catalog_empty_attempts,
                     delay,
-                    (
-                        "explicit no-data response; {}".format(parse_detail)
-                        if explicit_no_data
-                        else "HTML without filing rows or no-data marker; "
-                        "supported_scope_detail={}".format(parse_detail)
+                    response_detail,
+                    extra=structured_extra(
+                        symbol=normalized_symbol,
+                        source="MOPS",
+                        status=response_status,
+                        attempt=attempt,
+                        cache_hit=False,
                     ),
                 )
                 self._reset_mops_session()
@@ -299,6 +327,14 @@ class MopsClient:
                     "MOPS catalog explicitly returned no data for {} after {} attempt(s)".format(
                         normalized_symbol,
                         self._catalog_empty_attempts,
+                    ),
+                    retryable=False,
+                )
+            if access_blocked:
+                raise TwseAccessBlockedError(
+                    "{} returned the MOPS security guard page; {}".format(
+                        context,
+                        parse_detail,
                     ),
                     retryable=False,
                 )

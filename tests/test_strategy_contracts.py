@@ -1,5 +1,7 @@
 import datetime
+import logging
 from dataclasses import FrozenInstanceError
+from dataclasses import replace
 
 import pandas as pd
 import pytest
@@ -107,6 +109,53 @@ def test_assembler_builds_frozen_versioned_field_evidence() -> None:
     assert valuation.available_at <= decision.evaluated_at
     with pytest.raises(FrozenInstanceError):
         close.value = 0
+
+
+def test_assembler_skips_slot_without_valid_market_history(caplog) -> None:
+    market = market_input()
+    market = replace(
+        market,
+        stock_count=2,
+        stock_numbers=["2330", ""],
+        stock_names=["台積電", ""],
+        dates=[["2026-07-25"], []],
+        opens=[[990_000.0], []],
+        highs=[[1_010_000.0], []],
+        lows=[[980_000.0], []],
+        closes=[[1_000_000.0], []],
+        volumes=[[20_000.0], []],
+        trade_counts=[[100], []],
+        trade_values=[[20_000_000.0], []],
+        bids=[[999_000.0], []],
+        asks=[[1_001_000.0], []],
+        pe_ratios=[[20.0], []],
+        taiex_closes=[[23_000.0], []],
+    )
+    invalid = valid_row(
+        **{
+            "證券代號": "",
+            "證券名稱": "",
+            "收盤": None,
+            "Base Available Weight": None,
+            "Valuation Gate": None,
+            "Valuation Model Status": None,
+            "Valuation Model Version": None,
+        }
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        decisions = StrategyDecisionAssembler().assemble(
+            pd.DataFrame([valid_row(), invalid]),
+            market,
+        )
+
+    assert len(decisions) == 1
+    assert decisions[0].value("證券代號") == "2330"
+    assert "no valid TWSE market history" in caplog.text
+    assert "Skipping stock <unresolved>" in caplog.text
+    assert "analysis slot" not in caplog.text
+    assert caplog.records[-1].levelno == logging.DEBUG
+    assert caplog.records[-1].status == "ANALYSIS_SLOT_SKIPPED"
 
 
 def test_contract_rejects_future_point_in_time_evidence() -> None:

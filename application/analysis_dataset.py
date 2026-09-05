@@ -24,8 +24,8 @@ from domain.strategies.expected_return_exit_v3 import (
 )
 from domain.strategies.low_entry_score_v5 import LOW_ENTRY_OUTPUT_COLUMNS
 from domain.strategies.low_entry_score_v5 import LOW_ENTRY_STRATEGY_NAME
-from domain.strategies.portfolio_allocation_v1 import (
-    PORTFOLIO_ALLOCATION_OUTPUT_COLUMNS,
+from domain.strategies.portfolio_allocation_v2 import (
+    PAE_V2_OUTPUT_COLUMNS,
 )
 
 
@@ -62,7 +62,7 @@ CORE_ANALYSIS_COLUMNS = (
 )
 ANALYSIS_COLUMNS = (
     CORE_ANALYSIS_COLUMNS
-    + PORTFOLIO_ALLOCATION_OUTPUT_COLUMNS
+    + list(PAE_V2_OUTPUT_COLUMNS)
 )
 
 

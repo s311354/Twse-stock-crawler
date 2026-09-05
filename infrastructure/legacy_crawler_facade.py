@@ -98,6 +98,11 @@ class LegacyCrawlerFacade:
                 "portfolio_entry_dates_by_stock",
                 {},
             ),
+            entry_decisions_by_stock=getattr(
+                self,
+                "portfolio_entry_decisions_by_stock",
+                {},
+            ),
             market_breadth_snapshots=getattr(
                 self,
                 "market_breadth_snapshots_by_date",
@@ -177,12 +182,30 @@ class LegacyCrawlerFacade:
         maxprofits: list[ProfitRow] = [
             [] for _ in range(self.stocklistsize)
         ]
+        missing_symbols: list[str] = []
+        unresolved_count = 0
         for item, daily_stock in enumerate(self.daily_stocks):
             if not daily_stock:
-                logging.warning(
-                    "Skipping max profit calculation for stock index %s "
-                    "because no valid prices were collected.",
-                    item,
+                tracked_numbers = getattr(self, "tracked_stock_numbers", ())
+                tracked_symbol = (
+                    tracked_numbers[item]
+                    if item < len(tracked_numbers)
+                    else None
+                )
+                known_symbol = self.stocknumbers[item] or tracked_symbol
+                if known_symbol:
+                    missing_symbols.append(str(known_symbol))
+                else:
+                    unresolved_count += 1
+                logging.debug(
+                    "Skipping max profit calculation for stock %s because "
+                    "no valid prices were collected.",
+                    known_symbol or "UNKNOWN",
+                    extra={
+                        "symbol": known_symbol,
+                        "source": "TWSE",
+                        "status": "MAX_PROFIT_PRICE_MISSING",
+                    },
                 )
                 maxprofits[item].extend([0, 0, 0, 0, None])
                 self.stocksprice.append(None)
@@ -201,6 +224,20 @@ class LegacyCrawlerFacade:
                 round(profit_with_fee / daily_stock[-1], 2)
             )
             self.stocksprice.append(round(daily_stock[-1], 2))
+
+        if missing_symbols or unresolved_count:
+            symbol_text = ",".join(dict.fromkeys(missing_symbols)) or "NONE"
+            logging.warning(
+                "Max profit unavailable summary stocks=%s symbols=%s "
+                "unresolved=%s; no valid prices were collected.",
+                len(missing_symbols) + unresolved_count,
+                symbol_text,
+                unresolved_count,
+                extra={
+                    "source": "TWSE",
+                    "status": "MAX_PROFIT_PRICE_MISSING_SUMMARY",
+                },
+            )
         return maxprofits
 
     def cal_signal_features(self) -> list[SignalRow]:

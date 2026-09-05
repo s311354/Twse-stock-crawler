@@ -25,7 +25,10 @@ class ExitPolicy:
         has_alternative: bool,
     ) -> tuple[PortfolioAction, str, ExitConfirmationAssessment]:
         assessment = self.exit_confirmation_assessment(holding, evaluation)
-        if evaluation.hard_reject:
+        # Candidate hard-reject status answers "may new capital enter?" and may
+        # include entry-only states such as HARD_NO_BUY or BASE_REJECT.  A
+        # holding is forced out only by an explicit fundamental hard risk.
+        if holding.fundamental_hard_reject:
             return (
                 PortfolioAction.EXIT_AND_REALLOCATE
                 if has_alternative
@@ -54,17 +57,9 @@ class ExitPolicy:
         confidence = holding.erem_holding_confidence
         if confidence < self.config.erem_exit_threshold:
             if (
-                confidence < self.config.erem_severe_exit_threshold
-                and assessment.trend_broken
+                assessment.confirmation_count
+                >= self.config.erem_full_exit_confirmation_required
             ):
-                return (
-                    PortfolioAction.EXIT_AND_REALLOCATE
-                    if has_alternative
-                    else PortfolioAction.EXIT_TO_CASH,
-                    "SEVERE_EREM_AND_TREND_BREAK",
-                    assessment,
-                )
-            if assessment.confirmation_count == 3:
                 return (
                     PortfolioAction.EXIT_AND_REALLOCATE
                     if has_alternative
@@ -72,7 +67,10 @@ class ExitPolicy:
                     "CONFIRMED_EREM_EXIT",
                     assessment,
                 )
-            if assessment.confirmation_count >= 2:
+            if (
+                assessment.confirmation_count
+                >= self.config.erem_partial_exit_confirmation_required
+            ):
                 if assessment.high_quality_protected:
                     return (
                         PortfolioAction.REDUCE_25,
@@ -80,10 +78,12 @@ class ExitPolicy:
                         assessment,
                     )
                 return (
-                    PortfolioAction.EXIT_AND_REALLOCATE
-                    if has_alternative
-                    else PortfolioAction.EXIT_TO_CASH,
-                    "CONFIRMED_EREM_EXIT",
+                    PortfolioAction.REDUCE_25,
+                    (
+                        "SEVERE_EREM_PARTIAL_CONFIRMATION"
+                        if confidence < self.config.erem_severe_exit_threshold
+                        else "PARTIAL_EREM_EXIT_CONFIRMATION"
+                    ),
                     assessment,
                 )
             return (
@@ -116,7 +116,7 @@ class ExitPolicy:
             and holding.data_confidence is not None
             and holding.data_confidence
             >= self.config.quality_protection_data_confidence
-            and not evaluation.hard_reject
+            and not holding.fundamental_hard_reject
         )
         stop_breached = bool(
             holding.current_price is not None

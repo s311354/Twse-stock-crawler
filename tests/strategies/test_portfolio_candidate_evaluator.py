@@ -45,6 +45,66 @@ def test_candidate_evaluator_calculates_cer_and_eligibility() -> None:
     assert result.capital_claim == pytest.approx(0.06)
 
 
+def test_candidate_evaluator_requires_a_clear_falling_knife_gate() -> None:
+    evaluator = PortfolioCandidateEvaluator(PortfolioAllocationConfig())
+    candidate = _candidate()
+    watch = AllocationSecurity(
+        **{**candidate.__dict__, "falling_knife_state": "REVERSAL_WATCH"}
+    )
+
+    result = evaluator.evaluate(watch, required_return=0.10)
+
+    assert result.absolute_strategic_candidate is True
+    assert result.executable_candidate is False
+    assert result.capital_claim == 0
+
+
+def test_buy_small_accepts_supportive_valuation_and_quality_watch() -> None:
+    evaluator = PortfolioCandidateEvaluator(PortfolioAllocationConfig())
+    candidate = _candidate()
+    starter = AllocationSecurity(
+        **{
+            **candidate.__dict__,
+            "quality_status": "QUALITY_WATCH",
+            "valuation_gate": "SUPPORTIVE",
+            "les_decision": "BUY_SMALL",
+        }
+    )
+
+    result = evaluator.evaluate(starter, required_return=0.10)
+
+    assert result.strategic_candidate is True
+    assert result.executable_candidate is True
+    assert result.capital_claim == pytest.approx(0.024)
+
+
+def test_standard_buy_still_requires_valuation_pass() -> None:
+    evaluator = PortfolioCandidateEvaluator(PortfolioAllocationConfig())
+    candidate = _candidate()
+    supportive = AllocationSecurity(
+        **{**candidate.__dict__, "valuation_gate": "SUPPORTIVE"}
+    )
+
+    result = evaluator.evaluate(supportive, required_return=0.10)
+
+    assert result.strategic_candidate is False
+    assert result.executable_candidate is False
+
+
+def test_entry_quality_reject_still_blocks_new_capital() -> None:
+    evaluator = PortfolioCandidateEvaluator(PortfolioAllocationConfig())
+    candidate = _candidate()
+    rejected = AllocationSecurity(
+        **{**candidate.__dict__, "quality_status": "HARD_NO_BUY"}
+    )
+
+    result = evaluator.evaluate(rejected, required_return=0.10)
+
+    assert result.hard_reject is True
+    assert result.strategic_candidate is False
+    assert result.executable_candidate is False
+
+
 def test_engine_preserves_candidate_evaluation_compatibility_delegates() -> None:
     engine = PortfolioAllocationEngine()
     security = _candidate()

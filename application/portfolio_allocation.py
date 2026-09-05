@@ -6,10 +6,17 @@ import datetime
 import math
 from collections.abc import Mapping
 from collections.abc import Sequence
-from dataclasses import dataclass
 from dataclasses import replace
 from typing import Protocol
 
+from application.portfolio_contracts import PAE_INPUT_COLD_START
+from application.portfolio_contracts import PAE_INPUT_EXPLICIT
+from application.portfolio_contracts import PAE_INPUT_MIXED
+from application.portfolio_contracts import PAE_INPUT_SYMBOL_ONLY
+from application.portfolio_contracts import PersistenceObservation
+from application.portfolio_contracts import PortfolioAllocationInputError
+from application.portfolio_contracts import PortfolioPersistenceError
+from application.portfolio_contracts import PortfolioRuntimeContext
 from domain.model_contracts import DecisionField
 from domain.model_contracts import FieldSource
 from domain.model_contracts import FieldUnit
@@ -26,21 +33,6 @@ from domain.strategies.portfolio_allocation_v1 import resolve_portfolio_mode
 from domain.strategies.portfolio_allocation_v1 import (
     PORTFOLIO_ALLOCATION_OUTPUT_COLUMNS,
 )
-
-
-class PortfolioAllocationInputError(ValueError):
-    """Raised when runtime portfolio state cannot be valued safely."""
-
-
-class PortfolioPersistenceError(RuntimeError):
-    """Raised when cross-session opportunity evidence is unavailable."""
-
-
-@dataclass(frozen=True)
-class PersistenceObservation:
-    incumbent_symbol: str
-    challenger_symbol: str
-    excess_opportunity: float
 
 
 class PortfolioPersistencePort(Protocol):
@@ -79,21 +71,6 @@ class NullPortfolioPersistence:
         observations: Sequence[PersistenceObservation],
     ) -> None:
         return None
-
-
-@dataclass(frozen=True)
-class PortfolioRuntimeContext:
-    account_equity: float
-    positions: tuple[PortfolioPosition, ...] = ()
-    current_cash: float | None = None
-    sector_by_symbol: Mapping[str, str] | None = None
-    default_sector: str = "UNKNOWN"
-
-
-PAE_INPUT_COLD_START = "COLD_START_ALL_CASH"
-PAE_INPUT_EXPLICIT = "EXPLICIT_SHARES"
-PAE_INPUT_SYMBOL_ONLY = "SYMBOL_ONLY_EQUAL_WEIGHT"
-PAE_INPUT_MIXED = "MIXED_EXPLICIT_AND_EQUAL_WEIGHT"
 
 
 class PortfolioAllocationPipeline:
@@ -429,12 +406,6 @@ class PortfolioAllocationPipeline:
             ),
             fundamental_hard_reject=(
                 hard_rejects not in {"", "NONE", "N/A", "NAN"}
-                or quality_status.upper() in {
-                    "HARD_NO_BUY",
-                    "QUALITY_REJECT",
-                    "BASE_REJECT",
-                    "EXTENDED_REJECT",
-                }
             ),
         )
 
@@ -663,6 +634,10 @@ class PortfolioAllocationPipeline:
 
 __all__ = [
     "NullPortfolioPersistence",
+    "PAE_INPUT_COLD_START",
+    "PAE_INPUT_EXPLICIT",
+    "PAE_INPUT_MIXED",
+    "PAE_INPUT_SYMBOL_ONLY",
     "PersistenceObservation",
     "PortfolioAllocationInputError",
     "PortfolioAllocationPipeline",

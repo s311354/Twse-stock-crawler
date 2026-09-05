@@ -13,6 +13,10 @@ Profiles: elec, semi, chemi, bio, comp, air, veh
 The profile selects stocklist_<profile>, the matching TWSE market type, and
 portfolio_holdings_<profile>.txt when that holdings file exists. The default
 profile is elec; TWSE_ANALYSIS_PROFILE provides the same selection by env var.
+Holding token format:
+  symbol[:shares[:entry_date[:entry_les[:entry_decision]]]]
+where entry_decision is BUY, EARLY_BUY, or BUY_SMALL. Existing shorter tokens
+remain valid.
 --check validates the complete runtime configuration without network or email.
 EOF
 }

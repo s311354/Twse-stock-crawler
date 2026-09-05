@@ -37,6 +37,9 @@ from twse.parser import clean_cell
 from twse.parser import parse_price
 
 
+FULL_MARKET_TYPE = "ALLBUT0999"
+
+
 class TwseCrawker(LegacyCrawlerFacade):
     def __init__(
         self,
@@ -62,6 +65,7 @@ class TwseCrawker(LegacyCrawlerFacade):
         self.stocknumbers: list[str] = ['' for _ in range(self.stocklistsize)]
         self.stocknames: list[str] = ['' for _ in range(self.stocklistsize)]
         self.tracked_stock_numbers: list[str | None] = [None for _ in range(self.stocklistsize)]
+        self.explicit_stock_numbers: set[str] = set()
         self.missing_tracked_stock_numbers: set[str] = set()
         self.missing_tracked_stock_first_dates: dict[str, str] = {}
         self.stocksprice: list[float | None] = list()
@@ -248,9 +252,34 @@ class TwseCrawker(LegacyCrawlerFacade):
         selector_text = str(selector).strip()
         stock_row = stock_lookup.get(selector_text)
         if stock_row is not None:
+            if selector_text in self.tracked_stock_numbers:
+                logging.debug(
+                    "Skipping explicit stock %s at %s because it is already tracked by the selected industry universe.",
+                    selector_text,
+                    scheduled_time,
+                )
+                return None
             self.tracked_stock_numbers[item] = selector_text
             logging.debug("Tracking stock %s from stock-number selector at %s.", selector_text, scheduled_time)
             return stock_row
+
+        if selector_text in self.explicit_stock_numbers:
+            self.missing_tracked_stock_first_dates.setdefault(
+                selector_text,
+                scheduled_time,
+            )
+            logging.debug(
+                "Skipping explicit portfolio stock %s at %s because it is missing from the TWSE full-market response.",
+                selector_text,
+                scheduled_time,
+                extra={
+                    "symbol": selector_text,
+                    "trade_date": scheduled_time,
+                    "source": "TWSE",
+                    "status": "PORTFOLIO_STOCK_MISSING",
+                },
+            )
+            return None
 
         if selector_text.isdigit() and selector_text != str(int(selector_text)):
             logging.warning(
@@ -274,6 +303,14 @@ class TwseCrawker(LegacyCrawlerFacade):
             return None
 
         resolved_stock_no = clean_cell(stock_row[TwseColumns.STOCK_NO])
+        if resolved_stock_no in self.tracked_stock_numbers:
+            logging.warning(
+                "Skipping legacy row index %s at %s because stock %s is already tracked by another slot.",
+                stock_index,
+                scheduled_time,
+                resolved_stock_no,
+            )
+            return None
         self.tracked_stock_numbers[item] = resolved_stock_no
         logging.debug(
             "Resolved legacy row index %s to stock %s at %s; future dates will use stock-number lookup.",
@@ -529,6 +566,11 @@ class TwseCrawker(LegacyCrawlerFacade):
         cache_writes = 0
         cache_invalid = 0
         network_days = 0
+        full_market_cache_days: dict[str, CachedMarketDay] = {}
+        full_market_cache_usable = self.market_history_cache is not None
+        full_market_cache_hits = 0
+        full_market_cache_writes = 0
+        full_market_network_days = 0
         if self.market_history_cache is not None:
             cache_query_dates = [
                 trade_date
@@ -552,6 +594,38 @@ class TwseCrawker(LegacyCrawlerFacade):
                         "cache_hit": False,
                     },
                 )
+            if self.explicit_stock_numbers:
+                try:
+                    load_symbols_many = getattr(
+                        self.market_history_cache,
+                        "load_symbols_many",
+                        None,
+                    )
+                    if callable(load_symbols_many):
+                        full_market_cache_days = load_symbols_many(
+                            cache_query_dates,
+                            market_type=FULL_MARKET_TYPE,
+                            symbols=self.explicit_stock_numbers,
+                        )
+                    else:
+                        full_market_cache_days = (
+                            self.market_history_cache.load_many(
+                                cache_query_dates,
+                                market_type=FULL_MARKET_TYPE,
+                            )
+                        )
+                except MarketHistoryCacheError as error:
+                    full_market_cache_usable = False
+                    logging.warning(
+                        "TWSE full-market history cache status=READ_ERROR; "
+                        "falling back to HTTP for portfolio stocks: %s",
+                        error,
+                        extra={
+                            "source": "TWSE_MARKET_CACHE",
+                            "status": "READ_ERROR",
+                            "cache_hit": False,
+                        },
+                    )
     
         # Crawing daily TWSE Stock data
         for iso_scheduled_time in self.iso_scheduled_times:
@@ -654,6 +728,67 @@ class TwseCrawker(LegacyCrawlerFacade):
                             },
                         )
 
+            missing_portfolio_symbols = (
+                self.explicit_stock_numbers.difference(stock_lookup)
+            )
+            if missing_portfolio_symbols:
+                full_market_day = full_market_cache_days.get(scheduled_time)
+                full_market_rows: StockRows | None = None
+                full_market_lookup: dict[str, StockRow] = {}
+                if full_market_day is not None:
+                    full_market_rows = full_market_day.stock_rows
+                    full_market_lookup = self.build_stock_lookup(
+                        full_market_rows,
+                        scheduled_time,
+                    )
+                    if full_market_lookup:
+                        full_market_cache_hits += 1
+                    else:
+                        full_market_day = None
+
+                if full_market_day is None:
+                    full_market_network_days += 1
+                    full_market_rows = self.twse_client.get_daily_stock_rows(
+                        scheduled_time,
+                        FULL_MARKET_TYPE,
+                    )
+                    full_market_lookup = self.build_stock_lookup(
+                        full_market_rows,
+                        scheduled_time,
+                    )
+                    if (
+                        full_market_cache_usable
+                        and self.market_history_cache is not None
+                        and full_market_lookup
+                    ):
+                        try:
+                            self.market_history_cache.upsert_day(
+                                CachedMarketDay(
+                                    trade_date=scheduled_time,
+                                    stock_rows=full_market_rows,
+                                    taiex_close=taiex_close,
+                                ),
+                                market_type=FULL_MARKET_TYPE,
+                            )
+                            full_market_cache_writes += 1
+                        except (MarketHistoryCacheError, ValueError) as error:
+                            full_market_cache_usable = False
+                            logging.warning(
+                                "TWSE full-market history cache status=WRITE_ERROR; "
+                                "cache writes disabled for this run: %s",
+                                error,
+                                extra={
+                                    "source": "TWSE_MARKET_CACHE",
+                                    "status": "WRITE_ERROR",
+                                    "cache_hit": False,
+                                },
+                            )
+
+                for symbol in missing_portfolio_symbols:
+                    portfolio_row = full_market_lookup.get(symbol)
+                    if portfolio_row is not None:
+                        stock_lookup[symbol] = portfolio_row
+
             breadth = derive_twse_market_breadth(
                 row,
                 as_of=iso_scheduled_time,
@@ -740,6 +875,21 @@ class TwseCrawker(LegacyCrawlerFacade):
                     "cache_hit": network_days == 0,
                 },
             )
+            if self.explicit_stock_numbers:
+                logging.info(
+                    "TWSE portfolio full-market cache requested=%s hits=%s "
+                    "network_days=%s writes=%s symbols=%s",
+                    len(scheduled_dates),
+                    full_market_cache_hits,
+                    full_market_network_days,
+                    full_market_cache_writes,
+                    len(self.explicit_stock_numbers),
+                    extra={
+                        "source": "TWSE_MARKET_CACHE",
+                        "status": "PORTFOLIO_CACHE_SUMMARY",
+                        "cache_hit": full_market_network_days == 0,
+                    },
+                )
 
         self._log_no_data_summary()
         self._log_unscheduled_closed_summary()

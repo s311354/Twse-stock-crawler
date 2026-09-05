@@ -38,6 +38,7 @@ def test_app_settings_validate_and_normalize_all_runtime_groups(tmp_path) -> Non
             "TWSE_PAE_HOLDINGS_JSON": (
                 '[{"symbol":"2330","shares":1000,'
                 '"average_cost":900,"entry_les":82,'
+                '"entry_decision":"EARLY_BUY",'
                 '"entry_date":"2026-08-05",'
                 '"sector":"24","correlation_cluster":"FOUNDRY"}]'
             ),
@@ -65,6 +66,7 @@ def test_app_settings_validate_and_normalize_all_runtime_groups(tmp_path) -> Non
     assert settings.account_equity == 2_500_000
     assert settings.pae_positions[0].symbol == "2330"
     assert settings.pae_positions[0].entry_les == 82
+    assert settings.pae_positions[0].entry_decision == "EARLY_BUY"
     assert settings.pae_positions[0].entry_date.isoformat() == "2026-08-05"
     assert settings.pae_current_cash == 1_500_000
     assert settings.pae_persistence_path == tmp_path / "pae.sqlite3"

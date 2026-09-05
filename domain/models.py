@@ -30,6 +30,7 @@ class PortfolioPosition:
     shares: float | None = None
     average_cost: float | None = None
     entry_les: float | None = None
+    entry_decision: str | None = None
     entry_date: datetime.date | None = None
     sector: str | None = None
     correlation_cluster: str | None = None
@@ -51,6 +52,19 @@ class PortfolioPosition:
             raise ValueError("PortfolioPosition average_cost cannot be negative")
         if self.entry_les is not None and not 0 <= self.entry_les <= 100:
             raise ValueError("PortfolioPosition entry_les must be between 0 and 100")
+        if self.entry_decision is not None:
+            entry_decision = (
+                str(self.entry_decision)
+                .strip()
+                .upper()
+                .replace("-", "_")
+                .replace(" ", "_")
+            )
+            if entry_decision not in {"BUY", "EARLY_BUY", "BUY_SMALL"}:
+                raise ValueError(
+                    "PortfolioPosition entry_decision must be BUY, EARLY_BUY, or BUY_SMALL"
+                )
+            object.__setattr__(self, "entry_decision", entry_decision)
         if self.entry_date is not None:
             entry_date = self.entry_date
             if isinstance(entry_date, datetime.datetime):

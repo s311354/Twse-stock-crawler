@@ -208,6 +208,29 @@ def test_cold_start_establishes_only_the_first_position() -> None:
     assert result.target_cash_weight >= 0.10 - 1e-9
 
 
+def test_cold_start_labels_exceptional_risk_adjusted_entry_strong_add() -> None:
+    strong = _candidate(
+        "2040",
+        bear=0.16,
+        base=0.20,
+        bull=0.24,
+        quality_score=90,
+    )
+
+    result = PortfolioAllocationEngine().allocate(
+        PortfolioAllocationRequest(
+            account_equity=1_000_000,
+            current_cash=1_000_000,
+            candidates=(strong,),
+        )
+    )
+
+    line = _line(result, "2040")
+    assert line.action is PortfolioAction.STRONG_ADD
+    assert line.evaluation.opportunity_edge >= 0.07
+    assert line.target_weight > 0
+
+
 def test_default_single_industry_profile_does_not_cap_sector_at_half() -> None:
     engine = PortfolioAllocationEngine(
         PortfolioAllocationConfig(
@@ -413,6 +436,59 @@ def test_high_quality_holding_reduces_when_two_exit_signals_confirm() -> None:
     assert line.target_weight == pytest.approx(0.225)
 
 
+def test_two_soft_exit_confirmations_reduce_instead_of_forcing_cash() -> None:
+    engine = PortfolioAllocationEngine()
+    holding = _holding(
+        "4106",
+        bear=-0.06,
+        base=-0.03,
+        bull=0.0,
+        confidence=35,
+        exit_streak=2,
+        quality_score=70,
+    )
+
+    result = engine.allocate(
+        PortfolioAllocationRequest(
+            account_equity=1_000_000,
+            current_cash=700_000,
+            holdings=(holding,),
+        )
+    )
+
+    line = _line(result, "4106")
+    assert line.action is PortfolioAction.REDUCE_25
+    assert line.reason == "PARTIAL_EREM_EXIT_CONFIRMATION"
+    assert line.exit_confirmation_count == 2
+    assert line.target_weight == pytest.approx(0.225)
+
+
+def test_severe_erem_and_trend_break_waits_for_full_confirmation() -> None:
+    engine = PortfolioAllocationEngine()
+    holding = _holding(
+        "4107",
+        confidence=25,
+        exit_streak=2,
+        quality_score=70,
+        ema20=110,
+        ema20_slope=-0.10,
+        distribution_warning=True,
+    )
+
+    result = engine.allocate(
+        PortfolioAllocationRequest(
+            account_equity=1_000_000,
+            current_cash=700_000,
+            holdings=(holding,),
+        )
+    )
+
+    line = _line(result, "4107")
+    assert line.action is PortfolioAction.REDUCE_25
+    assert line.reason == "SEVERE_EREM_PARTIAL_CONFIRMATION"
+    assert line.exit_confirmation_count == 2
+
+
 def test_all_three_soft_exit_signals_confirm_full_exit() -> None:
     engine = PortfolioAllocationEngine()
     holding = _holding(
@@ -561,7 +637,7 @@ def test_one_session_edge_does_not_rotate() -> None:
     assert "PERSISTENCE_NOT_CONFIRMED" in line.reason
 
 
-def test_steady_state_higher_cer_without_quality_advantage_cannot_receive_capital() -> None:
+def test_steady_state_equal_quality_with_higher_cer_can_receive_capital() -> None:
     engine = PortfolioAllocationEngine()
     holding = _holding("6201", quality_score=85)
     companion = _holding(
@@ -589,11 +665,12 @@ def test_steady_state_higher_cer_without_quality_advantage_cannot_receive_capita
 
     candidate_line = _line(result, "6202")
     assert candidate_line.evaluation.absolute_strategic_candidate is True
-    assert candidate_line.evaluation.dual_dominance_candidate is False
-    assert candidate_line.quality_dominance_gate == "FAIL"
+    assert candidate_line.evaluation.dual_dominance_candidate is True
+    assert candidate_line.quality_dominance_gate == "PASS"
     assert candidate_line.cer_dominance_gate == "PASS"
-    assert candidate_line.target_weight == 0
-    assert result.best_strategic_alternative is None
+    assert candidate_line.action is PortfolioAction.STRONG_ADD
+    assert candidate_line.target_weight > 0
+    assert result.best_strategic_alternative == "6202"
 
 
 def test_steady_state_quality_advantage_without_cer_advantage_cannot_receive_capital() -> None:
@@ -627,6 +704,49 @@ def test_steady_state_quality_advantage_without_cer_advantage_cannot_receive_cap
     assert candidate_line.cer_dominance_gate == "FAIL"
     assert candidate_line.dual_dominance_gate == "FAIL"
     assert candidate_line.target_weight == 0
+
+
+def test_equal_quality_challenger_can_rotate_after_cer_persistence() -> None:
+    engine = PortfolioAllocationEngine()
+    holding = _holding("6351", quality_score=85)
+    companion = _holding(
+        "6350",
+        weight=0.20,
+        quality_score=85,
+        cluster="COMPANION",
+    )
+    challenger = _candidate(
+        "6352",
+        bear=0.16,
+        base=0.20,
+        bull=0.24,
+        quality_score=85,
+    )
+    evidence = PersistenceEvidence(
+        incumbent_symbol="6351",
+        challenger_symbol="6352",
+        recent_excess_opportunities=(0.03, 0.03, 0.03),
+    )
+
+    result = engine.allocate(
+        PortfolioAllocationRequest(
+            account_equity=1_000_000,
+            current_cash=500_000,
+            holdings=(holding, companion),
+            candidates=(challenger,),
+            persistence=(evidence,),
+        )
+    )
+
+    holding_line = _line(result, "6351")
+    assert holding_line.quality_dominance_gate == "PASS"
+    assert holding_line.cer_dominance_gate == "PASS"
+    assert holding_line.persistence_passed is True
+    assert holding_line.action in {
+        PortfolioAction.ROTATE_25,
+        PortfolioAction.ROTATE_50,
+        PortfolioAction.ROTATE_75,
+    }
 
 
 def test_best_strategic_alternative_is_quality_first_after_dual_dominance() -> None:
@@ -715,7 +835,7 @@ def test_obvious_opportunity_can_bypass_persistence_but_not_hard_gates() -> None
     assert _line(blocked_result, "7001").action is PortfolioAction.HOLD_NO_ADD
 
 
-def test_full_portfolio_does_not_create_a_fifth_partial_rotation_position() -> None:
+def test_full_portfolio_uses_one_full_atomic_rotation_without_a_fifth_position() -> None:
     engine = PortfolioAllocationEngine()
     holdings = tuple(
         _holding(
@@ -746,17 +866,23 @@ def test_full_portfolio_does_not_create_a_fifth_partial_rotation_position() -> N
         )
     )
 
-    assert _line(result, "9000").target_weight == 0
-    assert sum(line.target_weight > 0 for line in result.lines) == 4
-    assert all(
-        line.action not in {
+    challenger_line = _line(result, "9000")
+    rotation_lines = [
+        line
+        for line in result.lines
+        if line.action in {
             PortfolioAction.ROTATE_25,
             PortfolioAction.ROTATE_50,
             PortfolioAction.ROTATE_75,
             PortfolioAction.FAST_TRACK_ROTATE,
         }
-        for line in result.lines
-    )
+    ]
+    assert challenger_line.target_weight > 0
+    assert sum(line.target_weight > 0 for line in result.lines) == 4
+    assert len(rotation_lines) == 1
+    assert rotation_lines[0].target_weight == 0
+    assert rotation_lines[0].alternative_symbol == "9000"
+    assert "FULL_PORTFOLIO_ATOMIC_ROTATION" in rotation_lines[0].reason
 
 
 def test_dataframe_adapter_and_plugin_registry_are_compatible() -> None:
@@ -787,10 +913,10 @@ def test_dataframe_adapter_and_plugin_registry_are_compatible() -> None:
     result = PortfolioAllocationV1Strategy().run(frame)
 
     assert "portfolio_allocation_v1" in available_strategies()
-    assert get_strategy("portfolio_allocation_v1").version == "1.1.5"
+    assert get_strategy("portfolio_allocation_v1").version == "1.2.1"
     assert result.loc[0, "PAE Decision"] == "ADD"
     assert result.loc[0, "PAE Target Weight"] > 0
-    assert result.loc[0, "PAE Model Version"] == "1.1.5"
+    assert result.loc[0, "PAE Model Version"] == "1.2.1"
 
 
 def test_invalid_scenario_probabilities_are_rejected() -> None:

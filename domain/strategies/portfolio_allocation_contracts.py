@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 
 PORTFOLIO_ALLOCATION_STRATEGY_NAME = "portfolio_allocation_v1"
-PAE_V1_MODEL_VERSION = "1.1.5"
+PAE_V1_MODEL_VERSION = "1.2.1"
 PORTFOLIO_ALLOCATION_OUTPUT_COLUMNS = [
     "PAE Status",
     "PAE Mode",
@@ -127,7 +127,11 @@ class PortfolioAllocationConfig:
     cash_expected_return: float = 0.02
     equity_risk_premium: float = 0.06
     minimum_candidate_quality_score: float = 70.0
-    minimum_quality_advantage: float = 3.0
+    # A challenger must be no worse in quality. Requiring an arbitrary +3
+    # points blocked otherwise superior risk-adjusted return opportunities.
+    minimum_quality_advantage: float = 0.0
+    # Keep a meaningful model-error buffer so relaxed quality parity does not
+    # turn small estimated-return differences into excessive rotation.
     base_replacement_buffer: float = 0.03
     commission_rate_each_side: float = 0.001425
     transaction_tax_rate: float = 0.003
@@ -156,6 +160,8 @@ class PortfolioAllocationConfig:
     erem_severe_exit_threshold: float = 30.0
     erem_reduce_threshold: float = 55.0
     erem_exit_persistence_required: int = 2
+    erem_partial_exit_confirmation_required: int = 2
+    erem_full_exit_confirmation_required: int = 3
     portfolio_balance_tolerance: float = 0.01
     epsilon: float = 1e-9
 
@@ -206,6 +212,16 @@ class PortfolioAllocationConfig:
             )
         if self.erem_exit_persistence_required < 1:
             raise ValueError("erem_exit_persistence_required must be positive")
+        if not (
+            1
+            <= self.erem_partial_exit_confirmation_required
+            < self.erem_full_exit_confirmation_required
+            <= 3
+        ):
+            raise ValueError(
+                "EREM exit confirmation thresholds must satisfy "
+                "1 <= partial < full <= 3"
+            )
         for name in (
             "minimum_cash_reserve",
             "single_stock_weight_limit",

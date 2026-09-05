@@ -44,6 +44,7 @@ def market_history_input() -> MarketHistoryInput:
         fallback_date="2026-07-25",
         entry_les_by_stock={"2330": 82.0},
         entry_dates_by_stock={"2330": "2026-07-24"},
+        entry_decisions_by_stock={"2330": "EARLY_BUY"},
     )
 
 
@@ -69,6 +70,7 @@ def test_market_history_assembler_preserves_context_and_aligns_optional_data() -
         pd.DataFrame({"fiscal_year": [2025]})
     )
     assert history["Entry LES"].tolist() == [82.0, 82.0]
+    assert history["Entry Decision"].tolist() == ["EARLY_BUY", "EARLY_BUY"]
     assert history["Holding Days"].tolist() == [0, 1]
 
 

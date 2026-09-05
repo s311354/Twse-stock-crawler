@@ -21,7 +21,7 @@ class PositiveFloatAdapter(Protocol):
 
 
 class LowEntryV5DecisionEvaluator:
-    """Resolve model state into executable BUY/BUY_SMALL decisions."""
+    """Resolve model state into executable BUY/EARLY_BUY/BUY_SMALL decisions."""
 
     def __init__(
         self,
@@ -92,6 +92,8 @@ class LowEntryV5DecisionEvaluator:
         recent_rally_reclaim_trigger: pd.Series | None = None,
         quality_pullback_trigger: pd.Series | None = None,
         broad_rally_active: pd.Series | None = None,
+        elec_trend_pullback_trigger: pd.Series | None = None,
+        elec_repriced_risk_gate: pd.Series | None = None,
     ) -> pd.Series:
         full_buy_trigger = self._optional_trigger(
             broad_rally_full_buy_trigger,
@@ -138,18 +140,19 @@ class LowEntryV5DecisionEvaluator:
             & (valuation == ValuationStatus.PASS.value)
             & (falling_state == FallingKnifeState.CLEAR.value)
         )
-        early_buy_small = (
+        early_buy = (
             eligible
             & next_day_confirmation
             & (risk_gate == "PASS")
             & (market_gate == "PASS")
             & (valuation == ValuationStatus.PASS.value)
+            & (falling_state == FallingKnifeState.CLEAR.value)
             & (
                 (quality.final_status is FinalQualityStatus.CONFIRMED)
                 | (score >= self.config.provisional_buy_score)
             )
         )
-        decision.loc[early_buy_small] = "BUY_SMALL"
+        decision.loc[early_buy] = "EARLY_BUY"
         decision.loc[normal_buy] = "BUY"
         decision.loc[
             falling_state == FallingKnifeState.PANIC_WATCH.value
@@ -183,6 +186,37 @@ class LowEntryV5DecisionEvaluator:
             & (market_gate == "PASS")
             & starter_valuation
             & (falling_state == FallingKnifeState.CLEAR.value)
+        ).fillna(False)
+        air_cycle_buy_small = (
+            self.quality_policy.air_cycle_starter_eligible(quality)
+            & (score >= self.config.air_cycle_score_threshold)
+            & (raw_score >= self.config.air_cycle_minimum_raw_score)
+            & next_day_confirmation
+            & (risk_gate == "PASS")
+            & (broad_rally_risk_gate == "PASS")
+            & (market_gate == "PASS")
+            & (valuation == ValuationStatus.SUPPORTIVE.value)
+            & (falling_state == FallingKnifeState.CLEAR.value)
+        ).fillna(False)
+        # A different, explicitly priced trade plan is not a risk waiver.
+        # Missing repriced risk evidence remains UNKNOWN, never PASS.
+        elec_risk = (
+            elec_repriced_risk_gate.reindex(score.index)
+            if elec_repriced_risk_gate is not None
+            else pd.Series("UNKNOWN", index=score.index)
+        )
+        elec_trend_pullback_buy_small = (
+            self.config.elec_trend_pullback_enabled
+            & self.quality_policy.elec_trend_pullback_quality_eligible(quality)
+            & self._optional_trigger(elec_trend_pullback_trigger, score.index)
+            & (score >= self.config.elec_trend_pullback_score_threshold)
+            & (raw_score >= self.config.elec_trend_pullback_minimum_raw_score)
+            & (elec_risk == "PASS")
+            & (broad_rally_risk_gate == "PASS")
+            & (market_gate == "PASS")
+            & starter_valuation
+            & (falling_state == FallingKnifeState.CLEAR.value)
+            & ~(normal_buy | early_buy)
         ).fillna(False)
         broad_rally_buy_small = (
             self.quality_policy.broad_rally_quality_eligible(quality)
@@ -238,11 +272,18 @@ class LowEntryV5DecisionEvaluator:
             | rally_reclaim_buy_small
             | supportive_non_broad_buy_small
             | quality_pullback_buy_small
+            | air_cycle_buy_small
+            | elec_trend_pullback_buy_small
         )
         decision.loc[broad_rally_buy_small] = "BUY_SMALL"
 
         broad_rally_full_buy = (
             self.quality_policy.broad_rally_full_buy_quality_eligible(quality)
+            # BUY is the formal full-entry decision and always retains the
+            # model-wide 75-point floor.  Strong breadth may unlock a
+            # conditional BUY_SMALL below that floor, but it cannot promote a
+            # low technical score to BUY.
+            & (score >= self.config.confirmed_buy_score)
             & (score >= self.config.breadth_rally_full_buy_score_threshold)
             & (raw_score >= self.config.breadth_rally_full_buy_minimum_raw_score)
             & full_buy_trigger
@@ -282,6 +323,7 @@ class LowEntryV5DecisionEvaluator:
             else self.config.provisional_position_fraction
         )
         fraction.loc[decision == "BUY"] = normal
+        fraction.loc[decision == "EARLY_BUY"] = normal
         fraction.loc[decision == "BUY_SMALL"] = (
             self.config.breadth_rally_position_fraction
         )
@@ -321,7 +363,7 @@ class LowEntryV5DecisionEvaluator:
         decision: pd.Series,
         recommended_shares: pd.Series,
     ) -> pd.Series:
-        buy_states = decision.isin(["BUY", "BUY_SMALL"])
+        buy_states = decision.isin(["BUY", "EARLY_BUY", "BUY_SMALL"])
         non_executable = buy_states & recommended_shares.fillna(0).le(0)
         downgraded = decision.copy()
         downgraded.loc[non_executable] = "ARMED"

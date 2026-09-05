@@ -244,11 +244,13 @@ class LowEntryV5ReportBuilder:
                         [
                             (decision == "BUY")
                             & panic["broad_rally_full_buy_trigger"],
+                            decision == "EARLY_BUY",
                             decision == "BUY_SMALL",
                             decision == "BUY",
                         ],
                         [
                             "NEXT_SESSION_BREAKS_SIGNAL_HIGH",
+                            "NEXT_DAY_REVERSAL_CONFIRMATION",
                             "NEXT_SESSION_BREAKS_SIGNAL_HIGH",
                             "CLOSE_CONFIRMED",
                         ],
@@ -336,6 +338,10 @@ class LowEntryV5ReportBuilder:
         detail["retest"] = panic["recent_rally_retest_trigger"]
         detail["reclaim"] = panic["recent_rally_reclaim_trigger"]
         detail["quality_pullback"] = panic["quality_pullback_trigger"]
+        detail["high_quality_reversal"] = panic[
+            "high_quality_reversal_trigger"
+        ]
+        detail["air_cycle_watch"] = panic["air_cycle_watch"]
         detail["supportive_non_broad"] = (
             (decision == "BUY_SMALL")
             & ~panic["broad_rally_active"].fillna(False)
@@ -355,12 +361,12 @@ class LowEntryV5ReportBuilder:
             quality.critical_field_coverage,
         )
         valuation_reasons = "、".join(valuation_result.reasons) or "NONE"
-        return detail.apply(
+        reasons = detail.apply(
             lambda row: (
                 "{}；Valuation={}({})；分數={:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f}"
                 "；Penalty={:.0f}；Falling={}({})；Panic/Reversal={:.0f}/{:.0f}"
                 "；Trigger={}；Risk={}({})；BroadRally={}/{}/Full={}/Absorb={}/MultiDay={}/Retest={}/Reclaim={}"
-                "；SupportiveNonBroad={}；QualityPullback={}；Required={:.0f}；決策={}"
+                "；SupportiveNonBroad={}；QualityPullback={}；HighQualityReversal={}；AirCycleWatch={}；Required={:.0f}；決策={}"
             ).format(
                 quality_text,
                 row["valuation"],
@@ -388,11 +394,34 @@ class LowEntryV5ReportBuilder:
                 "YES" if row["reclaim"] else "NO",
                 "YES" if row["supportive_non_broad"] else "NO",
                 "YES" if row["quality_pullback"] else "NO",
+                "YES" if row["high_quality_reversal"] else "NO",
+                "YES" if row["air_cycle_watch"] else "NO",
                 row["required"],
                 row["decision"],
             ),
             axis=1,
         )
+        elec_trigger = panic.get(
+            "elec_trend_pullback_trigger", pd.Series(False, index=detail.index)
+        ).fillna(False)
+        if not elec_trigger.any():
+            return reasons
+        elec_risk = panic.get(
+            "elec_repriced_risk_gate", pd.Series("UNKNOWN", index=detail.index)
+        )
+        reasons.loc[elec_trigger] += (
+            "；ELECTrendPullback=YES；ELECRepricedRisk=" + elec_risk.loc[elec_trigger]
+        )
+        for key, label in (
+            ("elec_starter_required_score", "ELECStarterRequired"),
+            ("elec_starter_required_raw_score", "ELECStarterRawRequired"),
+        ):
+            if key in panic:
+                reasons.loc[elec_trigger] += (
+                    "；" + label + "="
+                    + panic[key].loc[elec_trigger].map(lambda value: f"{value:g}")
+                )
+        return reasons
 
     def empty_result(self) -> dict[str, object]:
         result = {column: np.nan for column in self.output_columns}

@@ -3,6 +3,8 @@
 import pandas as pd
 
 from domain.quality_v5 import FinalQualityStatus
+from domain.strategies.low_entry_score_v5 import LowEntryV5MarketRules
+from domain.strategies.low_entry_score_v5 import LowEntryV5RuleEngine
 from domain.strategies.low_entry_score_v5 import LowEntryScoreV5Strategy
 from domain.strategies.low_entry_v5_decision import LowEntryV5DecisionEvaluator
 from domain.strategies.low_entry_v5_fundamentals import (
@@ -18,7 +20,9 @@ def test_default_pipeline_uses_independent_composable_components(
 ) -> None:
     strategy = LowEntryScoreV5Strategy()
 
-    assert strategy.rule_engine is not None
+    assert strategy._rule_engine is None
+    strategy.run(pd.DataFrame())
+    assert strategy._rule_engine is None
     assert isinstance(
         strategy.pipeline.components.market,
         LowEntryV5MarketEvaluator,
@@ -43,21 +47,23 @@ def test_default_pipeline_uses_independent_composable_components(
         strategy.pipeline.components.report,
         LowEntryV5ReportBuilder,
     )
-    assert strategy.pipeline.components.market is strategy.rule_engine.market_evaluator
+    compatibility = strategy.rule_engine
+    assert compatibility is not None
+    assert strategy.pipeline.components.market is compatibility.market_evaluator
     assert (
         strategy.pipeline.components.fundamentals
-        is strategy.rule_engine.fundamental_evaluator
+        is compatibility.fundamental_evaluator
     )
-    assert strategy.pipeline.components.panic is strategy.rule_engine.panic_evaluator
+    assert strategy.pipeline.components.panic is compatibility.panic_evaluator
     assert (
         strategy.pipeline.components.scoring
-        is strategy.rule_engine.scoring_evaluator
+        is compatibility.scoring_evaluator
     )
     assert (
         strategy.pipeline.components.decision
-        is strategy.rule_engine.decision_evaluator
+        is compatibility.decision_evaluator
     )
-    assert strategy.pipeline.components.report is strategy.rule_engine.report_builder
+    assert strategy.pipeline.components.report is compatibility.report_builder
 
 
 def test_rule_engine_preserves_fundamental_compatibility_delegate() -> None:
@@ -102,3 +108,13 @@ def test_rule_engine_preserves_scoring_compatibility_delegate() -> None:
     pd.testing.assert_series_equal(compatibility_risk_off, direct_risk_off)
     assert compatibility_penalty.tolist() == [-10, 0]
     assert compatibility_risk_off.tolist() == [True, False]
+
+
+def test_legacy_rule_engine_and_rules_wrapper_remain_import_compatible() -> None:
+    compatibility = LowEntryV5RuleEngine()
+    market_rules = LowEntryV5MarketRules(compatibility)
+
+    assert market_rules.shared_feature_config() == (
+        compatibility.market_evaluator.shared_feature_config()
+    )
+    assert compatibility.empty_result()["低點決策"] == "DATA_INSUFFICIENT"

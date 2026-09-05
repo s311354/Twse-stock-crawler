@@ -1,4 +1,5 @@
 import datetime
+import logging
 
 import pytest
 import pandas as pd
@@ -16,6 +17,7 @@ from infrastructure.crawler.twse_http_client import TwseNetworkError
 from infrastructure.crawler.twse_http_client import TwseSchemaChangedError
 from infrastructure.fundamentals.mops_repository import MopsStorageError
 from infrastructure.bootstrap import build_stock_analysis_runtime
+from application.portfolio_allocation_v2 import PortfolioAllocationV2Pipeline
 from infrastructure.bootstrap import build_stock_analysis_service
 from infrastructure.stock_analysis_adapters import CrawlerFundamentalAdapter
 from interface.cli import build_request
@@ -213,6 +215,17 @@ def test_default_calendar_and_crawler_share_one_http_client() -> None:
     assert (
         runtime.fundamental_service.filing_catalog.http_client
         is http_client
+    )
+
+
+def test_production_composition_root_uses_pae_v2_pipeline() -> None:
+    runtime = build_stock_analysis_runtime()
+
+    strategy_adapter = runtime.service._evaluate_strategies._strategies
+
+    assert isinstance(
+        strategy_adapter._portfolio_allocator,
+        PortfolioAllocationV2Pipeline,
     )
 
 
@@ -440,6 +453,78 @@ def test_fundamental_refresh_logs_one_individual_scope_fallback_summary(
         and values["fallback_symbols"] == ["6281", "7631"]
         for event, values in observer.records
     )
+
+
+def test_fundamental_refresh_logs_one_access_blocked_cache_summary(
+    caplog,
+) -> None:
+    class CachedCrawler:
+        stocknumbers = ["6924", "6962", "7631"]
+        stocknames = ["測試一", "測試二", "測試三"]
+        daily_dates = [["2026-08-31"] for _ in stocknumbers]
+
+        def set_low_entry_v4_fundamentals(self, *args, **kwargs):
+            pass
+
+    class AccessBlockedCacheService:
+        def __init__(self) -> None:
+            self.symbols: set[str] = set()
+
+        def reset_access_blocked_diagnostics(self):
+            self.symbols.clear()
+
+        def consume_access_blocked_cache_fallback_symbols(self):
+            result = tuple(sorted(self.symbols))
+            self.symbols.clear()
+            return result
+
+        def load(self, symbol, **kwargs):
+            self.symbols.add(symbol)
+            return FundamentalBundle(
+                annual_fundamentals=pd.DataFrame({"fiscal_year": [2025]}),
+                snapshot={"available_at": "2026-08-31T13:45:00+08:00"},
+            )
+
+    service = AccessBlockedCacheService()
+    adapter = CrawlerFundamentalAdapter(service)
+    context = AnalysisContext(
+        CachedCrawler(),
+        datetime.date(2026, 8, 31),
+        MarketStatus.OPEN,
+    )
+    request = StockAnalysisRequest(
+        stocklist=["6924", "6962", "7631"],
+        stocktype="ELEC",
+        output_file_names="shirong",
+        endbacktrack=3,
+    )
+
+    with caplog.at_level("INFO"):
+        adapter.refresh(
+            context,
+            request,
+            analysis_time=datetime.datetime(
+                2026,
+                8,
+                31,
+                13,
+                45,
+                tzinfo=datetime.timezone(datetime.timedelta(hours=8)),
+            ),
+        )
+
+    summaries = [
+        record
+        for record in caplog.records
+        if getattr(record, "status", None)
+        == "ACCESS_BLOCKED_CACHE_FALLBACK_SUMMARY"
+    ]
+    assert len(summaries) == 1
+    assert summaries[0].levelno == logging.WARNING
+    assert summaries[0].source == "MOPS_CACHE"
+    assert summaries[0].cache_hit is True
+    assert "stocks=3 symbols=6924,6962,7631" in summaries[0].getMessage()
+    assert service.symbols == set()
 
 
 def test_application_separates_preferred_security_from_mops_issuer() -> None:

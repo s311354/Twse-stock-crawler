@@ -32,6 +32,8 @@ class StockAnalysisRequest:
     mops_enabled: bool = True
     mops_history_years: int = 5
     account_equity: float = 1_000_000.0
+    portfolio_symbols: tuple[str, ...] = ()
+    explicit_symbols: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

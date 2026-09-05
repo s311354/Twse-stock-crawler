@@ -36,6 +36,16 @@ class MarketHistoryCachePort(Protocol):
     ) -> dict[str, CachedMarketDay]:
         """Load complete cached days with one repository query."""
 
+    def load_symbols_many(
+        self,
+        trade_dates: list[str],
+        *,
+        market_type: str,
+        symbols: set[str],
+        schema_version: int = MARKET_HISTORY_SCHEMA_VERSION,
+    ) -> dict[str, CachedMarketDay]:
+        """Load only requested stock rows from complete cached market days."""
+
     def upsert_day(
         self,
         day: CachedMarketDay,

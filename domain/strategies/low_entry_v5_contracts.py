@@ -8,7 +8,7 @@ from enum import Enum
 LOW_ENTRY_STRATEGY_NAME = "low_entry_score_v5"
 LES_V5_MODEL_VERSION = "5.0.0"
 LES_V5_PARAMETER_VERSION = (
-    "quality-first-panic-reversal-2026-08-21-v23-two-entry-states"
+    "quality-first-panic-reversal-2026-09-05-v26-elec-trend-pullback"
 )
 
 

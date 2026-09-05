@@ -10,6 +10,7 @@ class DataErrorCategory(str, enum.Enum):
     NO_DATA = "no_data"
     SCHEMA_CHANGED = "schema_changed"
     NETWORK_ERROR = "network_error"
+    ACCESS_BLOCKED = "access_blocked"
 
 
 class DataSourceError(RuntimeError):
@@ -34,3 +35,7 @@ class SchemaChangedError(DataSourceError):
 
 class NetworkError(DataSourceError):
     category = DataErrorCategory.NETWORK_ERROR
+
+
+class AccessBlockedError(DataSourceError):
+    category = DataErrorCategory.ACCESS_BLOCKED

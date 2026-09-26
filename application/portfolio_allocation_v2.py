@@ -297,6 +297,9 @@ class PortfolioAllocationV2Pipeline:
             if item is not None
         ]
         data_confidence = min(confidences) if confidences else None
+        is_v6 = decision.value("LES Model Version") == "6.0.0"
+        if is_v6:
+            data_confidence = self._number(decision.value("Data Confidence"))
         quality_confidence = self._number(
             decision.value("Quality Confidence")
         )
@@ -306,8 +309,10 @@ class PortfolioAllocationV2Pipeline:
             decision.value("Quality Hard Rejects", "NONE")
         ).upper()
         quality_status = self._quality_status(
-            decision.value("LES v5 Final Quality Status")
+            decision.value("Quality Status" if is_v6 else "LES v5 Final Quality Status")
         )
+        if is_v6:
+            quality_confidence = data_confidence
         erem_reason = self._text(decision.value("EREM 理由", ""))
         holding_confidence = self._number(
             decision.value("EREM Holding Confidence")
@@ -338,7 +343,7 @@ class PortfolioAllocationV2Pipeline:
             correlation_cluster_id=cluster,
             quality_status=quality_status,
             quality_score=self._number(
-                decision.value("LES v5 Final Quality Score")
+                decision.value("Quality Score" if is_v6 else "LES v5 Final Quality Score")
             ),
             quality_confidence=quality_confidence,
             data_confidence=data_confidence,

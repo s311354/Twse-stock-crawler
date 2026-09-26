@@ -370,6 +370,10 @@ LOW_ENTRY_OUTPUT_COLUMNS = [
     "建議股數",
     "LES Model Version",
     "LES Parameter Version",
+    "Industry Quality Profile",
+    "Industry Profile Version",
+    "Industry Profile Mode",
+    "Industry Shadow Decision",
     "低點理由",
 ]
 

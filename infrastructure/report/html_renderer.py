@@ -12,6 +12,7 @@ from tabulate import tabulate
 from domain.model_contracts import StrategyDecision
 from infrastructure.report.contracts import HtmlRenderer
 from infrastructure.report.contracts import MetricColumn
+from infrastructure.report.low_entry_v6_renderer import LowEntryV6Renderer
 from infrastructure.report.portfolio_renderer import (
     PortfolioAllocationRenderer,
 )
@@ -359,6 +360,8 @@ class LowEntryV41Renderer(LowEntryHtmlRenderer):
                 '<div style="margin-top:8px"><strong>標準 BUY 風控</strong>：'
                 "RR ≥ 1.7、停損距離 ≤ 1.8 ATR14；初始部位上限 1/3。</div>"
                 '<div style="margin-top:8px"><strong>CHEMICAL_PROFILE</strong>：'
+                "正式 registry 已改用 CHEMI_PROFILE，與其他 Stocktype 預設皆為 SHADOW；"
+                "僅觀察、不進場。以下為校準並啟用 ACTIVE 後的既有規則："
                 "QS ≥ 65 可走標準流程；QS 60–64 且 DC ≥ 75，只能在 Strict "
                 "Trigger、Strict Risk 與所有 Veto 通過後，以 1/8 部位 BUY_SMALL。</div>"
                 '<div style="margin-top:8px"><strong>PROVISIONAL BUY_SMALL</strong>：'
@@ -1112,9 +1115,13 @@ class DailyStrategyEmailRenderer(HtmlRenderer):
         decisions: Sequence[StrategyDecision],
     ) -> str:
         unique_decisions = self.portfolio_renderer.latest_by_symbol(decisions)
-        entry_card = self.entry_renderer.render_entry_summary(unique_decisions)
+        versions = {item.value("LES Model Version", "5.0.0") for item in unique_decisions}
+        if "6.0.0" in versions and len(versions) != 1:
+            raise ValueError("Mixed LES versions cannot share a daily report")
+        entry_renderer = LowEntryV6Renderer() if not versions or versions == {"6.0.0"} else self.entry_renderer
+        entry_card = entry_renderer.render_entry_summary(unique_decisions)
         portfolio_card = self.portfolio_renderer.render(unique_decisions)
-        details = self.entry_renderer.render_analysis(
+        details = entry_renderer.render_analysis(
             unique_decisions,
             include_entry_summary=False,
         )
@@ -1144,6 +1151,7 @@ class RendererFactory:
         "low_entry_score_v4": LowEntryV4Renderer(),
         "low_entry_score_v4_1": LowEntryV41Renderer(),
         "low_entry_score_v5": LowEntryV5Renderer(),
+        "low_entry_score_v6": LowEntryV6Renderer(),
         "expected_return_exit_v3": ExpectedReturnExitV3Renderer(),
         "portfolio_allocation_v1": PortfolioAllocationRenderer(),
         "portfolio_allocation_v2": PortfolioAllocationRenderer(),

@@ -755,7 +755,7 @@ def test_missing_taiex_skips_date_without_misaligned_stock_data() -> None:
     assert crawler.iso_scheduled_times == ["2026-06-17"]
 
 
-def test_daily_analysis_dataset_uses_low_entry_score_v5() -> None:
+def test_daily_analysis_dataset_uses_v6_and_keeps_erem_and_legacy_evidence() -> None:
     crawler = CapturingTwseCrawler(1)
     crawler.iso_scheduled_times = ["2026-06-17"]
     crawler.stocknumbers = ["2382"]
@@ -790,8 +790,10 @@ def test_daily_analysis_dataset_uses_low_entry_score_v5() -> None:
     assert dataset.loc[0, "Base Data Confidence"] == 0
     assert dataset.loc[0, "Extended Data Confidence"] == 0
     rendered = crawler.build_entry_signal_analysis(decisions)
-    assert "Low-Entry Model v5" in rendered
-    assert "Quality-First Panic Reversal" in rendered
+    assert dataset.loc[0, "LES Model Version"] == "6.0.0"
+    assert "LES v6 Report" in dataset.columns
+    assert "Low-Entry Model v6" in rendered
+    assert "Quality-First Adaptive Entry" in rendered
     assert "DATA_INSUFFICIENT" in rendered
     assert "EREM 分數" in dataset.columns
     assert "EREM 決策訊號" in dataset.columns

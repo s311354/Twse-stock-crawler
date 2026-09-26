@@ -11,6 +11,8 @@ from typing import Any, Callable
 import pandas as pd
 
 from domain.data_provenance import TRUSTED_AVAILABILITY_SOURCES
+from domain.elec_quality_metrics import electronics_cycle_values
+from domain.eleccomp_quality_metrics import components_cycle_values
 from domain.industry_profiles import ELECTRONICS_PROFILE
 from domain.industry_profiles import IndustryProfileMode
 from domain.industry_profiles import IndustryProfileRegistry
@@ -186,6 +188,19 @@ def evaluate_quality_gate(
         qa_flags.append("INDUSTRY_PROFILE_SHADOW_MODE")
 
     values = _quality_values(annual, snapshot)
+    cycle_producer = {
+        "ELEC_PROFILE": electronics_cycle_values,
+        "ELECCOMP_PROFILE": components_cycle_values,
+    }.get(scoring_profile.name)
+    if cycle_producer is not None:
+        cycle_values = cycle_producer(
+            annual, snapshot if snapshot_point_in_time and snapshot_source_trusted else {},
+        )
+        values.update(cycle_values)
+        missing_cycle = [name for name, value in cycle_values.items() if value is None]
+        if missing_cycle:
+            stocktype = scoring_profile.name.removesuffix("_PROFILE")
+            qa_flags.append(stocktype + "_CYCLE_MISSING=" + ",".join(missing_cycle))
     metric_scores = _score_quality_metrics(values, scoring_profile)
     available_metric_weight = sum(
         metric.maximum for metric in metric_scores if metric.available

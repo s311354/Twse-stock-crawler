@@ -30,18 +30,23 @@ _CJK_LAYOUT_WHITESPACE = re.compile(
 def normalize_cjk_text(value: str | None) -> str:
     """Normalize presentation artifacts without destroying English spacing.
 
-    HTML entities and full-width compatibility forms are normalized first.
+    HTML entities (including nested escapes) and full-width compatibility forms
+    are decoded to a fixed point, so normalization is idempotent.
     Zero-width formatting characters are removed, Unicode whitespace is
     collapsed, and layout spaces between adjacent CJK characters are removed.
     """
 
     if value is None:
         return ""
-    normalized = unescape(str(value))
-    normalized = unicodedata.normalize("NFKC", normalized)
-    normalized = _ZERO_WIDTH_CHARACTERS.sub("", normalized)
-    normalized = _UNICODE_WHITESPACE.sub(" ", normalized).strip()
-    return _CJK_LAYOUT_WHITESPACE.sub("", normalized)
+    normalized = str(value)
+    while True:
+        decoded = unicodedata.normalize("NFKC", unescape(normalized))
+        decoded = _ZERO_WIDTH_CHARACTERS.sub("", decoded)
+        decoded = _UNICODE_WHITESPACE.sub(" ", decoded).strip()
+        decoded = _CJK_LAYOUT_WHITESPACE.sub("", decoded)
+        if decoded == normalized:
+            return decoded
+        normalized = decoded
 
 
 __all__ = ["normalize_cjk_text"]

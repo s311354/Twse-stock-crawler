@@ -83,6 +83,12 @@ class LegacyCrawlerFacade:
             ),
             signal_dates=self.low_entry_v4_signal_dates_by_stock,
             account_equity=self.low_entry_v4_account_equity,
+            default_sector=str(getattr(self, "analysis_universe", "UNKNOWN")),
+            market_source=getattr(self, "market_source", "TWSE"),
+            replay_as_of=getattr(self, "replay_as_of", None),
+            les_v6_portfolio=getattr(self, "les_v6_portfolio", {}),
+            trading_restrictions=getattr(self, "trading_restrictions", {}),
+            les_v6_research_context=getattr(self, "les_v6_research_context", {}),
             fallback_date=(
                 self.iso_scheduled_times[-1]
                 if self.iso_scheduled_times
@@ -143,9 +149,10 @@ class LegacyCrawlerFacade:
         smtpemail.textstockprofittable(
             iso_scheduled_times=self.iso_scheduled_times,
             transactiondays=self.transactiondays,
-            stocktype=stocktype,
+            stocktype=("TPEx 上櫃半導體 SEMI" if getattr(self, "market_source", "TWSE") == "TPEX" else stocktype),
             stockprofittable="",
             entryanalysis=entryanalysis,
+            les_model_version=(decisions[0].value("LES Model Version", "5.0.0") if decisions else "6.0.0"),
         )
 
     def smtp_img_email(

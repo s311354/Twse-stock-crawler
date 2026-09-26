@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import date
 import re
 from typing import Any
 
@@ -12,7 +13,7 @@ from domain.text_normalization import normalize_cjk_text
 
 
 FUNDAMENTAL_DERIVATION_VERSION = (
-    "2026-07-27-qs-dc-v7-industry-profiles"
+    "2026-09-25-qs-dc-v11-declared-xbrl-units"
 )
 
 
@@ -349,6 +350,7 @@ def _derive_snapshot(
         ],
         "accounting_concern_classification": accounting_concern_classification,
         "audit_evidence_available": audit["audit_evidence_available"],
+        "audit_review_required": audit["audit_review_required"],
         "correction_description": latest.correction_description,
         "sector": sector,
         "free_cash_flow_ttm": free_cash_flow_ttm,
@@ -474,34 +476,117 @@ def _latest_annual_values(
     }
 
 
+_OPINION_CONCEPTS = {
+    "tifrs-ar:UnqualifiedOpinionAbstract",
+    "tifrs-ar:QualifiedOpinionAbstract",
+    "tifrs-ar:AdverseOpinionAbstract",
+    "tifrs-ar:DisclaimerOfOpinionAbstract",
+    "tifrs-ar:UnqualifiedOpinionWithEmphasisOfMatterParagraphsOrOtherMatterParagraphs",
+}
+_REPORT_BODY_CONCEPT = "tifrs-ar:AccountantsReportBody"
+_AUDIT_CONCEPTS = _OPINION_CONCEPTS | {_REPORT_BODY_CONCEPT}
+_NON_AFFIRMATIVE_FLAGS = {"", "n", "no", "false", "0", "unknown", "n/a", "none", "未知"}
+
+
+def _audit_facts_by_period(
+    latest: FiledFinancials,
+) -> tuple[tuple[FiledFact, ...], tuple[FiledFact, ...], date | None]:
+    """Select filing-level facts by context, never mix comparative endpoints.
+
+    Undated legacy facts are a fallback per category (abstract/body), only when
+    that category has no dated current facts. Dimensional and invalid/future
+    contexts are not evidence for the reporting entity's current opinion.
+    """
+    try:
+        period_end = date.fromisoformat(latest.period_end) if latest.period_end else date(
+            latest.fiscal_year, latest.quarter * 3, (31, 30, 30, 31)[latest.quarter - 1]
+        )
+    except (ValueError, IndexError):
+        return (), (), None
+    by_date: dict[date, list[FiledFact]] = {}
+    undated: list[FiledFact] = []
+    for fact in latest.facts:
+        if fact.dimensions or fact.concept not in _AUDIT_CONCEPTS:
+            continue
+        endpoint = fact.end_date or fact.instant
+        if endpoint is None:
+            if fact.start_date is None:
+                undated.append(fact)
+            continue
+        try:
+            fact_date = date.fromisoformat(endpoint)
+        except ValueError:
+            continue
+        if fact_date <= period_end:
+            by_date.setdefault(fact_date, []).append(fact)
+    current = by_date.get(period_end, [])
+    categories = {fact.concept == _REPORT_BODY_CONCEPT for fact in current}
+    current = current + [
+        fact for fact in undated
+        if (fact.concept == _REPORT_BODY_CONCEPT) not in categories
+    ]
+    prior_end = max((end for end in by_date if end < period_end), default=None)
+    prior = by_date[prior_end] if prior_end is not None else []
+    return tuple(current), tuple(prior), prior_end
+
+
 def _derive_audit_evidence(latest: FiledFinancials) -> dict[str, object]:
+    current, prior, prior_end = _audit_facts_by_period(latest)
+    evidence = _derive_period_audit_evidence(replace(latest, facts=current))
+    if prior and prior_end is not None:
+        comparative = _derive_period_audit_evidence(replace(
+            latest, facts=prior, fiscal_year=prior_end.year,
+        ))
+        source = str(comparative["audit_opinion_source"])
+        opinion = comparative["audit_opinion"]
+        # Structured prior facts outrank comparative mentions in the current
+        # body, including conflicts/unknown flags; never promote them to PASS.
+        if source != "NONE" and (
+            source.startswith("ABSTRACT")
+            or opinion != "UNKNOWN"
+            or evidence["comparative_audit_opinion"] is None
+        ):
+            if opinion == "UNKNOWN" and _opinion_abstract_is_true(
+                prior, "tifrs-ar:QualifiedOpinionAbstract"
+            ):
+                opinion = "QUALIFIED_UNKNOWN" if source == "ABSTRACT" else "UNKNOWN"
+            evidence["comparative_audit_opinion"] = opinion
+            evidence["comparative_audit_opinion_source"] = (
+                f"{source}_COMPARATIVE"
+                if source.startswith("ABSTRACT")
+                else "REPORT_BODY_COMPARATIVE"
+            )
+    # Keep all report bodies for traceability; only period-selected evidence
+    # above can affect the current opinion and hard-risk flags.
+    raw = " ".join(
+        fact.text_value for fact in latest.facts
+        if fact.concept == _REPORT_BODY_CONCEPT and fact.text_value
+    )
+    evidence["audit_report_text_raw"] = raw
+    evidence["audit_report_text_normalized"] = normalize_cjk_text(raw)
+    return evidence
+
+
+def _derive_period_audit_evidence(latest: FiledFinancials) -> dict[str, object]:
     facts = latest.facts
     report_bodies = [
         fact.text_value or ""
         for fact in facts
         if fact.concept == "tifrs-ar:AccountantsReportBody" and fact.text_value
     ]
-    report_body = " ".join(report_bodies)
-    normalized_report_body = normalize_cjk_text(report_body)
-    summary_text = " ".join(
+    summary_texts = [
         fact.text_value or ""
         for fact in facts
-        if fact.concept
-        in {
-            "tifrs-ar:UnqualifiedOpinionAbstract",
-            "tifrs-ar:QualifiedOpinionAbstract",
-            "tifrs-ar:AdverseOpinionAbstract",
-            "tifrs-ar:DisclaimerOfOpinionAbstract",
-            (
-                "tifrs-ar:"
-                "UnqualifiedOpinionWithEmphasisOfMatterParagraphsOrOtherMatterParagraphs"
-            ),
-        }
+        if fact.concept in _OPINION_CONCEPTS
         and fact.text_value
-        and (fact.text_value or "").strip().lower() not in {"y", "n"}
-    )
+        and normalize_cjk_text(fact.text_value).lower()
+        not in _NON_AFFIRMATIVE_FLAGS | {"y", "yes", "true", "1"}
+    ]
+    # Each selected fact starts in its own reporting context. The analysis-only
+    # label prevents a prior section in one fact from leaking into the next;
+    # raw/normalized evidence returned by the wrapper is never annotated.
     normalized = normalize_cjk_text(
-        " ".join((report_body, summary_text))
+        " ".join("本期:" + text for text in report_bodies + summary_texts)
     ).lower()
     text_evidence_available = bool(normalized.strip())
     adverse_abstract = _opinion_abstract_is_true(
@@ -535,7 +620,8 @@ def _derive_audit_evidence(latest: FiledFinancials) -> dict[str, object]:
     true_abstracts = [
         name for name, is_true in abstract_values.items() if is_true
     ]
-    evidence_available = text_evidence_available or bool(true_abstracts)
+    abstracts_present = any(fact.concept in _OPINION_CONCEPTS for fact in facts)
+    evidence_available = text_evidence_available or abstracts_present
     abstract_conflict = len(true_abstracts) > 1
     modified_abstract = next(
         (
@@ -550,6 +636,8 @@ def _derive_audit_evidence(latest: FiledFinancials) -> dict[str, object]:
         if abstract_conflict
         else "ABSTRACT"
         if true_abstracts
+        else "ABSTRACT_UNKNOWN"
+        if abstracts_present
         else "REPORT_BODY_FALLBACK"
         if text_evidence_available
         else "NONE"
@@ -582,10 +670,10 @@ def _derive_audit_evidence(latest: FiledFinancials) -> dict[str, object]:
         if text_evidence_available or unqualified_abstract
         else None
     )
-    # The structured abstract describes the current report.  Report bodies
-    # frequently reproduce the prior-year qualified basis for comparatives;
-    # those historical words must not override a current unmodified abstract.
-    infer_from_body = not true_abstracts
+    # Body fallback is absence-based, not truth-based. Present but empty,
+    # false, or conflicting structured flags must stay UNKNOWN. A qualified
+    # abstract still needs its current basis text to classify the reason.
+    infer_from_body = not abstracts_present
     has_adverse_opinion = modified_abstract == "ADVERSE" or (
         infer_from_body
         and _contains_current_period_marker(
@@ -607,6 +695,18 @@ def _derive_audit_evidence(latest: FiledFinancials) -> dict[str, object]:
         and _contains_current_period_marker(
             normalized,
             qualified_markers,
+            latest.fiscal_year,
+        )
+    )
+    has_unmodified_opinion = unqualified_abstract or (
+        infer_from_body
+        and _contains_current_period_marker(
+            normalized,
+            (
+                "無保留意見", "無保留結論", "unmodified opinion",
+                "unqualified opinion", "unmodified conclusion",
+                "並未發現財務報告未允當表達",
+            ),
             latest.fiscal_year,
         )
     )
@@ -642,11 +742,11 @@ def _derive_audit_evidence(latest: FiledFinancials) -> dict[str, object]:
             opinion = "UNKNOWN"
             material_issue = None
             concern_classification = "UNKNOWN"
-    elif evidence_available and latest.audit_status == "reviewed":
+    elif has_unmodified_opinion and latest.audit_status == "reviewed":
         opinion = "REVIEWED_UNMODIFIED"
         material_issue = False
         concern_classification = "NONE"
-    elif evidence_available:
+    elif has_unmodified_opinion:
         opinion = "UNMODIFIED"
         material_issue = False
         concern_classification = "NONE"
@@ -670,14 +770,13 @@ def _derive_audit_evidence(latest: FiledFinancials) -> dict[str, object]:
         "comparative_audit_opinion": comparative_opinion,
         "accounting_concern_classification": concern_classification,
         "audit_evidence_available": evidence_available,
+        "audit_review_required": evidence_available and opinion == "UNKNOWN",
         "audit_opinion_source": opinion_source,
         "comparative_audit_opinion_source": (
             "REPORT_BODY_COMPARATIVE"
             if comparative_opinion is not None
             else "NONE"
         ),
-        "audit_report_text_raw": report_body,
-        "audit_report_text_normalized": normalized_report_body,
     }
 
 
@@ -689,8 +788,8 @@ def _opinion_abstract_is_true(
     for fact in facts:
         if fact.concept not in accepted:
             continue
-        text = (fact.text_value or "").strip().lower()
-        if text in {"n", "no", "false", "0"}:
+        text = normalize_cjk_text(fact.text_value).lower()
+        if text in _NON_AFFIRMATIVE_FLAGS - {""}:
             continue
         if text or (fact.numeric_value is not None and fact.numeric_value != 0):
             return True
@@ -703,6 +802,13 @@ def _qualified_basis_text(
     current_fiscal_year: int,
     comparative: bool = False,
 ) -> str:
+    """Read basis sections, not references to them or generic responsibilities.
+
+    iXBRL flattens headings into the body. A fixed character window can include
+    management's duty to prevent material misstatement, which is not an audit
+    finding. Unknown/unrecognized sections remain unclassified, never cleared.
+    """
+    report_text = _normalize_audit_text(report_text)
     start_markers = (
         "保留意見之基礎",
         "保留結論之基礎",
@@ -712,21 +818,41 @@ def _qualified_basis_text(
         "basis of qualified conclusion",
     )
     candidates: list[str] = []
+    section_end = re.compile(
+        r"本期:|關鍵查核事項|關鍵核閱事項|其他事項|強調事項|"
+        r"管理階層(?:與治理單位)?對(?:合併|個體|個別)?財務(?:報告|報表)之責任|"
+        r"會計師(?:查核|核閱)(?:合併|個體|個別)?財務(?:報告|報表)之責任|"
+        r"key audit matters|other matter|emphasis of matter|"
+        r"responsibilities of (?:management|the auditor)|"
+        r"management[’']s responsibilities|auditor[’']s responsibilities|"
+        r"保留(?:意見|結論)(?!之基礎)|qualified (?:opinion|conclusion)"
+    )
     for marker in start_markers:
         search_from = 0
         while (marker_position := report_text.find(marker, search_from)) >= 0:
             basis_start = marker_position + len(marker)
             prefix = report_text[max(0, marker_position - 48) : marker_position]
+            suffix = report_text[basis_start:]
+            # Examples: 除保留意見之基礎段所述..., 表示保留意見之基礎。
+            # English reports likewise refer to the 'Basis ... section'.
+            if (re.match(r"\s*[」\"'’]?\s*(?:段|所述|[。；;]|section\b|paragraph\b)", suffix)
+                    or re.search(r"(?:表示|上述|前述|除|described in(?: the)?|refer to(?: the)?)\s*[「\"'‘]?\s*$", prefix)):
+                search_from = basis_start
+                continue
             is_prior = _is_prior_period_reference(
-                prefix,
+                report_text[:marker_position],
                 current_fiscal_year,
             )
             if is_prior != comparative:
                 search_from = basis_start
                 continue
-            candidates.append(report_text[basis_start : basis_start + 4000])
+            end = section_end.search(report_text, basis_start)
+            next_bases = [pos for next_marker in start_markers
+                          if (pos := report_text.find(next_marker, basis_start)) >= 0]
+            basis_end = min([len(report_text), *(next_bases), *([end.start()] if end else [])])
+            candidates.append(report_text[basis_start:basis_end])
             search_from = basis_start
-    return " ".join(candidates).strip()
+    return " ".join(dict.fromkeys(candidates)).strip()
 
 
 def _is_non_significant_component_scope_limitation(basis: str) -> bool:
@@ -734,6 +860,13 @@ def _is_non_significant_component_scope_limitation(basis: str) -> bool:
         return False
     compact_basis = re.sub(r"\s+", "", _normalize_audit_text(basis))
     normalized_basis = _normalize_audit_text(basis)
+    # Inability to access evidence/management is not the routine, bounded
+    # qualification for unreviewed non-significant components.
+    if any(marker in normalized_basis for marker in (
+        "未能接觸", "無法接觸", "無法取得", "未能取得", "無法判斷",
+        "unable to access", "unable to obtain", "could not obtain", "unable to determine",
+    )):
+        return False
     chinese_component = any(
         marker in compact_basis
         for marker in (
@@ -781,42 +914,29 @@ def _is_prior_period_reference(
     prefix: str,
     current_fiscal_year: int,
 ) -> bool:
+    """Nearest explicit period label wins, without a 48-character cutoff.
+
+    A prior section remains prior until a current label/year resumes it. This
+    also handles a short '前期...本期...' transition without prior dominance.
+    Unlabelled text retains the reporting context's period for compatibility.
+    """
     compact = re.sub(r"\s+", "", _normalize_audit_text(prefix))
-    explicit_prior = any(
-        marker in compact
-        for marker in (
-            "前一年度",
-            "前期",
-            "上期",
-            "上年度",
-            "prioryear",
-            "previousyear",
-            "priorperiod",
-            "comparativeperiod",
-        )
-    )
-    if explicit_prior:
-        return True
-    prior_year = current_fiscal_year - 1
-    prior_roc_year = prior_year - 1911
-    current_roc_year = current_fiscal_year - 1911
-    prior_markers = (
-        "{}年".format(prior_year),
-        "民國{}年".format(prior_roc_year),
-        "{}年".format(prior_roc_year),
-        "{}q".format(prior_year),
-        "{}q".format(prior_roc_year),
-    )
-    current_markers = (
-        "{}年".format(current_fiscal_year),
-        "民國{}年".format(current_roc_year),
-        "{}年".format(current_roc_year),
-        "{}q".format(current_fiscal_year),
-        "{}q".format(current_roc_year),
-    )
-    return any(marker in compact for marker in prior_markers) and not any(
-        marker in compact for marker in current_markers
-    )
+    labels = {
+        "前一年度": True, "前期": True, "上期": True, "上年度": True,
+        "prioryear": True, "previousyear": True, "priorperiod": True,
+        "previousperiod": True, "comparativeperiod": True,
+        "本期": False, "本年度": False, "當期": False,
+        "currentperiod": False, "currentyear": False,
+    }
+    candidates = [
+        (compact.rfind(label), prior)
+        for label, prior in labels.items() if label in compact
+    ]
+    for match in re.finditer(r"(?<!\d)(?:民國)?(\d{2,4})(?:年度?|q[1-4])", compact):
+        year = int(match[1])
+        year = year + 1911 if year < 1911 else year
+        candidates.append((match.start(), year < current_fiscal_year))
+    return max(candidates, default=(-1, False))[1]
 
 
 def _contains_current_period_marker(
@@ -827,7 +947,7 @@ def _contains_current_period_marker(
     for marker in markers:
         search_from = 0
         while (position := report_text.find(marker, search_from)) >= 0:
-            prefix = report_text[max(0, position - 48) : position]
+            prefix = report_text[:position]
             if not _is_prior_period_reference(
                 prefix,
                 current_fiscal_year,
@@ -845,7 +965,7 @@ def _contains_comparative_period_marker(
     for marker in markers:
         search_from = 0
         while (position := report_text.find(marker, search_from)) >= 0:
-            prefix = report_text[max(0, position - 48) : position]
+            prefix = report_text[:position]
             if _is_prior_period_reference(prefix, current_fiscal_year):
                 return True
             search_from = position + len(marker)

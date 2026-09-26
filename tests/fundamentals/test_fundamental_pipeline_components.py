@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 
 import pandas as pd
+import pytest
 
 from application.fundamental_deriver import FundamentalDeriver
 from application.fundamental_point_in_time import PointInTimeResolver
@@ -16,6 +17,7 @@ from domain.fundamental_derivation import FundamentalBundle
 from domain.fundamental_models import FilingCorrection
 from domain.fundamental_models import FilingRecord
 from domain.fundamental_models import FundamentalSnapshot
+from domain.strategies.low_entry_v6_filings import V6_FILING_SCHEMA_VERSION
 
 
 def test_refresh_planner_detects_only_new_revision_events() -> None:
@@ -112,7 +114,8 @@ def test_snapshot_assembler_reuses_latest_point_in_time_cache() -> None:
 def test_fundamental_deriver_uses_versioned_cache_without_recalculation() -> None:
     cached = FundamentalBundle(
         pd.DataFrame([{"fiscal_year": 2025}]),
-        {"symbol": "2330"},
+        {"symbol": "2330", "les_v6_mops_filings": [],
+         "les_v6_filing_schema_version": V6_FILING_SCHEMA_VERSION},
     )
     repository = _DeriverRepository(cached)
 
@@ -141,6 +144,45 @@ def test_fundamental_deriver_uses_versioned_cache_without_recalculation() -> Non
     assert result is cached
     assert cache_hit is True
     assert repository.activated is True
+
+
+@pytest.mark.parametrize("old_fields", [{}, {"les_v6_mops_filings": [], "les_v6_filing_schema_version": "old"}])
+def test_legacy_bundle_only_adds_v6_records_without_recalculating_old_metrics(old_fields):
+    cached = FundamentalBundle(
+        pd.DataFrame([{"fiscal_year": 2025}]),
+        {"symbol": "2330", "legacy_quality": 72, **old_fields}, "2026-02-10T00:00:00+00:00",
+    )
+    class MigratingRepository(_DeriverRepository):
+        def save_fundamental_bundle(self, symbol, cache_key, sector, bundle, **kwargs):
+            self.bundle = bundle
+    repository = MigratingRepository(cached)
+
+    def unexpected_derivation(*args, **kwargs):
+        raise AssertionError("format-only migration must preserve derived metrics")
+
+    result, cache_hit = FundamentalDeriver(repository, unexpected_derivation).load_or_derive(
+        "2330", parsed_signal=pd.Timestamp("2026-09-13T00:00:00+00:00"), resolved_sector="24",
+        filed_financials=[FiledFinancials(
+            fiscal_year=2025, quarter=4, available_at="2026-02-10T00:00:00+00:00",
+            revision_number=1, facts=(),
+        )], uow=object(),
+    )
+    assert cache_hit and result.snapshot["legacy_quality"] == 72
+    assert result.as_of == cached.as_of
+    assert result.annual_fundamentals is cached.annual_fundamentals
+    assert result.snapshot["les_v6_mops_filings"][0]["available_at"] == cached.as_of
+    assert result.snapshot["les_v6_filing_schema_version"] == V6_FILING_SCHEMA_VERSION
+    assert cached.snapshot.get("les_v6_filing_schema_version") != V6_FILING_SCHEMA_VERSION
+    assert "basic_eps_quarter" in result.snapshot["les_v6_mops_filings"][0]
+    # A second call must reuse the migrated bundle, not write or derive again.
+    def unexpected_save(*args, **kwargs):
+        raise AssertionError("current schema must reuse migrated records")
+    repository.save_fundamental_bundle = unexpected_save
+    reused, hit = FundamentalDeriver(repository, unexpected_derivation).load_or_derive(
+        "2330", parsed_signal=pd.Timestamp("2026-09-13T00:00:00+00:00"), resolved_sector="24",
+        filed_financials=[FiledFinancials(2025, 4, cached.as_of, 1, ())], uow=object(),
+    )
+    assert hit and reused is result
 
 
 class _SnapshotRepository:

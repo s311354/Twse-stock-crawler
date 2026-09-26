@@ -1880,7 +1880,8 @@ class LowEntryScoreV41Strategy(LowEntryScoreV4Strategy):
         if quality.status == GateStatus.UNKNOWN:
             return pd.Series("DATA_INSUFFICIENT", index=score.index)
         if quality.industry_profile_mode == IndustryProfileMode.SHADOW.value:
-            return pd.Series("WATCH_ONLY", index=score.index)
+            blocked = vetoes.any(axis=1) | (market_data_gate != "PASS")
+            return pd.Series(np.where(blocked, "NO_BUY", "WATCH_ONLY"), index=score.index)
         industry_profile = IndustryProfileRegistry.get(quality.industry_profile)
         vetoed = vetoes.any(axis=1)
         if quality.status == GateStatus.WATCH_QUALITY:
@@ -2225,7 +2226,8 @@ class LowEntryScoreV41Strategy(LowEntryScoreV4Strategy):
         self,
         quality: QualityGateResult,
     ) -> float:
-        if quality.industry_profile == "CHEMICAL_PROFILE":
+        profile = IndustryProfileRegistry.get(quality.industry_profile)
+        if profile is not None and "21" in profile.sector_codes:
             return self.config.chemical_buy_small_initial_position_fraction
         return self.config.provisional_initial_position_fraction
 
@@ -2237,7 +2239,7 @@ class LowEntryScoreV41Strategy(LowEntryScoreV4Strategy):
         return bool(
             self._is_balanced_profile
             and profile is not None
-            and profile.name == "CHEMICAL_PROFILE"
+            and "21" in profile.sector_codes
             and profile.mode is IndustryProfileMode.ACTIVE
             and quality.status == GateStatus.PASS
             and quality.score is not None
@@ -2260,7 +2262,7 @@ class LowEntryScoreV41Strategy(LowEntryScoreV4Strategy):
             self._is_balanced_profile
             and sector_code == "24"
             and profile is not None
-            and profile.name == "ELECTRONICS_PROFILE"
+            and sector_code in profile.sector_codes
             and profile.mode is IndustryProfileMode.ACTIVE
             and quality.status == GateStatus.PASS
             and quality.score is not None
@@ -2284,7 +2286,7 @@ class LowEntryScoreV41Strategy(LowEntryScoreV4Strategy):
             self._is_balanced_profile
             and sector_code in (ELECTRONICS_SECTOR_CODES - {"24"})
             and profile is not None
-            and profile.name == "ELECTRONICS_PROFILE"
+            and sector_code in profile.sector_codes
             and profile.mode is IndustryProfileMode.ACTIVE
             and quality.status == GateStatus.PASS
             and quality.score is not None
@@ -2308,7 +2310,7 @@ class LowEntryScoreV41Strategy(LowEntryScoreV4Strategy):
             self._is_balanced_profile
             and sector_code in (ELECTRONICS_SECTOR_CODES - {"24"})
             and profile is not None
-            and profile.name == "ELECTRONICS_PROFILE"
+            and sector_code in profile.sector_codes
             and profile.mode is IndustryProfileMode.ACTIVE
             and quality.status == GateStatus.PASS
             and quality.score is not None
@@ -2344,7 +2346,7 @@ class LowEntryScoreV41Strategy(LowEntryScoreV4Strategy):
             self._is_balanced_profile
             and sector_code in ELECTRONICS_SECTOR_CODES
             and profile is not None
-            and profile.name == "ELECTRONICS_PROFILE"
+            and sector_code in profile.sector_codes
             and profile.mode is IndustryProfileMode.ACTIVE
             and quality.status == GateStatus.PASS
             and quality.score is not None
@@ -2360,7 +2362,7 @@ class LowEntryScoreV41Strategy(LowEntryScoreV4Strategy):
         profile = IndustryProfileRegistry.get(quality.industry_profile)
         return bool(
             profile is not None
-            and profile.name == "CHEMICAL_PROFILE"
+            and "21" in profile.sector_codes
             and profile.mode is IndustryProfileMode.ACTIVE
             and profile.allow_buy_small
             and quality.status == GateStatus.WATCH_QUALITY

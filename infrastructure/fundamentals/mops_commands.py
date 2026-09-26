@@ -14,6 +14,7 @@ from application.fundamental_ports import FundamentalUnitOfWork
 from domain.fundamental_derivation import FundamentalBundle
 from domain.fundamental_models import FundamentalSnapshot
 from domain.fundamental_models import NormalizedFact
+from domain.fundamental_models import FilingCatalogState
 from infrastructure.fundamentals.models import MopsFiling
 from infrastructure.fundamentals.models import MopsFilingCandidate
 from infrastructure.fundamentals.mops_queries import MopsQueryRepository
@@ -38,6 +39,36 @@ class MopsRevisionWriter:
         self._connect = connect
         self._ensure_schema = ensure_schema
         self._queries = queries
+
+    def save_filing_catalog(
+        self, state: FilingCatalogState, *, uow: FundamentalUnitOfWork | None = None,
+    ) -> None:
+        self._ensure_schema()
+        if any(item.symbol != state.symbol for item in (*state.candidates, *state.corrections, *state.verified_corrections)):
+            raise ValueError("Filing catalog contains another symbol")
+        payload = json.dumps(asdict(state), ensure_ascii=False, sort_keys=True)
+        with borrow_connection(self._connect, None, uow) as connection:
+            with write_transaction(connection, externally_managed=uow is not None):
+                connection.execute(
+                    "INSERT INTO filing_catalog_cache (symbol, checked_at_epoch, state_json) VALUES (?, ?, ?) "
+                    "ON CONFLICT(symbol) DO UPDATE SET "
+                    "checked_at_epoch=excluded.checked_at_epoch, state_json=excluded.state_json",
+                    (state.symbol, to_epoch(state.checked_at), payload),
+                )
+
+    def save_refresh_attempt(
+        self, key: str, attempted_at: float, status: str, *,
+        uow: FundamentalUnitOfWork | None = None,
+    ) -> None:
+        self._ensure_schema()
+        with borrow_connection(self._connect, None, uow) as connection:
+            with write_transaction(connection, externally_managed=uow is not None):
+                connection.execute(
+                    "INSERT INTO remote_refresh_attempts VALUES (?, ?, ?) "
+                    "ON CONFLICT(refresh_key) DO UPDATE SET "
+                    "attempted_at_epoch=excluded.attempted_at_epoch, status=excluded.status",
+                    (key, attempted_at, status),
+                )
 
     def save_revision(
         self,
@@ -280,7 +311,7 @@ class MopsRevisionWriter:
                         recent_revision_checked_at_epoch =
                             excluded.recent_revision_checked_at_epoch
                     """,
-                    (symbol, checked_at_epoch, checked_at_epoch),
+                    (symbol, 0, checked_at_epoch),
                 )
 
     def save_financial_batch_state(
@@ -371,6 +402,10 @@ class MopsRevisionWriter:
         externally_managed = uow is not None or connection is not None
         with borrow_connection(self._connect, connection, uow) as active:
             with write_transaction(active, externally_managed=externally_managed):
+                active.execute(
+                    "INSERT OR IGNORE INTO refresh_state (symbol, full_catalog_checked_at_epoch) VALUES (?, 0)",
+                    (symbol,),
+                )
                 active.execute(
                     """
                     UPDATE refresh_state

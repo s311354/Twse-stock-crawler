@@ -6,11 +6,15 @@ VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
 
 usage() {
   cat <<'EOF'
-Usage: ./stockdataanalysis.sh [--profile PROFILE] [--check]
+Usage: ./stockdataanalysis.sh [--profile PROFILE] [-b DAYS] [-e DAYS] [--check]
+       ./stockdataanalysis.sh --profile PROFILE -b START_DATE -e END_DATE
+         --pae-holdings-file HISTORICAL_FILE --pae-current-cash CASH
+         --account-equity EQUITY [--replay-restrictions-file JSON] [--replay-mail] [--check]
 
-Profiles: elec, semi, chemi, bio, comp, air, veh
+Profiles: elec, semi, chemi, bio, comp, air, veh, eleccomp
 
-The profile selects stocklist_<profile>, the matching TWSE market type, and
+The semi profile selects TPEx OTC semiconductor daily quotes (all stock numbers).
+Other profiles select stocklist_<profile>, the matching TWSE market type, and
 portfolio_holdings_<profile>.txt when that holdings file exists. The default
 profile is elec; TWSE_ANALYSIS_PROFILE provides the same selection by env var.
 Holding token format:
@@ -18,6 +22,15 @@ Holding token format:
 where entry_decision is BUY, EARLY_BUY, or BUY_SMALL. Existing shorter tokens
 remain valid.
 --check validates the complete runtime configuration without network or email.
+Integer -b/-e retain calendar-day offsets relative to the execution date.
+Date pairs (-b YYYY-MM-DD -e YYYY-MM-DD) select an inclusive history range and
+automatically replay at END_DATE 13:30 Taipei. Timestamps and premarket/intraday
+replay are not supported. Do not mix dates and days.
+Date replay reads only PIT fundamental cache, writes isolated
+research outputs, and does not email unless --replay-mail is explicitly set.
+--replay-mail uses existing SMTP settings and labels the report historical / not
+for trading. --check still sends nothing. An explicit historical portfolio is
+required; an empty holdings file declares no holdings. Normal runs still email.
 EOF
 }
 
@@ -38,6 +51,13 @@ fi
 
 ANALYSIS_PROFILE="${TWSE_ANALYSIS_PROFILE:-elec}"
 CHECK_CONFIG=0
+BACKTRACK_END=792
+BACKTRACK_BEGIN=9
+EXPLICIT_HOLDINGS=""
+EXPLICIT_CASH=""
+EXPLICIT_EQUITY=""
+REPLAY_RESTRICTIONS=""
+REPLAY_MAIL=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -h|--help)
@@ -46,6 +66,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --check)
       CHECK_CONFIG=1
+      shift
+      ;;
+    --replay-mail)
+      REPLAY_MAIL=1
       shift
       ;;
     --profile)
@@ -61,6 +85,21 @@ while [ "$#" -gt 0 ]; do
       ANALYSIS_PROFILE=${1#--profile=}
       shift
       ;;
+    -b|-e|--pae-holdings-file|--pae-current-cash|--account-equity|--replay-restrictions-file)
+      if [ "$#" -lt 2 ]; then
+        echo "$1 requires a value" >&2
+        exit 2
+      fi
+      case "$1" in
+        -b) BACKTRACK_BEGIN=$2 ;;
+        -e) BACKTRACK_END=$2 ;;
+        --pae-holdings-file) EXPLICIT_HOLDINGS=$2 ;;
+        --pae-current-cash) EXPLICIT_CASH=$2 ;;
+        --account-equity) EXPLICIT_EQUITY=$2 ;;
+        --replay-restrictions-file) REPLAY_RESTRICTIONS=$2 ;;
+      esac
+      shift 2
+      ;;
     *)
       echo "Unknown argument: $1" >&2
       usage >&2
@@ -68,6 +107,40 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+# Detect date syntax only; Python validates real calendar dates and ordering.
+# Replay must be selected BEFORE consulting current holdings or adding -m.
+DATE_RANGE=0
+case "$BACKTRACK_BEGIN" in
+  [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) DATE_RANGE=1 ;;
+esac
+case "$BACKTRACK_END" in
+  [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+    if [ "$DATE_RANGE" -ne 1 ]; then
+      echo "-b/-e must both be integers or both YYYY-MM-DD dates" >&2
+      exit 2
+    fi
+    ;;
+  *)
+    if [ "$DATE_RANGE" -eq 1 ]; then
+      echo "-b/-e must both be integers or both YYYY-MM-DD dates" >&2
+      exit 2
+    fi
+    ;;
+esac
+REPLAY_MODE=$DATE_RANGE
+if [ "$REPLAY_MAIL" -eq 1 ] && [ "$REPLAY_MODE" -ne 1 ]; then
+  echo "--replay-mail requires a date -b/-e pair" >&2
+  exit 2
+fi
+if [ "$REPLAY_MODE" -eq 1 ]; then
+  BACKTRACK_BEGIN=${BACKTRACK_BEGIN:-0}
+  if [ -z "$EXPLICIT_HOLDINGS" ] || [ -z "$EXPLICIT_CASH" ] || [ -z "$EXPLICIT_EQUITY" ]; then
+    echo "Replay requires explicit historical --pae-holdings-file, --pae-current-cash and --account-equity (not current environment defaults)." >&2
+    exit 2
+  fi
+else
+  BACKTRACK_BEGIN=${BACKTRACK_BEGIN:-9}
+fi
 
 ANALYSIS_PROFILE=$(printf '%s' "$ANALYSIS_PROFILE" | tr '[:upper:]' '[:lower:]')
 case "$ANALYSIS_PROFILE" in
@@ -78,6 +151,7 @@ case "$ANALYSIS_PROFILE" in
   comp) STOCKTYPE=COMP ;;
   air) STOCKTYPE=AIR ;;
   veh) STOCKTYPE=VEH ;;
+  eleccomp) STOCKTYPE=ELECCOMP ;;
   *)
     echo "Unsupported analysis profile: $ANALYSIS_PROFILE" >&2
     usage >&2
@@ -108,13 +182,20 @@ if ! "$PYTHON_BIN" -c "import requests, pandas, tabulate, xlsxwriter, matplotlib
 fi
 
 STOCKLIST="$SCRIPT_DIR/stocklist_$ANALYSIS_PROFILE"
-if [ ! -r "$STOCKLIST" ]; then
+if [ "$ANALYSIS_PROFILE" != "semi" ] && [ ! -r "$STOCKLIST" ]; then
   echo "Stock list is not readable: $STOCKLIST" >&2
   exit 1
 fi
 
 DEFAULT_PAE_HOLDINGS_FILE="$SCRIPT_DIR/portfolio_holdings_$ANALYSIS_PROFILE.txt"
 PAE_HOLDINGS_FILE="${TWSE_PAE_HOLDINGS_FILE:-$DEFAULT_PAE_HOLDINGS_FILE}"
+if [ -n "$EXPLICIT_HOLDINGS" ]; then
+  PAE_HOLDINGS_FILE=$EXPLICIT_HOLDINGS
+  if [ ! -r "$PAE_HOLDINGS_FILE" ]; then
+    echo "PAE holdings file is not readable: $PAE_HOLDINGS_FILE" >&2
+    exit 1
+  fi
+fi
 PAE_HOLDINGS_ENABLED=0
 if [ -n "${TWSE_PAE_HOLDINGS_FILE:-}" ] && [ ! -r "$PAE_HOLDINGS_FILE" ]; then
   echo "PAE holdings file is not readable: $PAE_HOLDINGS_FILE" >&2
@@ -135,22 +216,42 @@ if [ -r "$PAE_HOLDINGS_FILE" ] && awk '
 elif [ -r "$PAE_HOLDINGS_FILE" ]; then
   echo "PAE holdings file is empty; using COLD_START_ALL_CASH: $PAE_HOLDINGS_FILE" >&2
 fi
+if [ -n "$EXPLICIT_HOLDINGS" ]; then
+  PAE_HOLDINGS_ENABLED=1
+fi
 
-echo "TWSE analysis profile: $STOCKTYPE ($STOCKLIST)"
+if [ "$ANALYSIS_PROFILE" = "semi" ]; then
+  STOCKLIST=ALL
+  echo "TPEx analysis profile: SEMI (historical sector universe by stock number)"
+else
+  echo "TWSE analysis profile: $STOCKTYPE ($STOCKLIST)"
+fi
 
 # Build argv without fragile multiline continuations; the stock list is data,
 # never a shell command.
 set -- "$SCRIPT_DIR/main.py"
 set -- "$@" -o shirong
-set -- "$@" -e 500
-set -- "$@" -b 0
+set -- "$@" -e "$BACKTRACK_END"
+set -- "$@" -b "$BACKTRACK_BEGIN"
 set -- "$@" -t "$STOCKTYPE"
 set -- "$@" --mops-history-years "${MOPS_HISTORY_YEARS:-5}"
-set -- "$@" --account-equity "${TWSE_ACCOUNT_EQUITY:-1000000}"
+set -- "$@" --account-equity "${EXPLICIT_EQUITY:-${TWSE_ACCOUNT_EQUITY:-1000000}}"
 if [ "$PAE_HOLDINGS_ENABLED" -eq 1 ]; then
   set -- "$@" --pae-holdings-file "$PAE_HOLDINGS_FILE"
 fi
-set -- "$@" -m
+if [ -n "$EXPLICIT_CASH" ]; then
+  set -- "$@" --pae-current-cash "$EXPLICIT_CASH"
+fi
+if [ "$REPLAY_MODE" -eq 1 ]; then
+  if [ "$REPLAY_MAIL" -eq 1 ]; then
+    set -- "$@" --replay-mail
+  fi
+else
+  set -- "$@" -m
+fi
+if [ -n "$REPLAY_RESTRICTIONS" ]; then
+  set -- "$@" --replay-restrictions-file "$REPLAY_RESTRICTIONS"
+fi
 if [ "$CHECK_CONFIG" -eq 1 ]; then
   set -- "$@" --check-config
 fi

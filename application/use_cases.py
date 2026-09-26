@@ -11,6 +11,7 @@ from application.contracts import AnalysisContext
 from application.contracts import MarketStatus
 from application.contracts import StockAnalysisRequest
 from application.contracts import StrategyEvaluation
+from application.historical_replay import SESSION_CLOSE, TAIPEI
 from application.ports import FundamentalPort
 from application.ports import MarketCalendarPort
 from application.ports import MarketDataPort
@@ -37,7 +38,13 @@ class FetchMarketData:
         self._now_provider = now_provider
 
     def execute(self, request: StockAnalysisRequest) -> AnalysisContext:
-        market_date = self._today_provider()
+        if request.replay_mail and request.as_of is None:
+            raise ValueError("Replay email requires a historical cutoff")
+        if request.as_of is not None and (request.as_of.utcoffset() is None or (request.mail and not request.replay_mail) or request.linechart):
+            raise ValueError("Historical replay requires an aware cutoff, explicit replay-mail for email, and no live charts")
+        if request.as_of is not None and request.as_of.astimezone(TAIPEI).time() != SESSION_CLOSE:
+            raise ValueError("REPLAY_CLOSE_ONLY: historical replay cutoff must be Taipei 13:30")
+        market_date = request.as_of.astimezone(TAIPEI).date() if request.as_of else self._today_provider()
         try:
             is_trading_day = self._calendar.is_trading_day(market_date)
         except Exception:
@@ -49,7 +56,8 @@ class FetchMarketData:
 
         market_status = MarketStatus.OPEN if is_trading_day else MarketStatus.CLOSED
         print(
-            "TWSE market status for {}: {}".format(
+            "{} market status for {}: {}".format(
+                request.market_source,
                 market_date.isoformat(),
                 market_status.value,
             )
@@ -60,10 +68,10 @@ class FetchMarketData:
                 "in the requested backtrack range."
             )
 
-        include_reference = self._reference_data_is_ready(
-            market_date,
-            is_trading_day=is_trading_day,
-        )
+        if request.as_of is not None:
+            include_reference = is_trading_day
+        else:
+            include_reference = self._reference_data_is_ready(market_date, is_trading_day=is_trading_day)
 
         return self._market_data.fetch(
             request,
@@ -109,7 +117,7 @@ class RefreshFundamentals:
     ) -> None:
         if not request.mops_enabled:
             return
-        analysis_time = self._now_provider()
+        analysis_time = request.as_of or self._now_provider()
         if analysis_time.tzinfo is None:
             raise ValueError("now_provider must return a timezone-aware datetime")
         self._fundamentals.refresh(
@@ -150,5 +158,5 @@ class SendNotification:
         request: StockAnalysisRequest,
         evaluation: StrategyEvaluation,
     ) -> None:
-        if request.mail:
+        if request.notification_enabled:
             self._notifications.send(context, request, evaluation)

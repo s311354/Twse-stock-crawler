@@ -119,6 +119,7 @@ class SMTPEmail(object):
         stocktype: object,
         stockprofittable: str,
         entryanalysis: str = "",
+        les_model_version: str = "5.0.0",
     ) -> None:
         if not self.is_configured():
             logging.warning("Skipping email send because SMTP credentials are not configured.")
@@ -141,7 +142,8 @@ class SMTPEmail(object):
                                                  ccreceiver = self.authentication.ccreceiver,
                                                  transactiondays = transactiondays,
                                                  iso_scheduled_times = iso_scheduled_times,
-                                                 entryanalysis = entryanalysis)
+                                                 entryanalysis = entryanalysis,
+                                                 les_model_version = les_model_version)
 
         print(f"Sending Email at {datetime.datetime.now()}")
 

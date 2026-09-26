@@ -17,6 +17,9 @@ from application.analysis_dataset import AnalysisDatasetBuilder
 from application.market_history_cache import CachedMarketDay
 from application.market_history_cache import MarketHistoryCacheError
 from application.market_history_cache import MarketHistoryCachePort
+from application.ports import DailyStockClientPort
+from domain.errors import NoDataError
+from domain.tpex_market import TPEX_FIELDS, TPEX_RAW_OFFSET
 from domain.models import Stocktype
 from domain.models import Ohlc
 from domain.models import StockSelector
@@ -38,22 +41,31 @@ from twse.parser import parse_price
 
 
 FULL_MARKET_TYPE = "ALLBUT0999"
+HISTORY_BUFFERS = (
+    "daily_stocks", "daily_highs", "daily_lows", "daily_closes", "daily_volumes",
+    "daily_trade_counts", "daily_trade_values", "daily_bid_prices", "daily_ask_prices",
+    "daily_pe_ratios", "daily_taiex_closes", "daily_dates",
+)
 
 
 class TwseCrawker(LegacyCrawlerFacade):
     def __init__(
         self,
         stocklistsize: int,
-        twse_client: TwseClient | None = None,
+        twse_client: DailyStockClientPort | None = None,
         csv_repository: CsvRepositoryPort | None = None,
         http_client: TwseHttpClient | None = None,
         app_settings: object | None = None,
         analysis_dataset_builder: AnalysisDatasetBuilder | None = None,
         market_history_cache: MarketHistoryCachePort | None = None,
+        market_source: str = "TWSE",
     ) -> None:
         if twse_client is not None and http_client is not None:
             raise ValueError("Pass either twse_client or http_client, not both")
         self.stocklistsize: int = stocklistsize
+        if market_source not in {"TWSE", "TPEX"}:
+            raise ValueError("Unsupported market source")
+        self.market_source = market_source
         self.twse_client = twse_client or TwseClient(http_client=http_client)
         self.market_history_cache = market_history_cache
         self._initialize_legacy_facade(
@@ -100,6 +112,23 @@ class TwseCrawker(LegacyCrawlerFacade):
         self.twse_closed_unscheduled_dates: set[str] = set()
         self._market_history_refresh_dates: set[str] = set()
 
+    def _reset_tpex_slots(self) -> None:
+        self.stocklistsize = 0
+        self.stocknumbers = []
+        self.stocknames = []
+        self.tracked_stock_numbers = []
+        self.stocksprice = []
+        for name in HISTORY_BUFFERS:
+            setattr(self, name, [])
+
+    def _append_tpex_symbols(self, symbols: list[str]) -> None:
+        self.stocklistsize += len(symbols)
+        self.stocknumbers.extend(symbols)
+        self.stocknames.extend([""] * len(symbols))
+        self.tracked_stock_numbers.extend(symbols)
+        for name in HISTORY_BUFFERS:
+            getattr(self, name).extend([] for _ in symbols)
+
 
     def clean_data(self, row: StockRow) -> StockRow:
         for index, content in enumerate(row):
@@ -112,6 +141,14 @@ class TwseCrawker(LegacyCrawlerFacade):
 
 
     def validate_twse_row_schema(self, stock_row: object, scheduled_time: str, source: str) -> bool:
+        if self.market_source == "TPEX" and (
+            not isinstance(stock_row, list)
+            or len(stock_row) != TPEX_RAW_OFFSET + len(TPEX_FIELDS)
+            or clean_cell(stock_row[0]) != clean_cell(stock_row[TPEX_RAW_OFFSET])
+        ):
+            logging.warning("TPEx cached row schema/identity invalid at %s; row skipped", scheduled_time,
+                            extra={"source": "TPEX", "trade_date": scheduled_time, "status": "SCHEMA_CHANGED"})
+            return False
         if not isinstance(stock_row, list):
             logging.warning(
                 "Skipping TWSE row from %s at %s because row is not a list: %s",
@@ -322,6 +359,8 @@ class TwseCrawker(LegacyCrawlerFacade):
 
 
     def build_record_row(self, stock_row: StockRow) -> StockRow:
+        if self.market_source == "TPEX":
+            return list(stock_row)  # Includes the original 17 TPEx cells.
         normalized_row = list(stock_row[:TwseColumns.REQUIRED_WIDTH]) + [""] * max(0, TwseColumns.REQUIRED_WIDTH - len(stock_row))
         return self.clean_data([
                 normalized_row[TwseColumns.STOCK_NO], # Stock number
@@ -475,6 +514,9 @@ class TwseCrawker(LegacyCrawlerFacade):
         calendar: TwseCalendar | None = None,
         reference_date: datetime.date | None = None,
         include_reference: bool = False,
+        *,
+        start_date: datetime.date | None = None,
+        end_date: datetime.date | None = None,
     ) -> None:
         self.iso_scheduled_times = []
         self._market_history_refresh_dates = set()
@@ -486,6 +528,8 @@ class TwseCrawker(LegacyCrawlerFacade):
             begin_backtrack=begin_backtrack,
             end_backtrack=end_backtrack,
             include_reference=include_reference,
+            start_date=start_date,
+            end_date=end_date,
         )
         for candidate in candidates:
             status = (
@@ -549,6 +593,21 @@ class TwseCrawker(LegacyCrawlerFacade):
 
 
     def get_twse_daily_stocks(self, file_name: str, stocktype: Stocktype, stocks: list[StockSelector]) -> None:
+        all_tpex = self.market_source == "TPEX" and "ALL" in stocks
+        if self.market_source == "TPEX":
+            if stocktype != Stocktype.SEMI:
+                raise ValueError("TPEx source supports SEMI only")
+            if any(str(symbol) != "ALL" and (not str(symbol).isdigit() or len(str(symbol)) != 4) for symbol in stocks):
+                raise ValueError("TPEx requires four-digit stock numbers or ALL, not TWSE row indexes")
+            if all_tpex:
+                # Discover the historical union by symbol; never reinterpret old
+                # TWSE indexes or restrict history to today's surviving listings.
+                stocks = []
+                self._reset_tpex_slots()
+            else:
+                stocks = list(dict.fromkeys(str(symbol) for symbol in stocks))
+                self._reset_tpex_slots()
+                self._append_tpex_symbols(stocks)
         valid_iso_scheduled_times: list[str] = []
         previous_taiex_close: float | None = None
         self._missing_ohlc_records = {}
@@ -557,6 +616,9 @@ class TwseCrawker(LegacyCrawlerFacade):
         self.missing_tracked_stock_numbers = set()
         self.missing_tracked_stock_first_dates = {}
         market_type = str(stocktype.value[0])
+        if self.market_source == "TPEX":
+            market_type = "TPEX:24:v1"
+        allow_full_market = self.market_source == "TWSE"
         scheduled_dates = [
             iso_date.replace("-", "") for iso_date in self.iso_scheduled_times
         ]
@@ -594,7 +656,7 @@ class TwseCrawker(LegacyCrawlerFacade):
                         "cache_hit": False,
                     },
                 )
-            if self.explicit_stock_numbers:
+            if self.explicit_stock_numbers and allow_full_market:
                 try:
                     load_symbols_many = getattr(
                         self.market_history_cache,
@@ -729,7 +791,7 @@ class TwseCrawker(LegacyCrawlerFacade):
                         )
 
             missing_portfolio_symbols = (
-                self.explicit_stock_numbers.difference(stock_lookup)
+                self.explicit_stock_numbers.difference(stock_lookup) if allow_full_market else set()
             )
             if missing_portfolio_symbols:
                 full_market_day = full_market_cache_days.get(scheduled_time)
@@ -792,7 +854,7 @@ class TwseCrawker(LegacyCrawlerFacade):
             breadth = derive_twse_market_breadth(
                 row,
                 as_of=iso_scheduled_time,
-                universe=getattr(stocktype, "name", str(stocktype)),
+                universe=("TPEX_SEMI" if self.market_source == "TPEX" else getattr(stocktype, "name", str(stocktype))),
                 source_final=True,
                 taiex_return=(
                     taiex_close / previous_taiex_close - 1
@@ -804,6 +866,11 @@ class TwseCrawker(LegacyCrawlerFacade):
             self.market_breadth_snapshots_by_date[
                 iso_scheduled_time
             ] = breadth.to_mapping()
+
+            if all_tpex:
+                new_symbols = sorted(set(stock_lookup).difference(stocks))
+                self._append_tpex_symbols(new_symbols)
+                stocks.extend(new_symbols)
 
             row_data: StockRows = [[] for _ in range(self.stocklistsize)]
     
@@ -857,8 +924,9 @@ class TwseCrawker(LegacyCrawlerFacade):
 
         if self.market_history_cache is not None:
             logging.info(
-                "TWSE market history cache requested=%s hits=%s "
+                "%s market history cache requested=%s hits=%s "
                 "network_days=%s writes=%s invalid=%s refreshed=%s",
+                self.market_source,
                 len(scheduled_dates),
                 cache_hits,
                 network_days,
@@ -870,12 +938,12 @@ class TwseCrawker(LegacyCrawlerFacade):
                     )
                 ),
                 extra={
-                    "source": "TWSE_MARKET_CACHE",
+                    "source": self.market_source + "_MARKET_CACHE",
                     "status": "CACHE_SUMMARY",
                     "cache_hit": network_days == 0,
                 },
             )
-            if self.explicit_stock_numbers:
+            if self.explicit_stock_numbers and allow_full_market:
                 logging.info(
                     "TWSE portfolio full-market cache requested=%s hits=%s "
                     "network_days=%s writes=%s symbols=%s",
@@ -895,7 +963,9 @@ class TwseCrawker(LegacyCrawlerFacade):
         self._log_unscheduled_closed_summary()
         self._log_missing_ohlc_summary()
         if not valid_iso_scheduled_times:
-            raise RuntimeError("No valid TWSE daily stock rows were collected for the requested date range.")
+            if self.market_source == "TPEX":
+                raise NoDataError("No valid TPEx SEMI quotes for the requested symbols/date range")
+            raise RuntimeError(f"No valid {self.market_source} daily stock rows were collected for the requested date range.")
 
         self.iso_scheduled_times = valid_iso_scheduled_times
         self.transactiondays = self.days_between_isodates(self.iso_scheduled_times[0], self.iso_scheduled_times[-1])
@@ -907,13 +977,14 @@ class TwseCrawker(LegacyCrawlerFacade):
 
         dates = sorted(self.twse_no_data_dates)
         logging.warning(
-            "TWSE NO_DATA summary dates=%s first_date=%s last_date=%s; "
+            "%s NO_DATA summary dates=%s first_date=%s last_date=%s; "
             "dates were skipped. Use debug mode for per-date details.",
+            self.market_source,
             len(dates),
             dates[0].replace("-", ""),
             dates[-1].replace("-", ""),
             extra={
-                "source": "TWSE",
+                "source": self.market_source,
                 "status": "NO_DATA_SUMMARY",
             },
         )
@@ -948,15 +1019,16 @@ class TwseCrawker(LegacyCrawlerFacade):
             trade_date for _, trade_date in self._missing_ohlc_records
         )
         logging.warning(
-            "TWSE OHLC unavailable summary records=%s stocks=%s "
+            "%s OHLC unavailable summary records=%s stocks=%s "
             "first_date=%s last_date=%s; invalid rows were skipped. "
             "Use debug mode for per-record details.",
+            self.market_source,
             len(self._missing_ohlc_records),
             len(symbols),
             dates[0],
             dates[-1],
             extra={
-                "source": "TWSE",
+                "source": self.market_source,
                 "status": "OHLC_MISSING_SUMMARY",
             },
         )

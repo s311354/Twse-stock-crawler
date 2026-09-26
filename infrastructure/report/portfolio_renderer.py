@@ -310,7 +310,7 @@ class PortfolioAllocationRenderer(
 
     _MODE_NOTES = {
         "DIRECT_SELECTION": (
-            "目前少於 3 檔有效持股；PAE 為 NON_BINDING，LES v5 控制進場、EREM v3 控制持股處置。"
+            "目前少於 3 檔有效持股；PAE 為 NON_BINDING，LES 控制進場、EREM v3 控制持股處置。"
         ),
         "PAE_ACTIVE_OPEN_SLOT": (
             "目前 3 檔有效持股；PAE 控制第四席，候選須通過絕對門檻與 Portfolio Improvement。"
@@ -367,7 +367,7 @@ class PortfolioAllocationRenderer(
         <section data-section="portfolio-allocation" style="margin:16px 0;padding:12px;border:1px solid #bfd0dc;border-left:5px solid #295f7a;background:#f5f9fb">
           <h3 style="margin:0 0 6px;color:#204f66">投資組合配置（PAE v{}）</h3>
           <div style="margin-bottom:9px;color:#3f5662">
-            <strong>{}</strong>：{} PAE 消費 LES v5／EREM v3 已發布決策，不重算技術指標。
+            <strong>{}</strong>：{} PAE 消費 LES／EREM v3 已發布決策，不重算技術指標。
           </div>
           <div style="display:flex;flex-wrap:wrap;gap:7px;margin-bottom:10px">
             {}

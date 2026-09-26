@@ -82,26 +82,12 @@ The crawler keeps the legacy scripts compatible while introducing a cleaner, low
 `-- data/                           # generated CSV outputs
 ```
 
-### Low-Entry Model v5 Decision Mapping ###
+### Low-Entry Model v6 (daily entry pipeline) ###
 
-| Condition | Decision |
-|---|---|
-| Confirmed hard fundamental failure | `NO_BUY` |
-| Base data is not point-in-time or lacks minimum coverage | `DATA_INSUFFICIENT` |
-| Base-only, ordinary quality-watch, or unsupported sector | `WATCH_ONLY` |
-| Active temporary falling-knife block | `PANIC_WATCH` |
-| Panic reversal detected, awaiting next-day confirmation | `REVERSAL_WATCH` |
-| Outside Broad Rally: confirmed QS `>= 80`, score `>= 75` (or the higher risk-off requirement), Valuation `SUPPORTIVE`, Trigger, both risk gates, Market Gate and Falling-Knife `CLEAR` | conditional `BUY_SMALL` (1/8) |
-| Completed broad-market panic reversal or depressed recovery plus quality, valuation and risk checks; includes the tightly guarded MOPS fallback starter | conditional `BUY_SMALL` (1/8) |
-| Deep capitulation absorption with two panic conditions, three reversal confirmations, QS `>= 80`, Valuation PASS, both risk gates and no Veto | conditional `BUY_SMALL` (1/8) |
-| At least two prior broad-rally sessions followed by an orderly stock retest, guarded breadth-starter QS `>= 75`, Valuation PASS, repriced risk PASS and no Veto | conditional `BUY_SMALL` (1/8) |
-| Deep recent-rally give-back with directly verified QS `>= 80`, demand seed, Valuation PASS, repriced risk PASS and no Veto; next session must reclaim the full signal bar | conditional `BUY_SMALL` (1/8) |
-| Strong completed breadth reversal with QS `>= 80`, score `>= 35`, raw score `>= 45`, four reversal confirmations, strong CLV/CMF, both risk gates and no Veto | conditional `BUY` (maximum 1/4) |
-| Technical score `< 60` | `AVOID` |
-| Technical score `60-69` | `WATCH` |
-| Technical score `70` through the applicable entry threshold | `ARMED` |
-| Required score plus Trigger, Valuation, Market Data and Risk gates | `BUY` |
-| Reversal day followed by valid next-day confirmation and all risk gates | conditional `BUY_SMALL` |
+The `low_entry_score_v6` Strategy plugin adds quality-first reversal, trend-pullback,
+and leadership-continuation setups with `BUY` / `BUY_SMALL` signals. Daily analysis,
+typed entry fields, HTML and email subjects now use v6. The v5 valuation/CER
+sidecar and EREM/PAE policies remain separately identified, and old plugins are retained.
 
 ### Expected Return Exit Model v3 ###
 
@@ -140,9 +126,9 @@ EREM decision mapping:
 
 ### Portfolio Allocation Engine v2 ###
 
-Portfolio Allocation Engine v2 (`portfolio_allocation_v2`, schema `pae.portfolio_decision.v2`) is the daily production allocator. It consumes published LES v5 and EREM v3 outputs and adds opportunity-cost allocation, complete-portfolio improvement, explicit cash preference, and atomic four-seat replacement rules.
+Portfolio Allocation Engine v2 (`portfolio_allocation_v2`, schema `pae.portfolio_decision.v2`) is the daily production allocator. It consumes published LES v6 and EREM v3 outputs, with the existing valuation/CER sidecar, and adds opportunity-cost allocation, complete-portfolio improvement, explicit cash preference, and atomic four-seat replacement rules.
 
-The premarket entry universe accepts only hard-gate-complete LES v5 `BUY`, `EARLY_BUY`, and `BUY_SMALL` decisions. `BUY` must score at least 75. PAE sizing applies the execution factor exactly once: `BUY = 1.00`, `EARLY_BUY = 0.65`, and `BUY_SMALL = 0.50`. A high LES score never overrides unknown or failed Quality, Valuation, Risk, Falling-Knife, liquidity, or point-in-time evidence.
+The daily premarket entry universe accepts only hard-gate-complete LES v6 `BUY` and `BUY_SMALL` decisions. Its setup-specific thresholds, position cap, and execution plan come from the frozen v6 report, not a v5 threshold. PAE remains an independent allocation gate and may decline an LES BUY. A high LES score never overrides missing core quality, failed Risk, Falling-Knife, liquidity, or point-in-time evidence. Legacy `EARLY_BUY` remains readable for old holdings but is not produced by v6.
 
 | Effective holdings | Mode | Authority |
 |---:|---|---|
@@ -179,7 +165,7 @@ Full command-line reference:
 
 ```text
 $ python main.py -h
-usage: main.py [-h] [--list-strategies] [--check-config] [-t {VEH,ELEC,BUI,AIR,CHEMI,BIO,SEMI,COMP,COMM}] [-o {SHIRONG,shirong}] [-e ENDBACKTRACK] [-b BEGINBACKTRACK] [-s SUBJECT] [-cc CCRECEIVER]
+usage: main.py [-h] [--list-strategies] [--check-config] [-t {VEH,ELEC,BUI,AIR,CHEMI,BIO,SEMI,COMP,COMM,ELECCOMP}] [-o {SHIRONG,shirong}] [-e ENDBACKTRACK] [-b BEGINBACKTRACK] [-s SUBJECT] [-cc CCRECEIVER]
                [-l] [-p PERIOD] [-m] [--skip-mops]
                [--mops-history-years MOPS_HISTORY_YEARS] [--account-equity ACCOUNT_EQUITY]
                [--pae-holdings-file PAE_HOLDINGS_FILE] [--include-symbols-file INCLUDE_SYMBOLS_FILE]
@@ -194,7 +180,7 @@ options:
   -h, --help            show this help message and exit
   --list-strategies     List all available trading strategies with descriptions and exit.
   --check-config        Validate settings and inputs, print a safe JSON summary, and exit without network or email.
-  -t, --type {VEH,ELEC,BUI,AIR,CHEMI,BIO,SEMI,COMP,COMM}
+  -t, --type {VEH,ELEC,BUI,AIR,CHEMI,BIO,SEMI,COMP,COMM,ELECCOMP}
                         The stock market you want to choose.
   -o, --output_file_names {SHIRONG,shirong}
                         Output file name prefix.
@@ -233,7 +219,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
-Run the automated workflow after configuring `.env`:
+Run the automated workflow after configuring `.env.example`:
 
 ```sh
 ./stockdataanalysis.sh --profile semi

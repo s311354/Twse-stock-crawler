@@ -9,6 +9,7 @@ import pytest
 import application.fundamental_service as fundamental_service_module
 from application.filing_refresh_planner import FilingRefreshPlanner
 from application.fundamental_service import MopsFundamentalService
+from application.mops_refresh_control import MopsRefreshPolicy
 from domain.data_provenance import FIRST_OBSERVED_DOWNLOAD
 from domain.data_provenance import MOPS_PUBLIC_ANNOUNCEMENT
 from domain.fundamental_derivation import FUNDAMENTAL_DERIVATION_VERSION
@@ -210,7 +211,7 @@ def test_fundamental_service_reuses_hash_snapshot_and_limits_daily_downloads(
 
     assert isinstance(first, FundamentalBundle)
     assert len(client.downloaded_periods) == 5
-    assert client.announcement_years[-1] == list(range(2020, 2027))
+    assert client.announcement_years[-1] == list(range(2022, 2027))
     assert derivation_calls == 1
 
 
@@ -324,12 +325,13 @@ def test_service_bulk_preload_skips_facts_and_filters_refresh_events(
     tmp_path,
 ) -> None:
     repository = MopsRepository(tmp_path / "mops")
-    candidates = [_candidate(year, 4) for year in range(2021, 2026)]
+    candidates = [_candidate(year, quarter) for year in range(2021, 2026)
+                  for quarter in (1, 2, 3, 4)]
     announcements = [
         FilingAnnouncement(
             symbol="2330",
             fiscal_year=candidate.fiscal_year,
-            quarter=4,
+            quarter=candidate.quarter,
             available_at=candidate.available_at or "",
             title="財務報告",
         )
@@ -361,6 +363,31 @@ def test_service_bulk_preload_skips_facts_and_filters_refresh_events(
     )
     assert cached["2330"].snapshot["remote_refresh_skipped"] is True
 
+    # Old v6 schemas are not eligible for the no-facts fast path.
+    schema_preload = repository.load_cached_bundles
+    def old_v6_schema(*args, **kwargs):
+        entries = schema_preload(*args, **kwargs)
+        entry = entries["2330"]
+        snapshot = dict(entry.bundle.snapshot, les_v6_filing_schema_version="old")
+        entries["2330"] = replace(entry, bundle=replace(entry.bundle, snapshot=snapshot))
+        return entries
+    with monkeypatch.context() as patch:
+        patch.setattr(repository, "load_cached_bundles", old_v6_schema)
+        assert service.load_cached_bundles(["2330"], signal_date="2026-07-22T13:30:00+08:00", sector="ELEC", history_years=5) == {}
+
+    # A version marker alone must not make annual-only v6 evidence reusable.
+    real_preload = repository.load_cached_bundles
+    def annual_only(*args, **kwargs):
+        entries = real_preload(*args, **kwargs)
+        entry = entries["2330"]
+        snapshot = dict(entry.bundle.snapshot)
+        snapshot["les_v6_mops_filings"] = [record for record in snapshot["les_v6_mops_filings"] if record["period_end"].endswith("12-31")]
+        entries["2330"] = replace(entry, bundle=replace(entry.bundle, snapshot=snapshot))
+        return entries
+    with monkeypatch.context() as patch:
+        patch.setattr(repository, "load_cached_bundles", annual_only)
+        assert service.load_cached_bundles(["2330"], signal_date="2026-07-22T13:30:00+08:00", sector="ELEC", history_years=5) == {}
+
     service._daily_corrections = {
         "2330": {
             (2025, 4): FilingCorrection(
@@ -388,8 +415,8 @@ def test_service_bulk_preload_uses_one_uow_for_multiple_symbols(
     symbols = ("2330", "2317")
     for symbol in symbols:
         candidates = [
-            _candidate(year, 4, symbol=symbol)
-            for year in range(2021, 2026)
+            _candidate(year, quarter, symbol=symbol)
+            for year in range(2021, 2026) for quarter in (1, 2, 3, 4)
         ]
         announcements = [
             FilingAnnouncement(
@@ -466,12 +493,14 @@ def test_complete_cache_refreshes_only_when_twse_batch_period_advances(
     tmp_path,
 ) -> None:
     repository = MopsRepository(tmp_path / "mops")
-    candidates = [_candidate(year, 4) for year in range(2021, 2026)]
+    candidates = [_candidate(year, 4) for year in range(2021, 2026)] + [
+        _candidate(year, quarter) for year in (2024, 2025) for quarter in (1, 2, 3)
+    ]
     announcements = [
         FilingAnnouncement(
             symbol="2330",
             fiscal_year=candidate.fiscal_year,
-            quarter=4,
+            quarter=candidate.quarter,
             available_at=candidate.available_at or "",
             title="財務報告",
         )
@@ -532,6 +561,7 @@ def test_complete_cache_refreshes_only_when_twse_batch_period_advances(
         quarter=1,
     )
     service.prepare_daily_batch(observed + dt.timedelta(days=2))
+    service.begin_run()
     service.load(
         "2330",
         signal_date="2026-07-23T13:30:00+08:00",
@@ -555,12 +585,14 @@ def test_complete_mops_cache_skips_cross_day_remote_without_revision_event(
     tmp_path,
 ) -> None:
     repository = MopsRepository(tmp_path / "mops")
-    candidates = [_candidate(year, 4) for year in range(2021, 2026)]
+    candidates = [_candidate(year, 4) for year in range(2021, 2026)] + [
+        _candidate(year, quarter) for year in (2024, 2025) for quarter in (1, 2, 3)
+    ]
     announcements = [
         FilingAnnouncement(
             symbol="2330",
             fiscal_year=candidate.fiscal_year,
-            quarter=4,
+            quarter=candidate.quarter,
             available_at=candidate.available_at or "",
             title="財務報告",
         )
@@ -578,6 +610,7 @@ def test_complete_mops_cache_skips_cross_day_remote_without_revision_event(
     )
     discovery_after_seed = client.discovery_calls
     downloads_after_seed = list(client.downloaded_periods)
+    announcements_after_seed = list(client.announcement_years)
     second = service.load(
         "2330",
         signal_date="2026-07-22T15:00:00+08:00",
@@ -595,6 +628,7 @@ def test_complete_mops_cache_skips_cross_day_remote_without_revision_event(
     assert client.downloaded_periods == downloads_after_seed
     assert repository.last_recent_revision_check_epoch("2330") is not None
 
+    service.begin_run()
     service.load(
         "2330",
         signal_date="2026-08-01T13:30:00+08:00",
@@ -603,7 +637,7 @@ def test_complete_mops_cache_skips_cross_day_remote_without_revision_event(
     )
 
     assert client.discovery_calls == discovery_after_seed + 1
-    assert client.announcement_years[-1] == [2026]
+    assert client.announcement_years == announcements_after_seed
     assert client.downloaded_periods == downloads_after_seed
 
 
@@ -646,6 +680,7 @@ def test_market_wide_correction_event_verifies_only_affected_period(tmp_path) ->
         )
     ]
 
+    service.begin_run()
     assert service.prepare_daily_revisions(
         dt.datetime(2026, 2, 16, 5, 30, tzinfo=dt.timezone.utc)
     ) == 1
@@ -657,7 +692,7 @@ def test_market_wide_correction_event_verifies_only_affected_period(tmp_path) ->
     )
 
     assert client.correction_scan_periods == [[(2025, 3), (2025, 4)]]
-    assert client.discovery_calls == discovery_after_seed + 1
+    assert client.discovery_calls == discovery_after_seed
     assert client.downloaded_periods == downloads_after_seed + [(2025, 4)]
 
 
@@ -706,7 +741,11 @@ def test_fundamental_service_uses_point_in_time_cache_when_catalog_is_unavailabl
 
     assert bundle.snapshot["filing_id"] == filing.filing_id
     with repository.company_connection() as connection:
-        assert connection.execute("SELECT COUNT(*) FROM refresh_state").fetchone()[0] == 0
+        state = connection.execute(
+            "SELECT full_catalog_checked_at_epoch, active_snapshot_cache_key FROM refresh_state WHERE symbol='2330'"
+        ).fetchone()
+        assert state[0] == 0  # Local activation must not claim a successful full refresh.
+        assert state[1] is not None
         snapshot_hash = connection.execute(
             "SELECT filing_set_sha256 FROM fundamental_snapshots WHERE symbol = '2330'"
         ).fetchone()[0]
@@ -767,7 +806,7 @@ def test_live_fundamental_service_uses_filings_observed_during_same_run(tmp_path
 
     assert len(bundle.annual_fundamentals) == 3
     assert bundle.as_of == filing_observed_at
-    assert client.downloaded_periods == [(2023, 4), (2024, 4), (2025, 4)]
+    assert client.downloaded_periods == [(2025, 4), (2024, 4), (2023, 4)]
     stored_filings = repository.load_filings("2330")
     assert {
         filing.availability_source for filing in stored_filings
@@ -989,6 +1028,10 @@ def _fundamental_service(
     repository: MopsRepository,
     **kwargs,
 ) -> MopsFundamentalService:
+    # These tests isolate filing selection/PIT semantics, not production quotas.
+    kwargs.setdefault("refresh_policy", MopsRefreshPolicy(
+        max_filings_per_symbol=100, cooldown_seconds=0,
+    ))
     return MopsFundamentalService(
         client,
         repository=repository,

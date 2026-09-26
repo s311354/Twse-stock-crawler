@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import json
 from collections.abc import Mapping
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -105,6 +106,34 @@ class StrategyDecisionSchema:
 
         self._validate_base_coverage(decision)
         self._validate_valuation(decision)
+        if decision.value("LES Model Version") == "6.0.0":
+            self._validate_v6(decision)
+
+    @staticmethod
+    def _validate_v6(decision: StrategyDecision) -> None:
+        from domain.strategies.low_entry_v6_report import entry_gate_checks, report_failure
+        try:
+            report = json.loads(decision.value("LES v6 Report"))
+            gates = entry_gate_checks(report)
+            matching = (
+                report["model_version"] == "6.0.0"
+                and report["symbol"] == decision.value("證券代號")
+                and report["decision"]["signal"] == decision.value("低點決策") == decision.value("LES v6 Decision")
+                and report["decision"]["score"] == decision.value("低點分數") == decision.value("LES v6 Score")
+                and report["quality"]["status"] == decision.value("Quality Status")
+                and report["quality"].get("score") == decision.value("Quality Score")
+                and decision.value("Quality Gate") == gates["quality"]
+                and decision.value("No Veto") is {"PASS": True, "FAIL": False}.get(gates["no_veto"])
+                and decision.value("LES v6 Score Gate") == gates["score"]
+                and decision.value("LES v6 Trigger Gate") == gates["trigger"]
+                and decision.value("Risk Gate") == report["decision"]["risk_gate"]
+            )
+            if not matching:
+                raise ValueError("v6 projection mismatch")
+            if decision.value("低點決策") in {"BUY", "BUY_SMALL"} and report_failure(report, allow_replay=True):
+                raise ValueError("v6 executable report fails its published contract")
+        except (TypeError, ValueError, KeyError) as error:
+            raise StrategyContractError(f"Invalid LES v6 decision: {error}") from error
 
     @staticmethod
     def _validate_base_coverage(decision: StrategyDecision) -> None:
@@ -123,7 +152,7 @@ class StrategyDecisionSchema:
     def _validate_valuation(self, decision: StrategyDecision) -> None:
         status = decision.value("Valuation Model Status")
         entry_decision = decision.value("低點決策")
-        if entry_decision == "BUY":
+        if entry_decision == "BUY" and decision.value("LES Model Version") != "6.0.0":
             if status != "COMPLETE":
                 raise StrategyContractError(
                     "BUY decisions require complete valuation evidence"
@@ -211,6 +240,7 @@ class StrategyDecisionAssembler:
                     extended_at=extended_at,
                     base_source=base_source,
                     has_fundamental_snapshot=bool(snapshot),
+                    market_source=market.market_source,
                 )
                 for name, value in row.items()
             )
@@ -254,6 +284,7 @@ class StrategyDecisionAssembler:
         extended_at: datetime.datetime,
         base_source: FieldSource,
         has_fundamental_snapshot: bool,
+        market_source: str = "TWSE",
     ) -> DecisionField[FieldValue]:
         value = self._normalize_value(raw_value)
         source = self._source_for(
@@ -261,6 +292,12 @@ class StrategyDecisionAssembler:
             base_source,
             has_fundamental_snapshot,
         )
+        if source is FieldSource.TWSE_MARKET and market_source == "TPEX":
+            source = FieldSource.TPEX_MARKET
+        if row.get("LES Model Version") == "6.0.0":
+            from application.low_entry_v6_daily import V6_PROJECTED_COLUMNS
+            if name in V6_PROJECTED_COLUMNS:
+                source = FieldSource.LES_V6
         available_at = self._available_at_for(
             name=name,
             source=source,
@@ -442,6 +479,7 @@ class StrategyDecisionAssembler:
             return base_at
         if source in {
             FieldSource.TWSE_MARKET,
+            FieldSource.TPEX_MARKET,
             FieldSource.PROFIT_ANALYSIS,
             FieldSource.SIGNAL_FEATURES,
             FieldSource.EREM_V3,
@@ -454,6 +492,8 @@ class StrategyDecisionAssembler:
             return extended_at
         if source is FieldSource.LES_V5:
             return max(market_at, base_at, extended_at)
+        if source is FieldSource.LES_V6:
+            return evaluated_at
         return evaluated_at
 
     @staticmethod
@@ -502,12 +542,18 @@ class StrategyDecisionAssembler:
     ) -> str:
         if source is FieldSource.TWSE_MARKET:
             return "twse-daily-v1"
+        if source is FieldSource.TPEX_MARKET:
+            return "tpex-daily-v1"
         if source is FieldSource.PROFIT_ANALYSIS:
             return "profit-analysis-v1"
         if source is FieldSource.SIGNAL_FEATURES:
             return "signal-features-v1"
         if source is FieldSource.EREM_V3:
             return EREM_V3_MODEL_VERSION
+        if source is FieldSource.LES_V6:
+            return "6.0.0"
+        if source is FieldSource.LES_V5:
+            return "5.0.0"
         if source is FieldSource.LES_V5_VALUATION:
             return StrategyDecisionAssembler._version_value(
                 row.get("Valuation Model Version"),
@@ -539,8 +585,14 @@ class StrategyDecisionAssembler:
     @staticmethod
     def _unit_for(name: str) -> FieldUnit:
         lowered = name.lower()
+        if name in {"LES v6 Score Gate", "LES v6 Trigger Gate"}:
+            return FieldUnit.TEXT
         if name == "日期":
             return FieldUnit.DATE
+        if name in {"Entry Candidate", "Entry Trigger Price", "ATR14"}:
+            return FieldUnit.TWD_SCALED_1000
+        if name == "Falling Knife Veto":
+            return FieldUnit.BOOLEAN
         if "version" in lowered or "版本" in name:
             return FieldUnit.VERSION
         if name in {

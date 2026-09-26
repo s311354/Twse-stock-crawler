@@ -17,6 +17,7 @@ from domain.model_contracts import FieldSource
 from domain.model_contracts import FieldUnit
 from domain.model_contracts import STRATEGY_DECISION_SCHEMA_VERSION
 from domain.model_contracts import StrategyDecision
+from domain.models import Stocktype
 from domain.strategies.portfolio_allocation_v1 import AllocationSecurity
 from domain.strategies.portfolio_allocation_v1 import PortfolioAllocationEngine
 from domain.strategies.portfolio_allocation_v1 import PortfolioAllocationRequest
@@ -235,18 +236,45 @@ def _sqlite_contract(database_path: Path) -> dict[str, object]:
         }
 
 
+def test_cli_contract_fixture_digest_matches_actions() -> None:
+    expected_cli = _fixture()["cli"]
+    assert _digest(expected_cli["actions"]) == expected_cli["sha256"], (
+        "CLI fixture actions and reviewed SHA-256 must be updated together"
+    )
+
+
+def test_cli_accepts_eleccomp_profile() -> None:
+    args = create_parser().parse_args(["-t", "ELECCOMP", "stocklist_eleccomp"])
+
+    assert args.type is Stocktype.ELECCOMP
+    assert args.stocklist == ["stocklist_eleccomp"]
+
+
 def test_cli_strategy_dataset_and_renderer_contracts_are_stable() -> None:
     fixture = _fixture()
     cli_actions = _cli_actions()
     expected_cli = fixture["cli"]
     assert isinstance(expected_cli, dict)
-    assert cli_actions == expected_cli["actions"]
-    assert _digest(cli_actions) == expected_cli["sha256"]
+    # Explicitly reviewed additive replay options. Preserve the legacy actions
+    # and hash rather than regenerating the golden contract to hide a change.
+    replay_options = [
+        {"dest": "replay_mail", "options": ["--replay-mail"], "nargs": 0, "choices": None},
+        {"dest": "replay_restrictions_file", "options": ["--replay-restrictions-file"], "nargs": None, "choices": None},
+    ]
+    replay_names = {action["dest"] for action in replay_options}
+    assert [action for action in cli_actions if action["dest"] in replay_names] == replay_options
+    legacy_actions = [action for action in cli_actions if action["dest"] not in replay_names]
+    assert legacy_actions == expected_cli["actions"]
+    assert _digest(legacy_actions) == expected_cli["sha256"]
 
     expected_columns = fixture["analysis_columns"]
     assert isinstance(expected_columns, dict)
-    assert len(ANALYSIS_COLUMNS) == expected_columns["count"]
-    assert _digest(ANALYSIS_COLUMNS) == expected_columns["sha256"]
+    # Intentional additive industry evidence; retain the original schema hash.
+    added = {"Industry Quality Profile", "Industry Profile Version", "Industry Profile Mode", "Industry Shadow Decision"}
+    assert added.issubset(ANALYSIS_COLUMNS)
+    original_columns = [name for name in ANALYSIS_COLUMNS if name not in added]
+    assert len(original_columns) == expected_columns["count"]
+    assert _digest(original_columns) == expected_columns["sha256"]
 
     expected_strategies = fixture["strategies"]
     assert isinstance(expected_strategies, dict)

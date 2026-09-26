@@ -13,6 +13,7 @@ from domain.fundamental_derivation import FiledFinancials
 from domain.fundamental_derivation import FundamentalBundle
 from domain.fundamental_models import FilingAnnouncement
 from domain.fundamental_models import FilingCandidate
+from domain.fundamental_models import FilingCatalogState
 from domain.fundamental_models import FilingCorrection
 from domain.fundamental_models import FilingDocument
 from domain.fundamental_models import FilingRecord
@@ -38,6 +39,23 @@ class FundamentalUnitOfWork(Protocol):
 
 
 class FundamentalRepositoryPort(Protocol):
+    def load_filing_catalog(
+        self, symbol: str, *, as_of: str, uow: FundamentalUnitOfWork | None = None,
+    ) -> FilingCatalogState | None: ...
+
+    def save_filing_catalog(
+        self, state: FilingCatalogState, *, uow: FundamentalUnitOfWork | None = None,
+    ) -> None: ...
+
+    def load_refresh_attempt(
+        self, key: str, *, uow: FundamentalUnitOfWork | None = None,
+    ) -> tuple[float, str] | None: ...
+
+    def save_refresh_attempt(
+        self, key: str, attempted_at: float, status: str, *,
+        uow: FundamentalUnitOfWork | None = None,
+    ) -> None: ...
+
     def unit_of_work(self) -> FundamentalUnitOfWork:
         """Open one atomic persistence boundary for one company."""
 

@@ -98,6 +98,20 @@ class FilingAnnouncement:
 
 
 @dataclass(frozen=True)
+class FilingCatalogState:
+    """Resumable discovery metadata; never proof of financial availability."""
+
+    symbol: str
+    checked_at: str
+    candidates: tuple[FilingCandidate, ...]
+    scanned_periods: tuple[tuple[int, int], ...] = ()
+    corrections: tuple[FilingCorrection, ...] = ()
+    verified_corrections: tuple[FilingCorrection, ...] = ()
+    announcements_pending: bool = False
+    observed_batch_period: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True)
 class FundamentalSnapshot:
     """Latest matching income/balance snapshot for one listed company."""
 

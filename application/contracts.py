@@ -9,6 +9,7 @@ from typing import Any
 
 from domain.models import ProfitRow
 from domain.models import StockSelector
+from domain.models import Stocktype
 from domain.model_contracts import StrategyDecision
 
 
@@ -34,6 +35,26 @@ class StockAnalysisRequest:
     account_equity: float = 1_000_000.0
     portfolio_symbols: tuple[str, ...] = ()
     explicit_symbols: tuple[str, ...] = ()
+    # Internal PIT cutoff derived from date -e; not a user-facing CLI option.
+    as_of: datetime.datetime | None = None
+    replay_restrictions_file: str | None = None
+    replay_mail: bool = False
+    history_start_date: datetime.date | None = None
+    history_end_date: datetime.date | None = None
+
+    @property
+    def notification_enabled(self) -> bool:
+        return self.mail and (self.as_of is None or self.replay_mail)
+
+    @property
+    def report_file_prefix(self) -> str:
+        if self.as_of is None:
+            return self.output_file_names
+        return f"{self.output_file_names}_replay_{self.as_of.strftime('%Y%m%dT%H%M%S%z')}"
+
+    @property
+    def market_source(self) -> str:
+        return "TPEX" if self.stocktype == Stocktype.SEMI else "TWSE"
 
 
 @dataclass(frozen=True)
@@ -43,6 +64,7 @@ class AnalysisContext:
     resource: object
     market_date: datetime.date
     market_status: MarketStatus
+    as_of: datetime.datetime | None = None
 
 
 @dataclass(frozen=True)

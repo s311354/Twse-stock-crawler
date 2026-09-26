@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import logging
 import time
 from collections.abc import Callable
@@ -35,12 +36,12 @@ class CrawlerReportAdapter:
         )
         if evaluation.decisions and callable(decision_recorder):
             decision_recorder(
-                file_name=request.output_file_names,
+                file_name=request.report_file_prefix,
                 decisions=evaluation.decisions,
             )
         else:
             crawler.record_analysis_dataset(
-                file_name=request.output_file_names,
+                file_name=request.report_file_prefix,
                 maxprofits=evaluation.maxprofits,
             )
         self._observer.record(
@@ -48,7 +49,7 @@ class CrawlerReportAdapter:
             trade_date=context.market_date.isoformat(),
             source="REPORT",
             status="SUCCESS",
-            output=request.output_file_names,
+            output=request.report_file_prefix,
         )
 
 
@@ -63,6 +64,22 @@ class CrawlerNotificationAdapter:
         evaluation: StrategyEvaluation,
     ) -> None:
         crawler = context.resource
+        subject = request.subject
+        if request.as_of is not None:
+            if not request.notification_enabled or context.as_of != request.as_of:
+                raise ValueError("REPLAY_MAIL_NOT_AUTHORIZED_OR_CUTOFF_MISMATCH")
+            if not evaluation.decisions:
+                raise ValueError("REPLAY_MAIL_REQUIRES_TYPED_DECISIONS")
+            for decision in evaluation.decisions:
+                try:
+                    report = json.loads(decision.value("LES v6 Report"))
+                    if (report.get("evaluation_mode") != "HISTORICAL_REPLAY"
+                            or datetime.datetime.fromisoformat(report["replay_as_of"].replace("Z", "+00:00")) != request.as_of
+                            or datetime.datetime.fromisoformat(report["decision_time"].replace("Z", "+00:00")) != request.as_of):
+                        raise ValueError("mismatched replay evidence")
+                except (KeyError, TypeError, ValueError, AttributeError) as error:
+                    raise ValueError("REPLAY_MAIL_REPORT_CUTOFF_MISMATCH") from error
+            subject = f"[HISTORICAL_REPLAY｜歷史重播｜不可下單｜截止 {request.as_of.isoformat()}] {subject}"
         strategy_mailer = getattr(
             crawler,
             "smtp_strategy_email",
@@ -70,12 +87,14 @@ class CrawlerNotificationAdapter:
         )
         if evaluation.decisions and callable(strategy_mailer):
             strategy_mailer(
-                subject=request.subject,
+                subject=subject,
                 ccreceiver=request.ccreceiver,
                 stocktype=request.stocktype,
                 decisions=evaluation.decisions,
             )
         else:
+            if request.as_of is not None:
+                raise ValueError("REPLAY_MAIL_REQUIRES_TYPED_MAILER")
             crawler.smtp_email(
                 subject=request.subject,
                 ccreceiver=request.ccreceiver,
@@ -100,14 +119,23 @@ class CrawlerLineChartAdapter:
         now_provider: Callable[[], datetime.datetime],
         sleeper: Callable[[float], None] = time.sleep,
         observer: RunObserverPort | None = None,
+        tpex_crawler_factory: Callable[[int], Any] | None = None,
     ) -> None:
         self._crawler_factory = crawler_factory
         self._calendar = calendar
         self._now_provider = now_provider
         self._sleep = sleeper
         self._observer = observer or NullRunObserver()
+        self._tpex_crawler_factory = tpex_crawler_factory
 
     def generate(self, request: StockAnalysisRequest) -> None:
+        factory = self._crawler_factory
+        if request.market_source == "TPEX":
+            if "ALL" in request.stocklist:
+                raise ValueError("SEMI line charts require explicit TPEx stock numbers")
+            if self._tpex_crawler_factory is None:
+                raise ValueError("TPEx crawler factory is required for SEMI")
+            factory = self._tpex_crawler_factory
         self._observer.record(
             "line_chart_started",
             source="TWSE",
@@ -124,7 +152,7 @@ class CrawlerLineChartAdapter:
         ]
 
         for back in range(startofbacktrack):
-            crawler = self._crawler_factory(len(request.stocklist))
+            crawler = factory(len(request.stocklist))
             logging.debug("Line-chart backtrack iteration=%s", back)
             crawler.get_date_times(
                 begin_backtrack=startofbacktrack - back,

@@ -8,6 +8,7 @@ import pandas as pd
 
 from application.market_history import MarketHistoryAssembler
 from application.market_history import MarketHistoryInput
+from application.low_entry_v6_daily import V6_DAILY_COLUMNS, overlay_daily_v6
 from application.strategy_execution import PreparedStrategyInputs
 from application.strategy_execution import StrategyExecutionService
 from application.strategy_contracts import StrategyDecisionAssembler
@@ -55,11 +56,12 @@ BASE_COLUMNS = [
     "利潤比",
     *SIGNAL_COLUMNS,
 ]
-CORE_ANALYSIS_COLUMNS = (
+CORE_ANALYSIS_COLUMNS = list(dict.fromkeys(
     BASE_COLUMNS
     + LOW_ENTRY_OUTPUT_COLUMNS
+    + V6_DAILY_COLUMNS
     + EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS
-)
+))
 ANALYSIS_COLUMNS = (
     CORE_ANALYSIS_COLUMNS
     + list(PAE_V2_OUTPUT_COLUMNS)
@@ -144,11 +146,12 @@ class AnalysisDatasetBuilder:
         self,
         prepared: PreparedStrategyInputs,
     ) -> pd.DataFrame:
-        return self.strategy_execution.evaluate(
+        legacy = self.strategy_execution.evaluate(
             LOW_ENTRY_STRATEGY_NAME,
             LOW_ENTRY_OUTPUT_COLUMNS,
             prepared,
         )
+        return overlay_daily_v6(prepared.histories, legacy)
 
     def evaluate_expected_return_exit(
         self,

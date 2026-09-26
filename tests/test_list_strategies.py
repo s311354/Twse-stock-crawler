@@ -20,6 +20,7 @@ def test_list_strategies_displays_all_registered_strategies(capsys):
     
     # Check that key strategies are listed
     assert "low_entry_score_v5" in captured.out
+    assert "low_entry_score_v6" in captured.out
     assert "expected_return_exit_v3" in captured.out
     assert "low_entry_score_v4_1" in captured.out
     assert "portfolio_allocation_v1" in captured.out
@@ -33,6 +34,8 @@ def test_list_strategies_shows_version_and_description(capsys):
     # Check LES v5 metadata
     assert "5.0.0" in captured.out
     assert "Quality-first panic reversal" in captured.out
+    assert "6.0.0" in captured.out
+    assert "Quality-first adaptive" in captured.out
     
     # Check EREM v3 metadata
     assert "3.2.4" in captured.out
@@ -54,8 +57,9 @@ def test_available_strategies_returns_all_builtin_names():
     names = available_strategies()
     
     assert isinstance(names, list)
-    assert len(names) == 11
+    assert len(names) == 12
     assert "low_entry_score_v5" in names
+    assert "low_entry_score_v6" in names
     assert "expected_return_exit_v3" in names
     assert "low_entry_score_v4_1" in names
     assert "portfolio_allocation_v1" in names

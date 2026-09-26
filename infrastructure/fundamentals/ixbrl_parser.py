@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from html.parser import HTMLParser
 from math import pow
 
 from domain.fundamental_models import FilingDocument
 from domain.fundamental_models import NormalizedFact
 from domain.fundamental_models import XbrlContext
 from infrastructure.crawler.twse_http_client import TwseSchemaChangedError
+from infrastructure.fundamentals.ixbrl_units import UnitParser
+
+
+# Preserve visible text boundaries without inserting spaces between inline spans.
+_TEXT_LAYOUT_TAGS = frozenset({"br", "p", "div", "li", "tr", "td", "th"})
 
 
 @dataclass
@@ -25,9 +29,9 @@ class _RawFact:
     text: str = ""
 
 
-class _InlineXbrlParser(HTMLParser):
+class _InlineXbrlParser(UnitParser):
     def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
+        super().__init__()
         self.contexts: dict[str, XbrlContext] = {}
         self.raw_facts: list[_RawFact] = []
         self._context_id: str | None = None
@@ -38,8 +42,10 @@ class _InlineXbrlParser(HTMLParser):
         self._fact: _RawFact | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        super().handle_starttag(tag, attrs)
         attributes = {name.lower(): value or "" for name, value in attrs}
         normalized_tag = tag.lower()
+        self._preserve_text_boundary(normalized_tag)
         if normalized_tag == "xbrli:context":
             self._context_id = attributes.get("id")
             self._context_values = {
@@ -83,13 +89,16 @@ class _InlineXbrlParser(HTMLParser):
         )
 
     def handle_data(self, data: str) -> None:
+        super().handle_data(data)
         if self._fact is not None:
             self._fact.text += data
         if self._context_field is not None:
             self._context_text.append(data)
 
     def handle_endtag(self, tag: str) -> None:
+        super().handle_endtag(tag)
         normalized_tag = tag.lower()
+        self._preserve_text_boundary(normalized_tag)
         context_end_tags = {
             "xbrli:startdate": "start_date",
             "xbrli:enddate": "end_date",
@@ -130,6 +139,16 @@ class _InlineXbrlParser(HTMLParser):
             self.raw_facts.append(self._fact)
             self._fact = None
 
+    def _preserve_text_boundary(self, tag: str) -> None:
+        if (
+            tag in _TEXT_LAYOUT_TAGS
+            and self._fact is not None
+            and not self._fact.is_numeric
+            and self._fact.text
+            and not self._fact.text.endswith(("\n", "\r"))
+        ):
+            self._fact.text += "\n"
+
 
 def decode_mops_content(content: bytes) -> str:
     """Decode MOPS bytes deterministically while tolerating legacy encodings."""
@@ -143,7 +162,12 @@ def decode_mops_content(content: bytes) -> str:
 
 
 def parse_ixbrl(content: bytes | str) -> list[NormalizedFact]:
-    """Return normalized facts with resolved periods and dimensions."""
+    """Resolve periods/numbers while retaining decoded text for audit evidence.
+
+    Text facts keep source whitespace and HTML layout boundaries. CJK matching
+    normalizes a separate copy in the domain layer; raw HTML bytes remain in
+    the filing repository for exact source reconstruction.
+    """
 
     parser = _InlineXbrlParser()
     parser.feed(decode_mops_content(content) if isinstance(content, bytes) else content)
@@ -158,9 +182,11 @@ def parse_ixbrl(content: bytes | str) -> list[NormalizedFact]:
             NormalizedFact(
                 concept=raw.concept,
                 context_id=raw.context_id,
-                unit=raw.unit,
+                unit=parser.units.get(raw.unit),
                 numeric_value=numeric_value,
-                text_value=None if raw.is_numeric else (text or None),
+                text_value=(
+                    raw.text if not raw.is_numeric and text else None
+                ),
                 start_date=context.start_date,
                 end_date=context.end_date,
                 instant=context.instant,

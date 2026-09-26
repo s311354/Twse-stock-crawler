@@ -19,6 +19,7 @@ from domain.fundamental_derivation import FiledFinancials
 from domain.fundamental_derivation import FundamentalBundle
 from domain.fundamental_models import FundamentalSnapshot
 from domain.fundamental_models import NormalizedFact
+from domain.fundamental_models import FilingCatalogState
 from infrastructure.fundamentals.models import MopsFiling
 from infrastructure.fundamentals.models import MopsFilingCandidate
 from infrastructure.fundamentals.mops_commands import MopsRevisionWriter
@@ -78,6 +79,7 @@ class MopsRepository:
         self.queries = MopsQueryRepository(
             lambda: self._connect(),
             lambda: self._ensure_schema(),
+            raw_root=self.raw_root,
         )
         self.revision_writer = MopsRevisionWriter(
             self.root,
@@ -85,6 +87,23 @@ class MopsRepository:
             lambda: self._ensure_schema(),
             self.queries,
         )
+
+    def load_filing_catalog(self, symbol, *, as_of, uow=None) -> FilingCatalogState | None:
+        return self.queries.load_filing_catalog(symbol, as_of=as_of, uow=uow)
+
+    def save_filing_catalog(self, state: FilingCatalogState, *, uow=None) -> None:
+        self.revision_writer.save_filing_catalog(state, uow=uow)
+
+    def load_refresh_attempt(
+        self, key: str, *, uow: FundamentalUnitOfWork | None = None,
+    ) -> tuple[float, str] | None:
+        return self.queries.load_refresh_attempt(key, uow=uow)
+
+    def save_refresh_attempt(
+        self, key: str, attempted_at: float, status: str, *,
+        uow: FundamentalUnitOfWork | None = None,
+    ) -> None:
+        self.revision_writer.save_refresh_attempt(key, attempted_at, status, uow=uow)
 
     def save_revision(
         self,

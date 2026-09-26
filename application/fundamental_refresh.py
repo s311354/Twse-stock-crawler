@@ -7,6 +7,7 @@ import datetime as dt
 import pandas as pd
 
 from application.fundamental_ports import FilingCatalogPort
+from application.filing_refresh_planner import FilingRefreshPlanner
 from domain.data_provenance import MOPS_PUBLIC_ANNOUNCEMENT
 from domain.fundamental_models import FilingAnnouncement
 from domain.fundamental_models import FilingCandidate
@@ -121,20 +122,17 @@ class RefreshPlanner:
         if not eligible:
             return False
         periods = {(item.fiscal_year, item.quarter) for item in eligible}
-        latest_period = max(periods)
-        annual_years = {year for year, quarter in periods if quarter == 4}
-        if len(annual_years) < history_years:
+        return FilingRefreshPlanner.history_periods(max(periods), history_years).issubset(periods)
+
+    @staticmethod
+    def has_recent_quarters(periods: set[tuple[int, int]]) -> bool:
+        """Eight standalone quarters need nine consecutive YTD observations."""
+        if not periods:
             return False
-        latest_year, latest_quarter = latest_period
-        if latest_quarter < 4:
-            required = {
-                latest_period,
-                (latest_year - 1, latest_quarter),
-                (latest_year - 1, 4),
-            }
-            if not required.issubset(periods):
-                return False
-        return True
+        year, quarter = max(periods)
+        latest_index = year * 4 + quarter - 1
+        required = {(index // 4, index % 4 + 1) for index in range(latest_index - 8, latest_index + 1)}
+        return required.issubset(periods)
 
     def select_refresh_candidates(
         self,

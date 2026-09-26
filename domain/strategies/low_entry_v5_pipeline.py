@@ -12,6 +12,8 @@ import pandas as pd
 from domain.features import FeatureFrame
 from domain.features import SharedFeatureConfig
 from domain.features import SharedFeaturePipeline
+from domain.industry_admission import industry_entry_signal
+from domain.industry_profiles import IndustryProfileRegistry
 from domain.quality_v5 import LowEntryV5QualityResult
 from domain.security_identity import ISSUER_SYMBOL_FIELD
 from domain.security_identity import SECURITY_TYPE_FIELD
@@ -389,6 +391,12 @@ class LowEntryV5DecisionPipeline:
             context,
         )
 
+        profile = IndustryProfileRegistry.resolve(snapshot.get("sector"))
+        shadow_decision = decision.copy()
+        decision = decision.map(lambda signal: industry_entry_signal(signal, profile))
+        executable = decision.isin({"BUY", "BUY_SMALL", "EARLY_BUY"})
+        position_fraction = position_fraction.where(executable, 0.0)
+        recommended_shares = recommended_shares.where(executable, 0)
         result = self.components.report.assemble_result(
             data=frame,
             indicators=indicators,
@@ -415,6 +423,12 @@ class LowEntryV5DecisionPipeline:
         )
         result["Security Type"] = security_type
         result["Issuer Symbol"] = issuer_symbol
+        result["Industry Quality Profile"] = profile.name if profile else "UNSUPPORTED"
+        result["Industry Profile Version"] = profile.version if profile else "N/A"
+        result["Industry Profile Mode"] = profile.mode.value if profile else "UNSUPPORTED"
+        result["Industry Shadow Decision"] = shadow_decision
+        if profile is not None and profile.mode.value == "SHADOW":
+            result["低點理由"] = "INDUSTRY_PROFILE_SHADOW_MODE；" + result["低點理由"].astype(str)
         if not security_supported:
             result["低點理由"] = (
                 "SecurityType={}；Issuer={}；"

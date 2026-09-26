@@ -9,6 +9,9 @@ import sqlite3
 from collections.abc import Callable
 from collections.abc import Mapping
 from contextlib import closing
+from dataclasses import replace
+from functools import lru_cache
+from pathlib import Path
 
 import pandas as pd
 
@@ -17,13 +20,31 @@ from domain.fundamental_derivation import CachedFundamentalBundle
 from domain.fundamental_derivation import FiledFact
 from domain.fundamental_derivation import FiledFinancials
 from domain.fundamental_derivation import FundamentalBundle
+from domain.fundamental_models import FilingCandidate
+from domain.fundamental_models import FilingCatalogState
+from domain.fundamental_models import FilingCorrection
 from domain.fundamental_models import FundamentalSnapshot
 from domain.fundamental_models import NormalizedFact
 from infrastructure.fundamentals.models import MopsFiling
 from infrastructure.fundamentals.models import MopsFilingCandidate
+from infrastructure.fundamentals.ixbrl_parser import decode_mops_content
+from infrastructure.fundamentals.ixbrl_units import UnitParser
 from infrastructure.fundamentals.mops_sqlite import row_to_filing
 from infrastructure.fundamentals.mops_sqlite import to_epoch
 from infrastructure.fundamentals.mops_unit_of_work import borrow_connection
+
+
+@lru_cache(maxsize=128)
+def _raw_unit_declarations(
+    path: Path, expected_hash: str, signature: tuple[int, int, int],
+) -> dict[str, str | None] | None:
+    """Bounded local-only migration; stat signature invalidates replaced files."""
+    content = path.read_bytes()
+    if hashlib.sha256(content).hexdigest() != expected_hash:
+        return None
+    parser = UnitParser()
+    parser.feed(decode_mops_content(content))
+    return parser.units
 
 
 class MopsQueryRepository:
@@ -35,9 +56,76 @@ class MopsQueryRepository:
         self,
         connect: Callable[[], sqlite3.Connection],
         ensure_schema: Callable[[], None],
+        *,
+        raw_root: Path | None = None,
     ) -> None:
         self._connect = connect
         self._ensure_schema = ensure_schema
+        self._raw_root = raw_root
+
+    def _resolve_cached_units(self, filing: MopsFiling, facts: list[FiledFact]) -> tuple[FiledFact, ...]:
+        """Upgrade old unitRef-only facts without rewriting filing provenance.
+
+        New facts already carry canonical measures. Old documents are verified
+        by content hash, read locally, and never trigger a network request.
+        Missing/corrupt originals cannot turn an opaque EPS unit into evidence.
+        """
+        if self._raw_root is None or not any(
+            fact.unit and not fact.unit.startswith(("iso4217:", "xbrli:")) for fact in facts
+        ):
+            return tuple(facts)
+        units = None
+        try:
+            path = (self._raw_root.parent / filing.raw_path).resolve()
+            if path.is_relative_to(self._raw_root.resolve()):
+                stat = path.stat()
+                units = _raw_unit_declarations(
+                    path, filing.content_sha256, (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size),
+                )
+        except OSError:
+            pass
+        result = []
+        for fact in facts:
+            if fact.unit and not fact.unit.startswith(("iso4217:", "xbrli:")):
+                # Even a familiar unitRef label is not a unit declaration.
+                unit = units.get(fact.unit) if units is not None else None
+                fact = replace(fact, unit=unit)
+            result.append(fact)
+        return tuple(result)
+
+    def load_filing_catalog(
+        self, symbol: str, *, as_of: str, uow: FundamentalUnitOfWork | None = None,
+    ) -> FilingCatalogState | None:
+        self._ensure_schema()
+        with borrow_connection(self._connect, None, uow) as connection:
+            row = connection.execute(
+                "SELECT state_json FROM filing_catalog_cache "
+                "WHERE symbol = ? AND checked_at_epoch <= ?", (symbol, to_epoch(as_of)),
+            ).fetchone()
+        if row is None:
+            return None
+        values = json.loads(row[0])
+        return FilingCatalogState(
+            symbol=values["symbol"], checked_at=values["checked_at"],
+            candidates=tuple(FilingCandidate(**item) for item in values["candidates"]),
+            scanned_periods=tuple(tuple(item) for item in values["scanned_periods"]),
+            corrections=tuple(FilingCorrection(**item) for item in values["corrections"]),
+            verified_corrections=tuple(FilingCorrection(**item) for item in values["verified_corrections"]),
+            announcements_pending=values.get("announcements_pending", False),
+            observed_batch_period=(tuple(values["observed_batch_period"])
+                                   if values.get("observed_batch_period") else None),
+        )
+
+    def load_refresh_attempt(
+        self, key: str, *, uow: FundamentalUnitOfWork | None = None,
+    ) -> tuple[float, str] | None:
+        self._ensure_schema()
+        with borrow_connection(self._connect, None, uow) as connection:
+            row = connection.execute(
+                "SELECT attempted_at_epoch, status FROM remote_refresh_attempts "
+                "WHERE refresh_key = ?", (key,),
+            ).fetchone()
+        return (float(row[0]), str(row[1])) if row else None
 
     def latest_filing(
         self,
@@ -247,7 +335,7 @@ class MopsQueryRepository:
                 quarter=filing.quarter,
                 available_at=filing.available_at,
                 revision_number=filing.revision_number,
-                facts=tuple(facts),
+                facts=self._resolve_cached_units(filing, facts),
                 correction_description=filing.correction_description,
                 availability_source=filing.availability_source,
                 filing_id=filing.filing_id,

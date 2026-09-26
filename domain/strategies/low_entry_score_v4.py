@@ -818,7 +818,8 @@ class LowEntryScoreV4Strategy(Strategy):
         if quality.status == GateStatus.UNKNOWN:
             return pd.Series("DATA_INSUFFICIENT", index=score.index)
         if quality.industry_profile_mode == IndustryProfileMode.SHADOW.value:
-            return pd.Series("WATCH_ONLY", index=score.index)
+            blocked = vetoes.any(axis=1) | (market_data_gate != "PASS")
+            return pd.Series(np.where(blocked, "NO_BUY", "WATCH_ONLY"), index=score.index)
         if quality.status in {GateStatus.PROVISIONAL, GateStatus.WATCH_QUALITY}:
             return pd.Series("WATCH_ONLY", index=score.index)
 

@@ -699,7 +699,9 @@ def test_application_marks_remaining_symbols_when_mops_schema_circuit_opens(capl
     assert "MOPS schema circuit open after 2 consecutive failures" in caplog.text
 
 
-def test_cli_renders_typed_http_failure(monkeypatch, capsys) -> None:
+def test_cli_renders_typed_http_failure(monkeypatch, capsys, tmp_path) -> None:
+    monkeypatch.setenv("TWSE_RUN_LOCK_PATH", str(tmp_path / "analysis.lock"))
+
     class FailingService:
         def run(self, request) -> None:
             raise TwseNetworkError("offline")

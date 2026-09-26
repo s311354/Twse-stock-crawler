@@ -169,6 +169,7 @@ def _panic_history() -> pd.DataFrame:
     )
 
 
+@pytest.mark.usefixtures("active_industry_profiles")
 def test_v5_golden_dataset_preserves_score_decision_reason_and_columns() -> None:
     fixture_path = (
         Path(__file__).parents[1]
@@ -188,7 +189,8 @@ def test_v5_golden_dataset_preserves_score_decision_reason_and_columns() -> None
     latest = result.iloc[-1]
 
     assert len(data) == expected["input_rows"]
-    assert result.columns.tolist() == expected["output_columns"]
+    added = ["Industry Quality Profile", "Industry Profile Version", "Industry Profile Mode", "Industry Shadow Decision"]
+    assert result.columns.tolist() == expected["output_columns"] + added
     assert float(latest["低點分數"]) == expected["score"]
     assert latest["低點決策"] == expected["decision"]
     assert latest["低點理由"] == expected["reason"]

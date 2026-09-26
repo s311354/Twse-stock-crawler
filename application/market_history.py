@@ -53,6 +53,10 @@ class MarketHistoryInput:
     fundamental_status_details: Mapping[str, str]
     signal_dates: Mapping[str, str]
     account_equity: float | None
+    default_sector: str = "UNKNOWN"
+    les_v6_portfolio: Mapping[str, object] = field(default_factory=dict)
+    trading_restrictions: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
+    les_v6_research_context: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
     fallback_date: str = ""
     entry_les_by_stock: Mapping[str, float] = field(default_factory=dict)
     entry_dates_by_stock: Mapping[
@@ -64,6 +68,8 @@ class MarketHistoryInput:
         str,
         Mapping[str, object],
     ] = field(default_factory=dict)
+    market_source: str = "TWSE"
+    replay_as_of: str | None = None
 
     def __post_init__(self) -> None:
         if self.stock_count < 0:
@@ -178,6 +184,8 @@ class MarketHistoryAssembler:
             (
                 "{}T13:30:00+08:00".format(dates[-1])
                 if dates
+                else "{}T13:30:00+08:00".format(market.fallback_date)
+                if market.fallback_date
                 else None
             ),
         )
@@ -217,6 +225,23 @@ class MarketHistoryAssembler:
                     visible_breadth[str(date)] = dict(snapshot)
             history.attrs[MARKET_BREADTH_HISTORY_ATTR] = visible_breadth
         history.attrs[PRICE_SCALE_ATTR] = 1000.0
+        history.attrs["les_v6_daily_identity"] = {
+            "symbol": stock_no, "name": market.stock_names[item],
+            "sector": market.default_sector,
+        }
+        if market.market_source != "TWSE":
+            history.attrs["les_v6_daily_identity"]["market"] = market.market_source
+            history.attrs["market_source"] = market.market_source
+        # The scheduled completed session belongs to the batch, not to each
+        # stock's last quote (which may be absent from recent market tables).
+        history.attrs["les_v6_analysis_session"] = market.fallback_date or max(
+            (str(values[-1]) for values in market.dates if values), default=""
+        )
+        history.attrs["les_v6_portfolio"] = dict(market.les_v6_portfolio)
+        if market.replay_as_of:
+            history.attrs["replay_as_of"] = market.replay_as_of
+        history.attrs["trading_restriction"] = dict(market.trading_restrictions.get(stock_no, {}))
+        history.attrs["les_v6_research_context"] = dict(market.les_v6_research_context.get(stock_no, {}))
         if stock_no in market.annual_fundamentals:
             history.attrs[ANNUAL_FUNDAMENTALS_ATTR] = (
                 market.annual_fundamentals[stock_no].copy()

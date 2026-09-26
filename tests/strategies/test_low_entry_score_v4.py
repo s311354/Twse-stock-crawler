@@ -424,6 +424,7 @@ def test_low_entry_score_v4_missing_mops_context_is_watch_only() -> None:
     assert latest["LES v4 Trigger"] == 1
 
 
+@pytest.mark.usefixtures("active_industry_profiles")
 def test_low_entry_score_v4_requires_all_entry_gates_for_buy() -> None:
     latest = LowEntryScoreV4Strategy().run(with_quality_context(buy_candidate_history())).iloc[-1]
 
@@ -437,6 +438,7 @@ def test_low_entry_score_v4_requires_all_entry_gates_for_buy() -> None:
     assert latest["建議股數"] > 0
 
 
+@pytest.mark.usefixtures("active_industry_profiles")
 def test_low_entry_score_v4_1_end_to_end_buy_is_auditable() -> None:
     latest = LowEntryScoreV41Strategy().run(
         with_quality_context(buy_candidate_history())
@@ -593,8 +595,10 @@ def test_quality_gate_rejects_non_electronic_sector_and_untrusted_time() -> None
 
 
 def test_industry_profile_registry_separates_chemical_from_electronics() -> None:
-    assert IndustryProfileRegistry.resolve("21") is CHEMICAL_PROFILE
-    assert IndustryProfileRegistry.resolve("24") is ELECTRONICS_PROFILE
+    assert IndustryProfileRegistry.resolve("21").name == "CHEMI_PROFILE"
+    assert IndustryProfileRegistry.resolve("24").name == "SEMI_PROFILE"
+    assert IndustryProfileRegistry.resolve("21").mode is IndustryProfileMode.ACTIVE
+    # Historical constants remain stable for explicit rule replays only.
     assert CHEMICAL_PROFILE.mode is IndustryProfileMode.ACTIVE
     assert ELECTRONICS_PROFILE.sector_codes == frozenset(
         str(code) for code in range(24, 32)
@@ -618,7 +622,7 @@ def test_chemical_profile_scores_cycle_trough_with_recovery_evidence() -> None:
         "2026-07-21T05:30:00Z",
     )
 
-    assert result.industry_profile == "CHEMICAL_PROFILE"
+    assert result.industry_profile == "CHEMI_PROFILE"
     assert result.industry_profile_mode == "ACTIVE"
     assert result.status is GateStatus.PASS
     assert result.metrics["roic_5y_median"] == pytest.approx(0.06)
@@ -736,6 +740,7 @@ def test_chemical_profile_preserves_cross_industry_hard_rejects() -> None:
     assert "GOING_CONCERN_MATERIAL_UNCERTAINTY" in result.hard_red_flags
 
 
+@pytest.mark.usefixtures("active_industry_profiles")
 def test_active_chemical_profile_can_generate_standard_buy() -> None:
     contextual = attach_low_entry_v4_context(
         buy_candidate_history(),
@@ -747,7 +752,7 @@ def test_active_chemical_profile_can_generate_standard_buy() -> None:
     latest = LowEntryScoreV41Strategy().run(contextual).iloc[-1]
 
     assert latest["Quality Gate"] == "PASS"
-    assert latest["Industry Quality Profile"] == "CHEMICAL_PROFILE"
+    assert latest["Industry Quality Profile"] == "CHEMI_PROFILE"
     assert latest["Industry Profile Mode"] == "ACTIVE"
     assert latest["LES v4.1 Trigger"] == 1
     assert latest["低點決策"] == "BUY"

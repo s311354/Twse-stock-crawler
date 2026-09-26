@@ -13,6 +13,7 @@ from domain.fundamental_derivation import FiledFinancials
 from domain.fundamental_derivation import FUNDAMENTAL_DERIVATION_VERSION
 from domain.fundamental_derivation import FundamentalBundle
 from domain.fundamental_derivation import derive_fundamentals
+from domain.strategies.low_entry_v6_filings import V6_FILING_SCHEMA_VERSION, ixbrl_record
 
 
 class FundamentalDeriver:
@@ -50,12 +51,18 @@ class FundamentalDeriver:
             uow=uow,
         )
         cache_hit = bundle is not None
-        if bundle is None:
-            bundle = self._derive_bundle(
-                filed_financials,
-                signal_date=parsed_signal,
-                sector=resolved_sector,
-            )
+        if (bundle is None or "les_v6_mops_filings" not in bundle.snapshot
+                or bundle.snapshot.get("les_v6_filing_schema_version") != V6_FILING_SCHEMA_VERSION):
+            if bundle is None:
+                bundle = self._derive_bundle(
+                    filed_financials,
+                    signal_date=parsed_signal,
+                    sector=resolved_sector,
+                )
+            snapshot = dict(bundle.snapshot)
+            snapshot["les_v6_mops_filings"] = [ixbrl_record(symbol, filing) for filing in filed_financials]
+            snapshot["les_v6_filing_schema_version"] = V6_FILING_SCHEMA_VERSION
+            bundle = FundamentalBundle(bundle.annual_fundamentals, snapshot, bundle.as_of)
             self._repository.save_fundamental_bundle(
                 symbol,
                 snapshot_cache_key,

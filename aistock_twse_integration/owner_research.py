@@ -596,8 +596,31 @@ def main() -> int:
         "les": sorted(set(frame["LES Model Version"].dropna().astype(str))),
         "pae": sorted(set(frame["PAE Model Version"].dropna().astype(str))),
     }
-    if versions["les"] != [LES_V5_MODEL_VERSION] or versions["pae"] != [PAE_V2_MODEL_VERSION]:
+    if versions["les"] not in ([LES_V5_MODEL_VERSION], ["6.0.0"]) or versions["pae"] != [PAE_V2_MODEL_VERSION]:
         raise ValueError("MODEL_VERSION_MISMATCH")
+
+    v6_reports = None
+    execution_sessions = None
+    if payload.get("lesV6ReportsFile") or versions["les"] == ["6.0.0"]:
+        from .les_v6_execution import is_supported_execution_symbol, load_reports, next_sessions
+        from .les_v6_premarket import apply_reports
+        if versions["les"] == ["6.0.0"]:
+            if "LES v6 Report" not in frame:
+                raise ValueError("MISSING_V6_REPORTS")
+            v6_reports = {
+                str(row["證券代號"]): json.loads(row["LES v6 Report"])
+                for _, row in frame.iterrows()
+                if is_supported_execution_symbol(str(row["證券代號"]))
+            }
+            for code, report in v6_reports.items():
+                if report.get("symbol") != code or report.get("signal_date") != data_date or report.get("model_version") != "6.0.0":
+                    raise ValueError("V6_REPORT_IDENTITY_OR_DATE_MISMATCH")
+            if payload.get("lesV6ReportsFile") and load_reports(payload["lesV6ReportsFile"], data_date) != v6_reports:
+                raise ValueError("V6_CSV_ARTIFACT_MISMATCH")
+        else:
+            v6_reports = load_reports(payload["lesV6ReportsFile"], data_date)
+        execution_sessions = next_sessions(data_date, payload["tradeDate"])
+        frame = apply_reports(frame, v6_reports)
 
     close_by_code = {
         text(row["證券代號"]): finite(row["收盤"])
@@ -669,6 +692,10 @@ def main() -> int:
     output = decision.to_frame().set_index("Stock Code")
     source_by_code = {text(row["證券代號"]): row for _, row in frame.iterrows()}
     lines = [row_payload(source_by_code[str(code)], row) for code, row in output.iterrows()]
+    if v6_reports is not None:
+        for line in lines:
+            line["lowEntry"]["modelVersion"] = "6.0.0"
+            line["lowEntry"]["v6Report"] = v6_reports.get(line["code"])
     lines.sort(key=lambda item: (
         0 if item["role"] == "HOLDING" else 1,
         ACTION_PRIORITY.get(item["action"], 8),
@@ -702,7 +729,7 @@ def main() -> int:
         "requiredHistorySessions": REQUIRED_HISTORY_SESSIONS,
         "historyComplete": history_sessions >= REQUIRED_HISTORY_SESSIONS,
         "models": {
-            "les": LES_V5_MODEL_VERSION,
+            "les": "6.0.0" if v6_reports is not None else LES_V5_MODEL_VERSION,
             "erem": EREM_V3_MODEL_VERSION,
             "pae": PAE_V2_MODEL_VERSION,
         },
@@ -720,6 +747,9 @@ def main() -> int:
         "observations": observations,
         "lines": selected,
     }
+    if execution_sessions is not None:
+        result["executionSessions"] = execution_sessions
+        result["executionCalendarSource"] = "TWSE_OFFICIAL"
     sys.stdout.write(json.dumps(result, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
     return 0
 

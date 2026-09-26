@@ -10,6 +10,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from application.fundamental_service import MopsFundamentalService
+from application.mops_refresh_control import MopsRefreshPolicy
 from application.portfolio_allocation_v2 import PortfolioAllocationV2Pipeline
 from application.stock_service import StockAnalysisService
 from application.use_cases import EvaluateStrategies
@@ -21,6 +22,8 @@ from config.settings import AppSettings
 from infrastructure.calendar.twse_calendar import TwseCalendar
 from infrastructure.crawler.twse_http_client import TwseHttpClient
 from infrastructure.crawler.twse_http_client import TwseHttpConfig
+from infrastructure.crawler.tpex_client import TpexClient
+from infrastructure.storage.csv_repository import TpexCsvRepository
 from infrastructure.fundamentals.ixbrl_parser import IxbrlFilingParser
 from infrastructure.fundamentals.mops_client import MopsClient
 from infrastructure.fundamentals.mops_repository import MopsRepository
@@ -31,6 +34,8 @@ from infrastructure.storage.portfolio_persistence import (
     SQLitePortfolioPersistence,
 )
 from infrastructure.runtime.fundamental_adapter import CrawlerFundamentalAdapter
+from infrastructure.runtime.fundamental_refresh import FundamentalRefreshCoordinator
+from infrastructure.storage.trading_restriction_repository import TradingRestrictionRepository
 from infrastructure.runtime.market_data_adapter import CrawlerMarketDataAdapter
 from infrastructure.runtime.output_adapters import CrawlerLineChartAdapter
 from infrastructure.runtime.output_adapters import CrawlerNotificationAdapter
@@ -134,8 +139,17 @@ def build_stock_analysis_runtime(
             app_settings=effective_settings,
             market_history_cache=market_history_cache,
         )
+        tpex_crawler_factory = lambda size: TwseCrawker(
+            size,
+            twse_client=TpexClient(http_client=shared_http_client),
+            csv_repository=TpexCsvRepository(),
+            app_settings=effective_settings,
+            market_history_cache=market_history_cache,
+            market_source="TPEX",
+        )
     else:
         effective_crawler_factory = crawler_factory
+        tpex_crawler_factory = crawler_factory
 
     if fundamental_service is not None:
         effective_fundamental_service = fundamental_service
@@ -175,15 +189,31 @@ def build_stock_analysis_runtime(
             financial_batch_client=TwseFinancialBatchClient(
                 shared_http_client
             ),
+            refresh_policy=MopsRefreshPolicy(
+                max_symbols=effective_settings.mops_refresh_max_symbols,
+                max_requests=effective_settings.mops_refresh_max_requests,
+                max_filings_per_symbol=effective_settings.mops_refresh_max_filings_per_symbol,
+                cooldown_seconds=effective_settings.mops_refresh_cooldown_seconds,
+                blocked_threshold=effective_settings.mops_access_blocked_threshold,
+            ),
         )
 
+    restriction_repository = TradingRestrictionRepository(
+        effective_settings.mops_cache_dir / "trading_restrictions.sqlite3"
+    )
     market_data_adapter = CrawlerMarketDataAdapter(
         effective_crawler_factory,
         observer=observer,
+        tpex_crawler_factory=tpex_crawler_factory,
+        restriction_repository=restriction_repository,
     )
     fundamental_adapter = CrawlerFundamentalAdapter(
         effective_fundamental_service,
         observer=observer,
+        coordinator=FundamentalRefreshCoordinator(
+            effective_fundamental_service, observer=observer,
+            restriction_repository=restriction_repository, now_provider=effective_now_provider,
+        ),
     )
     service = StockAnalysisService(
         fetch_market_data=FetchMarketData(
@@ -220,6 +250,7 @@ def build_stock_analysis_runtime(
             effective_calendar,
             now_provider=effective_now_provider,
             observer=observer,
+            tpex_crawler_factory=tpex_crawler_factory,
         ),
         observer=observer,
     )

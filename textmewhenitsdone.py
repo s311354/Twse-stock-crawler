@@ -143,10 +143,13 @@ class TextMeWhenItsDone(object):
         entryanalysis: str = "",
         receiver: str | list[str] = "YO",
         ccreceiver: str = "",
+        les_model_version: str = "5.0.0",
     ) -> None:
         # Create the email message
         msg = MIMEMultipart('alternative')
-        msg['Subject'] = "[TWSE Stock {}] [{}]: LES v5 / EREM v3 ({} ~ {})".format(subject, stocktype, iso_scheduled_times[0], iso_scheduled_times[-1])
+        if les_model_version not in {"5.0.0", "6.0.0"}:
+            raise ValueError("Unsupported daily LES model version")
+        msg['Subject'] = "[TWSE Stock {}] [{}]: LES v{} / EREM v3 ({} ~ {})".format(subject, stocktype, les_model_version.split('.')[0], iso_scheduled_times[0], iso_scheduled_times[-1])
 
         # RFC 5322
         msg['From']  = email

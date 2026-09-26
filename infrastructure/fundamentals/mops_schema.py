@@ -81,6 +81,16 @@ class MopsSchemaMigrator:
                     active_latest_quarter INTEGER,
                     active_annual_history_years INTEGER
                 );
+                CREATE TABLE IF NOT EXISTS remote_refresh_attempts (
+                    refresh_key TEXT PRIMARY KEY,
+                    attempted_at_epoch REAL NOT NULL,
+                    status TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS filing_catalog_cache (
+                    symbol TEXT PRIMARY KEY,
+                    checked_at_epoch INTEGER NOT NULL,
+                    state_json TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS fundamental_snapshots (
                     symbol TEXT NOT NULL,
                     filing_set_sha256 TEXT NOT NULL,

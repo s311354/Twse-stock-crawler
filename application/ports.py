@@ -9,6 +9,15 @@ from typing import Protocol
 from application.contracts import AnalysisContext
 from application.contracts import StockAnalysisRequest
 from application.contracts import StrategyEvaluation
+from domain.models import StockRows
+
+
+class DailyStockClientPort(Protocol):
+    """Normalized legacy OHLCV rows and a separately sourced TAIEX benchmark."""
+
+    def get_daily_stock_rows(self, date_time: str, stocktype: int | str) -> StockRows: ...
+
+    def get_daily_taiex_close(self, date_time: str) -> float | None: ...
 
 
 class MarketCalendarPort(Protocol):

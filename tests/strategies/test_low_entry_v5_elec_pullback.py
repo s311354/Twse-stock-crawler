@@ -50,6 +50,7 @@ def _inputs(sector="24"):
     return strategy, indicators, quality, valuation
 
 
+@pytest.mark.usefixtures("active_industry_profiles")
 def test_elec_local_reclaim_opens_only_conditional_starter_with_repriced_risk():
     data = _history()
     baseline = LowEntryScoreV5Strategy(

@@ -12,6 +12,7 @@ from application.fundamental_ports import FundamentalUnitOfWork
 from domain.base_quality_features import BaseQualityFeatureProducer
 from domain.fundamental_derivation import FundamentalBundle
 from domain.fundamental_models import FundamentalSnapshot
+from domain.strategies.low_entry_v6_quality import combine_filing_sources, snapshot_record
 
 
 @dataclass(frozen=True)
@@ -151,6 +152,7 @@ class SnapshotAssembler:
         snapshot = dict(bundle.snapshot)
         snapshot.update(features.as_snapshot_fields())
         snapshot["base_quality_evidence_mode"] = resolution.source
+        snapshot["les_v6_filings"] = list(snapshot.get("les_v6_mops_filings", []))
         logging.debug(
             "Base quality symbol=%s status=PROVISIONAL source=%s "
             "feature_count=%s cache_hit=false",
@@ -228,6 +230,14 @@ class SnapshotAssembler:
         snapshot.update(batch_fields)
         snapshot.update(features.as_snapshot_fields())
         snapshot["base_quality_evidence_mode"] = source
+        # Preserve raw period values and their observation time, not annual
+        # approximations or a v5 score. v6 performs its own PIT/YTD normalization.
+        # Keep TWSE core precedence; separately dated MOPS quarter EPS is usable
+        # only after v6 ties the entire period and checks its own PIT cutoff.
+        twse = [snapshot_record(item) for item in history]
+        snapshot["les_v6_filings"] = combine_filing_sources(
+            snapshot.get("les_v6_mops_filings", []), twse, as_of=signal_time,
+        )
         return FundamentalBundle(
             annual_fundamentals=bundle.annual_fundamentals,
             snapshot=snapshot,

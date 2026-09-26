@@ -14,6 +14,7 @@ from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
 from config.settings import AppSettings
+from application.mops_refresh_control import MopsRefreshControl
 from infrastructure.crawler.twse_http_client import TwseAccessBlockedError
 from infrastructure.crawler.twse_http_client import TwseHttpClient
 from infrastructure.crawler.twse_http_client import TwseNetworkError
@@ -117,6 +118,7 @@ class MopsClient:
         min_request_interval_seconds: float | None = None,
         sleeper: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        refresh_control: MopsRefreshControl | None = None,
     ) -> None:
         if not base_urls:
             raise ValueError("base_urls must contain at least one MOPS host")
@@ -138,8 +140,10 @@ class MopsClient:
             else None
         )
         self.http_client = http_client or TwseHttpClient()
+        self.refresh_control = refresh_control
         self._now_provider = now_provider or (lambda: dt.datetime.now(dt.timezone.utc))
         self._correction_cache: dict[tuple[int, int], list[MopsCorrection]] = {}
+        self._market_type = "sii"
         self._base_urls = tuple(url.rstrip("/") for url in base_urls)
         self._active_base_url = self._base_urls[0]
         self._network_rounds = (
@@ -200,6 +204,12 @@ class MopsClient:
             raise ValueError("catalog_empty_backoff_seconds cannot be negative")
         if self._min_request_interval_seconds < 0:
             raise ValueError("min_request_interval_seconds cannot be negative")
+
+    def configure_refresh_control(self, control: MopsRefreshControl) -> None:
+        self.refresh_control = control
+
+    def begin_refresh_run(self) -> None:
+        self._correction_cache.clear()
 
     def discover(self, symbol: str) -> list[MopsFilingCandidate]:
         normalized_symbol = _normalize_symbol(symbol)
@@ -418,8 +428,20 @@ class MopsClient:
             table_rows=len(parser.rows),
         )
 
+    def select_market(self, market_source: str) -> None:
+        """Scope revision scans; OTC industry is supplied by its daily table."""
+        if market_source not in {"TWSE", "TPEX"}:
+            raise ValueError("Unsupported MOPS market")
+        market_type = "otc" if market_source == "TPEX" else "sii"
+        if market_type != self._market_type:
+            self._correction_cache.clear()
+        self._market_type = market_type
+
     def load_company_sectors(self) -> dict[str, str]:
         """Load the official listed-company industry code mapping."""
+
+        if self._market_type == "otc":
+            return {}  # Never use the TWSE listed-company master for OTC.
 
         response = self.http_client.get_json(
             TWSE_COMPANY_PROFILE_URL,
@@ -558,7 +580,7 @@ class MopsClient:
                     "firstin": "1",
                     "off": "1",
                     "isQuery": "Y",
-                    "TYPEK": "sii",
+                    "TYPEK": self._market_type,
                     "year": str(fiscal_year - 1911),
                     "season": "{:02d}".format(quarter),
                 },
@@ -599,13 +621,21 @@ class MopsClient:
                 request_headers = dict(HTML_HEADERS)
                 request_headers["Referer"] = base_url + "/mops/web/index"
                 try:
-                    self._wait_for_mops_rate_limit()
+                    controlled_kwargs = dict(kwargs)
+                    if self.refresh_control is not None:
+                        controlled_kwargs["before_attempt"] = self._before_refresh_attempt
+                    else:
+                        self._wait_for_mops_rate_limit()
                     response = self.http_client.request_bytes(
                         method,
                         request_url,
                         headers=request_headers,
-                        **kwargs,
+                        **controlled_kwargs,
                     )
+                except TwseAccessBlockedError:
+                    if self.refresh_control is not None:
+                        self.refresh_control.response(blocked=True)
+                    raise
                 except TwseNetworkError as error:
                     last_error = error
                     if index + 1 < len(candidates):
@@ -618,6 +648,16 @@ class MopsClient:
                     continue
 
                 self._last_request_at = self._monotonic()
+                if self.refresh_control is not None:
+                    blocked = _is_access_blocked_content(response.content)
+                    self.refresh_control.response(blocked=blocked)
+                    if blocked:
+                        # Applies to catalogs, announcements, corrections and filings.
+                        # Do not switch hosts or retry a known security guard page.
+                        raise TwseAccessBlockedError(
+                            "MOPS security guard page returned for {}".format(request_url),
+                            retryable=False,
+                        )
                 if base_url in self._base_urls:
                     self._active_base_url = base_url
                 return response, request_url
@@ -641,6 +681,12 @@ class MopsClient:
 
         assert last_error is not None
         raise last_error
+
+    def _before_refresh_attempt(self) -> None:
+        assert self.refresh_control is not None
+        self.refresh_control.before_request()
+        self._wait_for_mops_rate_limit()
+        self._last_request_at = self._monotonic()
 
     def _wait_for_mops_rate_limit(self) -> None:
         if self._last_request_at is None:
@@ -748,7 +794,18 @@ def _origin(url: str) -> str:
     return "{}://{}".format(parsed.scheme, parsed.netloc)
 
 
+def _is_access_blocked_content(content: bytes) -> bool:
+    lower = content.lower()
+    # A real filing may discuss security using the same ordinary Chinese words.
+    if b"<ix:header" in lower and b"<ix:nonfraction" in lower:
+        return False
+    text = decode_mops_content(content)
+    return any(marker in text for marker in MOPS_ACCESS_BLOCKED_MARKERS)
+
+
 def _validate_ixbrl(content: bytes) -> None:
+    if _is_access_blocked_content(content):
+        raise TwseAccessBlockedError("MOPS security guard page returned instead of iXBRL", retryable=False)
     lower_content = content.lower()
     if b"<ix:header" not in lower_content or b"<ix:nonfraction" not in lower_content:
         raise TwseSchemaChangedError("MOPS response is not an Inline XBRL document")

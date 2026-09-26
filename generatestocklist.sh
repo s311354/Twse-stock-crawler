@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-:  --stocktype {VEH,ELEC,SEMI,AIR,BIO,COMM}
+:  --stocktype {VEH,ELEC,SEMI,AIR,BIO,COMM,ELECCOMP}
 #
 
 # Interface: User Command

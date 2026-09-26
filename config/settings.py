@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
+from math import isfinite
 
 from domain.models import PortfolioPosition
 
@@ -172,6 +173,11 @@ class AppSettings:
     mops_catalog_empty_backoff_seconds: float = 3.0
     mops_min_request_interval_seconds: float = 1.0
     mops_history_years: int = 5
+    mops_refresh_max_symbols: int = 20
+    mops_refresh_max_requests: int = 120
+    mops_refresh_max_filings_per_symbol: int = 4
+    mops_refresh_cooldown_seconds: float = 86400.0
+    mops_access_blocked_threshold: int = 2
 
     account_equity: float = 1_000_000.0
     pae_positions: tuple[PortfolioPosition, ...] = ()
@@ -291,6 +297,11 @@ class AppSettings:
                 1.0,
             ),
             mops_history_years=configured_history_years,
+            mops_refresh_max_symbols=_parse_int(values, "MOPS_REFRESH_MAX_SYMBOLS", 20),
+            mops_refresh_max_requests=_parse_int(values, "MOPS_REFRESH_MAX_REQUESTS", 120),
+            mops_refresh_max_filings_per_symbol=_parse_int(values, "MOPS_REFRESH_MAX_FILINGS_PER_SYMBOL", 4),
+            mops_refresh_cooldown_seconds=_parse_float(values, "MOPS_REFRESH_COOLDOWN_SECONDS", 86400.0),
+            mops_access_blocked_threshold=_parse_int(values, "MOPS_ACCESS_BLOCKED_THRESHOLD", 2),
             account_equity=configured_equity,
             pae_positions=_parse_pae_positions(values),
             pae_current_cash=_parse_optional_float(
@@ -360,6 +371,11 @@ class AppSettings:
             )
         if self.mops_history_years < 3:
             raise SettingsError("MOPS_HISTORY_YEARS must be at least 3")
+        if min(self.mops_refresh_max_symbols, self.mops_refresh_max_requests,
+               self.mops_refresh_max_filings_per_symbol) < 0:
+            raise SettingsError("MOPS refresh limits cannot be negative")
+        if not isfinite(self.mops_refresh_cooldown_seconds) or self.mops_refresh_cooldown_seconds < 0 or self.mops_access_blocked_threshold < 1:
+            raise SettingsError("Invalid MOPS refresh cooldown or ACCESS_BLOCKED threshold")
         if self.account_equity <= 0:
             raise SettingsError("TWSE_ACCOUNT_EQUITY must be greater than zero")
         if len(self.pae_positions) > 4:

@@ -36,6 +36,10 @@ class FilingRefreshPlanner:
             raise ValueError("history_years must be at least one")
 
         selected = self.select_required_filings(candidates, history_years)
+        selected_periods = {self._period(item) for item in selected}
+        selected.extend(item for item in candidates
+                        if self._period(item) in (corrected_periods or set())
+                        and self._period(item) not in selected_periods)
         latest_cached = self._latest_by_period(cached_filings)
         corrected = corrected_periods or set()
         reuse: list[FilingRecord] = []
@@ -97,8 +101,14 @@ class FilingRefreshPlanner:
         filings: list[FilingCandidate],
         history_years: int,
     ) -> list[FilingCandidate]:
-        """Select annual history plus the periods needed for latest TTM metrics."""
+        """All quarters of five completed fiscal years, plus current YTD.
 
+        Select only catalog evidence; never invent a missing filing or count
+        five scattered annual reports as five complete years of quarters.
+        """
+
+        if history_years < 1:
+            raise ValueError("history_years must be at least one")
         if not filings:
             return []
         filings_by_period = {
@@ -109,23 +119,19 @@ class FilingRefreshPlanner:
             filings,
             key=lambda candidate: (candidate.fiscal_year, candidate.quarter),
         )
-        annual = sorted(
-            (candidate for candidate in filings if candidate.quarter == 4),
-            key=lambda candidate: candidate.fiscal_year,
-        )[-history_years:]
-        selected = {
-            (candidate.fiscal_year, candidate.quarter): candidate
-            for candidate in annual
-        }
-        selected[(latest.fiscal_year, latest.quarter)] = latest
-        if latest.quarter < 4:
-            for period in (
-                (latest.fiscal_year - 1, latest.quarter),
-                (latest.fiscal_year - 1, 4),
-            ):
-                if period in filings_by_period:
-                    selected[period] = filings_by_period[period]
-        return [selected[key] for key in sorted(selected)]
+        required = FilingRefreshPlanner.history_periods(
+            (latest.fiscal_year, latest.quarter), history_years,
+        )
+        return [filings_by_period[key] for key in sorted(required & filings_by_period.keys())]
+
+    @staticmethod
+    def history_periods(latest: FilingPeriod, history_years: int) -> set[FilingPeriod]:
+        if history_years < 1 or latest[1] not in {1, 2, 3, 4}:
+            raise ValueError("Invalid history years or fiscal quarter")
+        last_full_year = latest[0] if latest[1] == 4 else latest[0] - 1
+        first_index = (last_full_year - history_years + 1) * 4
+        last_index = latest[0] * 4 + latest[1] - 1
+        return {(index // 4, index % 4 + 1) for index in range(first_index, last_index + 1)}
 
     @staticmethod
     def _latest_by_period(

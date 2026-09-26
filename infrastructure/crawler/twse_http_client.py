@@ -6,6 +6,7 @@ import dataclasses
 import logging
 import re
 import time
+from urllib.parse import urljoin
 from collections.abc import Callable, Mapping
 
 import requests
@@ -187,6 +188,7 @@ class TwseHttpClient:
         headers: Mapping[str, str] | None = None,
         context: str = "TWSE request",
         content_validator: Callable[[bytes], None] | None = None,
+        before_attempt: Callable[[], None] | None = None,
     ) -> TwseBinaryResponse:
         """Request raw bytes with the same retry, SSL, and rate-limit policy."""
 
@@ -204,6 +206,7 @@ class TwseHttpClient:
                     data=data,
                     headers=headers,
                     context=context,
+                    before_attempt=before_attempt,
                 )
                 self._validate_http_status(response=response, context=context)
                 content = bytes(response.content)
@@ -245,6 +248,7 @@ class TwseHttpClient:
         data: Mapping[str, str | int] | None,
         headers: Mapping[str, str] | None,
         context: str,
+        before_attempt: Callable[[], None] | None = None,
     ) -> Response:
         try:
             return self._session_request(
@@ -254,6 +258,7 @@ class TwseHttpClient:
                 data=data,
                 headers=headers,
                 verify=True,
+                before_attempt=before_attempt,
             )
         except requests_exceptions.SSLError as error:
             if not self._should_use_ssl_fallback(error):
@@ -282,6 +287,7 @@ class TwseHttpClient:
                     data=data,
                     headers=headers,
                     verify=False,
+                    before_attempt=before_attempt,
                 )
             except requests_exceptions.RequestException as fallback_error:
                 raise TwseNetworkError(
@@ -313,9 +319,8 @@ class TwseHttpClient:
         data: Mapping[str, str | int] | None,
         headers: Mapping[str, str] | None,
         verify: bool,
+        before_attempt: Callable[[], None] | None = None,
     ) -> Response:
-        self._wait_for_rate_limit()
-        self._last_request_at = self._monotonic()
         request = self.session.get if method == "GET" else self.session.post
         kwargs: dict[str, object] = {
             "params": params,
@@ -326,7 +331,27 @@ class TwseHttpClient:
             kwargs["data"] = data
         if headers is not None:
             kwargs["headers"] = headers
-        return request(url, **kwargs)
+        if before_attempt is None:
+            self._wait_for_rate_limit()
+            self._last_request_at = self._monotonic()
+            return request(url, **kwargs)
+        # requests' automatic redirects would bypass the per-attempt budget.
+        kwargs["allow_redirects"] = False
+        for _ in range(6):
+            before_attempt()
+            self._wait_for_rate_limit()
+            self._last_request_at = self._monotonic()
+            response = request(url, **kwargs)
+            location = getattr(response, "headers", {}).get("Location")
+            if response.status_code not in (301, 302, 303, 307, 308) or not location:
+                return response
+            url = urljoin(url, location)
+            kwargs.pop("params", None)
+            if response.status_code == 303 or (response.status_code in (301, 302) and method == "POST"):
+                method = "GET"
+                request = self.session.get
+                kwargs.pop("data", None)
+        raise requests_exceptions.TooManyRedirects("bounded redirect limit exceeded")
 
     def _wait_for_rate_limit(self) -> None:
         if self._last_request_at is None:
@@ -355,7 +380,7 @@ class TwseHttpClient:
         return structured_extra(
             symbol=symbol_match.group(1) if symbol_match else None,
             trade_date=date_match.group(1) if date_match else None,
-            source="MOPS" if context.startswith("MOPS") else "TWSE",
+            source=("MOPS" if context.startswith("MOPS") else "TPEX" if context.startswith("TPEx") else "TWSE"),
             status=status,
             attempt=attempt,
             cache_hit=None,

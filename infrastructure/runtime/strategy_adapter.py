@@ -29,6 +29,24 @@ class CrawlerStrategyAdapter:
 
     def evaluate(self, context: AnalysisContext) -> StrategyEvaluation:
         crawler = context.resource
+        allocator = self._portfolio_allocator
+        if context.as_of is not None and allocator is not None:
+            # Never read or backdate writes into live pairwise persistence.
+            # A one-shot replay has no confirmed multi-session persistence.
+            allocator = PortfolioAllocationV2Pipeline(engine=allocator.engine, portfolio_id="historical_replay")
+        # Daily sizing is indicative. Missing cash or ambiguous holding quantities
+        # must not manufacture executable shares; the execution layer sizes again.
+        cash = self._portfolio_current_cash
+        if cash is None:
+            prices = {str(symbol): values[-1] / 1000.0 for symbol, values in zip(
+                getattr(crawler, "stocknumbers", ()), getattr(crawler, "daily_closes", ())
+            ) if values and values[-1] is not None}
+            if all(position.shares is not None and position.symbol in prices for position in self._portfolio_positions):
+                cash = max(0.0, self._account_equity - sum(position.shares * prices[position.symbol] for position in self._portfolio_positions))
+        crawler.les_v6_portfolio = {
+            "value": self._account_equity, "available_cash": cash,
+            "intended_weight": .25, "capacity_weight": .25,
+        }
         if self._portfolio_allocator is not None:
             crawler.portfolio_entry_les_by_stock = {
                 position.symbol: position.entry_les
@@ -68,7 +86,7 @@ class CrawlerStrategyAdapter:
                 if isinstance(snapshot, dict)
                 and str(snapshot.get("sector", "")).strip()
             }
-            decisions = self._portfolio_allocator.enrich(
+            decisions = allocator.enrich(
                 decisions,
                 PortfolioRuntimeContext(
                     account_equity=self._account_equity,

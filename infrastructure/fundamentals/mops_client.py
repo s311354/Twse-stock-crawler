@@ -368,6 +368,18 @@ class MopsClient:
 
         return self.discover(symbol)
 
+    def fetch_official_source(self, method: str, url: str, **kwargs: Any) -> tuple[Any, str]:
+        """Preserve raw research evidence using the same bounded transport.
+
+        The caller classifies and retains the response; this does not attest
+        publication time, version identity, or completeness of an empty result.
+        """
+        from application.research_evidence import OFFICIAL_HOSTS
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or parsed.hostname not in OFFICIAL_HOSTS or parsed.username or parsed.password:
+            raise ValueError("OFFICIAL_EVIDENCE_SOURCE_REQUIRED")
+        return self._request_bytes(method, url, **kwargs)
+
     @staticmethod
     def _parse_catalog(
         symbol: str,

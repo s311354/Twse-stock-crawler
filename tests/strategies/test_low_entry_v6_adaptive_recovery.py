@@ -110,12 +110,13 @@ def test_recovery_report_and_next_session_execution_share_the_same_evidence(path
     # admission, serialization, sizing, five-gate validation and execution checks.
     monkeypatch.setattr(strategy_module, "build_features", lambda data, shared: pd.DataFrame([f]))
     complete_quality = quality(coverage=dict.fromkeys(
-        ("balance_sheet", "profitability", "growth", "return_on_capital"), 100.))
+        ("balance_sheet", "profitability", "growth", "return_on_capital", "cash_flow"), 100.))
     monkeypatch.setattr(strategy_module, "evaluate_quality", lambda *args, **kwargs: complete_quality)
     data = strategy_module.attach_low_entry_v6_context(
         bars(1), symbol="2330", sector="24", as_of="2026-09-11T15:00+08:00",
         filings=[], portfolio=ACCOUNT)
-    row = strategy_module.LowEntryScoreV6Strategy().run_latest(data).iloc[-1]
+    # Preserve the legacy recovery-tier contract; unified policy is tested separately.
+    row = strategy_module.LowEntryScoreV6Strategy(config=CONFIG).run_latest(data).iloc[-1]
     report = row["LES v6 Report"]
     assert report["industry_profile"]["mode"] == "ACTIVE"
     assert report["decision"]["signal"] == "BUY_SMALL"

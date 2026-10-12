@@ -50,114 +50,11 @@ class LowEntryV5ReportBuilder:
     ) -> pd.DataFrame:
         frame = data.copy()
         score = (components.sum(axis=1) + penalty).clip(0, 100)
-        hard_rejects = "；".join(quality.hard_rejects) or "NONE"
-        quality_warnings = "；".join(quality.warnings) or "NONE"
-        valuation_confidence = self.valuation_confidence(quality, valuation_result)
-        cycle_review = valuation_result.cycle_review
         result = pd.DataFrame(
             {
                 "低點分數": score.round(2),
                 "低點決策": decision,
-                "LES v5 Final Quality Status": quality.final_status.value,
-                "LES v5 Final Quality Score": quality.final_score,
-                "Base Quality Status": quality.base_status.value,
-                "Base Quality Score": quality.base_score,
-                "Base Data Confidence": quality.base_data_confidence,
-                "Base Available Weight": quality.base_available_weight,
-                "Extended Quality Status": quality.extended_status.value,
-                "Extended Quality Score": quality.extended_score,
-                "Extended Data Confidence": quality.extended_data_confidence,
-                "Extended Available Weight": quality.extended_available_weight,
-                "Critical Field Coverage": quality.critical_field_coverage,
-                "Effective Extended Weight": quality.effective_extended_weight,
-                "Quality Hard Rejects": hard_rejects,
-                "Quality Warnings": quality_warnings,
-                "Valuation Gate": valuation,
-                "Valuation Model Status": valuation_result.status.value,
-                "Valuation Model Version": valuation_result.model_version,
-                "Valuation Reasons": "；".join(valuation_result.reasons) or "NONE",
-                "Valuation Confidence": valuation_confidence,
-                "Valuation Normalized EPS": self.scenario_value(
-                    valuation_result, "base", "normalized_eps"
-                ),
-                "Valuation TTM EPS": self.cycle_review_value(
-                    cycle_review, "ttm_eps"
-                ),
-                "Normalized EPS Divergence Ratio": self.cycle_review_value(
-                    cycle_review, "eps_divergence_ratio"
-                ),
-                "Cycle Valuation Review": (
-                    cycle_review.status.value
-                    if cycle_review is not None
-                    else "UNKNOWN"
-                ),
-                "Cycle Valuation Reasons": (
-                    ("；".join(cycle_review.reasons) or "NONE")
-                    if cycle_review is not None
-                    else "NONE"
-                ),
-                "Cycle Mid-Cycle Operating Margin": self.cycle_review_value(
-                    cycle_review, "mid_cycle_operating_margin"
-                ),
-                "Cycle Normalized ROE": self.cycle_review_value(
-                    cycle_review, "normalized_roe"
-                ),
-                "Cycle Book Value Per Share": self.cycle_review_value(
-                    cycle_review, "book_value_per_share"
-                ),
-                "Cycle Margin Fair Value": self.cycle_review_value(
-                    cycle_review, "margin_fair_value"
-                ),
-                "Cycle PB Fair Value": self.cycle_review_value(
-                    cycle_review, "pb_fair_value"
-                ),
-                "Cycle TTM EPS Fair Value": self.cycle_review_value(
-                    cycle_review, "ttm_eps_fair_value"
-                ),
-                "Cycle Composite Fair Value": self.cycle_review_value(
-                    cycle_review, "composite_fair_value"
-                ),
-                "Cycle Available Anchors": self.cycle_review_value(
-                    cycle_review, "available_anchor_count"
-                ),
-                "Cycle Supporting Anchors": self.cycle_review_value(
-                    cycle_review, "supporting_anchor_count"
-                ),
-                "Passive Benchmark Expected Return": (
-                    valuation_result.passive_benchmark_expected_return
-                ),
-                "Required Valuation Return": valuation_result.required_return,
-                "Base Case Revenue Growth": self.scenario_value(
-                    valuation_result, "base", "revenue_growth"
-                ),
-                "Base Case Operating Margin": self.scenario_value(
-                    valuation_result, "base", "operating_margin"
-                ),
-                "Base Case Exit PE": self.scenario_value(
-                    valuation_result, "base", "exit_pe"
-                ),
-                "Base Case Expected CAGR": self.scenario_value(
-                    valuation_result, "base", "expected_cagr"
-                ),
-                "Base Case Fair Value": self.scenario_value(
-                    valuation_result, "base", "fair_value"
-                ),
-                "Bear Case Expected CAGR": self.scenario_value(
-                    valuation_result, "bear", "expected_cagr"
-                ),
-                "Bear Case Fair Value": self.scenario_value(
-                    valuation_result, "bear", "fair_value"
-                ),
-                "Bear Case Permanent Loss": valuation_result.bear_permanent_loss,
-                "Bear Case Permanent Loss Acceptable": (
-                    valuation_result.bear_permanent_loss_acceptable
-                ),
-                "Bull Case Expected CAGR": self.scenario_value(
-                    valuation_result, "bull", "expected_cagr"
-                ),
-                "Bull Case Fair Value": self.scenario_value(
-                    valuation_result, "bull", "fair_value"
-                ),
+                **self.fundamental_fields(quality, valuation, valuation_result),
                 "Panic Opportunity Zone": panic["opportunity"].astype(int),
                 "Falling Knife State": panic["state"],
                 "Temporary Falling Knife Blocks": panic["block_text"],
@@ -281,6 +178,118 @@ class LowEntryV5ReportBuilder:
             index=frame.index,
         )
         return pd.concat([frame, result], axis=1)
+
+    def fundamental_fields(
+        self, quality: LowEntryV5QualityResult, valuation: pd.Series,
+        valuation_result: LowEntryV5ValuationResult,
+    ) -> dict[str, object]:
+        """Shared quality/valuation projection; no technical score or entry decision."""
+        hard_rejects = "；".join(quality.hard_rejects) or "NONE"
+        quality_warnings = "；".join(quality.warnings) or "NONE"
+        valuation_confidence = self.valuation_confidence(quality, valuation_result)
+        cycle_review = valuation_result.cycle_review
+        return {
+            "LES v5 Final Quality Status": quality.final_status.value,
+            "LES v5 Final Quality Score": quality.final_score,
+            "Base Quality Status": quality.base_status.value,
+            "Base Quality Score": quality.base_score,
+            "Base Data Confidence": quality.base_data_confidence,
+            "Base Available Weight": quality.base_available_weight,
+            "Extended Quality Status": quality.extended_status.value,
+            "Extended Quality Score": quality.extended_score,
+            "Extended Data Confidence": quality.extended_data_confidence,
+            "Extended Available Weight": quality.extended_available_weight,
+            "Critical Field Coverage": quality.critical_field_coverage,
+            "Effective Extended Weight": quality.effective_extended_weight,
+            "Quality Hard Rejects": hard_rejects,
+            "Quality Warnings": quality_warnings,
+            "Valuation Gate": valuation,
+            "Valuation Model Status": valuation_result.status.value,
+            "Valuation Model Version": valuation_result.model_version,
+            "Valuation Reasons": "；".join(valuation_result.reasons) or "NONE",
+            "Valuation Confidence": valuation_confidence,
+            "Valuation Normalized EPS": self.scenario_value(
+                valuation_result, "base", "normalized_eps"
+            ),
+            "Valuation TTM EPS": self.cycle_review_value(
+                cycle_review, "ttm_eps"
+            ),
+            "Normalized EPS Divergence Ratio": self.cycle_review_value(
+                cycle_review, "eps_divergence_ratio"
+            ),
+            "Cycle Valuation Review": (
+                cycle_review.status.value
+                if cycle_review is not None
+                else "UNKNOWN"
+            ),
+            "Cycle Valuation Reasons": (
+                ("；".join(cycle_review.reasons) or "NONE")
+                if cycle_review is not None
+                else "NONE"
+            ),
+            "Cycle Mid-Cycle Operating Margin": self.cycle_review_value(
+                cycle_review, "mid_cycle_operating_margin"
+            ),
+            "Cycle Normalized ROE": self.cycle_review_value(
+                cycle_review, "normalized_roe"
+            ),
+            "Cycle Book Value Per Share": self.cycle_review_value(
+                cycle_review, "book_value_per_share"
+            ),
+            "Cycle Margin Fair Value": self.cycle_review_value(
+                cycle_review, "margin_fair_value"
+            ),
+            "Cycle PB Fair Value": self.cycle_review_value(
+                cycle_review, "pb_fair_value"
+            ),
+            "Cycle TTM EPS Fair Value": self.cycle_review_value(
+                cycle_review, "ttm_eps_fair_value"
+            ),
+            "Cycle Composite Fair Value": self.cycle_review_value(
+                cycle_review, "composite_fair_value"
+            ),
+            "Cycle Available Anchors": self.cycle_review_value(
+                cycle_review, "available_anchor_count"
+            ),
+            "Cycle Supporting Anchors": self.cycle_review_value(
+                cycle_review, "supporting_anchor_count"
+            ),
+            "Passive Benchmark Expected Return": (
+                valuation_result.passive_benchmark_expected_return
+            ),
+            "Required Valuation Return": valuation_result.required_return,
+            "Base Case Revenue Growth": self.scenario_value(
+                valuation_result, "base", "revenue_growth"
+            ),
+            "Base Case Operating Margin": self.scenario_value(
+                valuation_result, "base", "operating_margin"
+            ),
+            "Base Case Exit PE": self.scenario_value(
+                valuation_result, "base", "exit_pe"
+            ),
+            "Base Case Expected CAGR": self.scenario_value(
+                valuation_result, "base", "expected_cagr"
+            ),
+            "Base Case Fair Value": self.scenario_value(
+                valuation_result, "base", "fair_value"
+            ),
+            "Bear Case Expected CAGR": self.scenario_value(
+                valuation_result, "bear", "expected_cagr"
+            ),
+            "Bear Case Fair Value": self.scenario_value(
+                valuation_result, "bear", "fair_value"
+            ),
+            "Bear Case Permanent Loss": valuation_result.bear_permanent_loss,
+            "Bear Case Permanent Loss Acceptable": (
+                valuation_result.bear_permanent_loss_acceptable
+            ),
+            "Bull Case Expected CAGR": self.scenario_value(
+                valuation_result, "bull", "expected_cagr"
+            ),
+            "Bull Case Fair Value": self.scenario_value(
+                valuation_result, "bull", "fair_value"
+            ),
+        }
 
     @staticmethod
     def scenario_value(

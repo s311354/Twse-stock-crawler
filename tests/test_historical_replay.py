@@ -98,8 +98,10 @@ def test_cli_preserves_day_offsets_and_requires_historical_portfolio(tmp_path, m
     with pytest.raises(SystemExit):
         build_run_configuration(replay_args(tmp_path) + ["--mail"])
     monkeypatch.delenv("TWSE_PAE_CURRENT_CASH")
-    live, _ = build_run_configuration(["2330", "-b", "9", "-e", "792"])
-    assert live.as_of is None and live.beginbacktrack == 9
+    with pytest.raises(SystemExit):
+        build_run_configuration(["2330", "-b", "9", "-e", "792"])
+    live, _ = build_run_configuration(["2330", "-b", "0", "-e", "792"])
+    assert live.as_of is None and live.beginbacktrack == 0
     assert live.report_file_prefix == live.output_file_names
 
 
@@ -230,7 +232,7 @@ def test_replay_les_erem_pae_report_isolated_and_not_live_executable(tmp_path):
     cutoff = market.signal_dates["2330"]
     market = replace(market, replay_as_of=cutoff)
     builder, decisions = build(market)
-    assert decisions[0].value("低點決策") == "BUY"
+    assert decisions[0].value("低點決策") == "BUY_SMALL"
     assert decisions[0].value("EREM 分數") is not None
     assert decisions[0].evaluated_at == pd.Timestamp(cutoff).to_pydatetime()
     persistence = Mock()

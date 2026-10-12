@@ -9,6 +9,7 @@ from collections.abc import Callable
 from contextlib import closing
 
 from infrastructure.fundamentals.mops_sqlite import to_epoch
+from application.daily_performance import count_work, measure_stage
 
 
 EMPTY_FILING_SET_SHA256 = hashlib.sha256(b"").hexdigest()
@@ -98,6 +99,8 @@ class MopsSchemaMigrator:
                     annual_json TEXT NOT NULL,
                     snapshot_json TEXT NOT NULL,
                     created_at_epoch INTEGER NOT NULL,
+                    filing_schema_version TEXT,
+                    has_mops_filings INTEGER,
                     PRIMARY KEY(symbol, filing_set_sha256, sector)
                 );
                 CREATE TABLE IF NOT EXISTS financial_batch_state (
@@ -162,6 +165,15 @@ class MopsSchemaMigrator:
                     "PRAGMA table_info(refresh_state)"
                 ).fetchall()
             }
+            snapshot_columns = {str(row[1]) for row in connection.execute(
+                "PRAGMA table_info(fundamental_snapshots)"
+            )}
+            # No scan/backfill of large legacy JSON during schema startup.
+            # NULL means unindexed, not format-valid; inspect lazily on use.
+            for column, sql_type in (("filing_schema_version", "TEXT"),
+                                     ("has_mops_filings", "INTEGER")):
+                if column not in snapshot_columns:
+                    connection.execute(f"ALTER TABLE fundamental_snapshots ADD COLUMN {column} {sql_type}")
             if "recent_revision_checked_at_epoch" not in refresh_columns:
                 connection.execute(
                     "ALTER TABLE refresh_state ADD COLUMN "
@@ -237,6 +249,18 @@ class MopsSchemaMigrator:
                 )
                 """
             )
+            # Header columns sit after multi-MB JSON columns in the table row.
+            # Excluding JSON from SELECT alone does not prevent SQLite reading
+            # overflow pages to locate those columns. A covering index does.
+            with measure_stage("fundamental_header_index"):
+                existing = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='fundamental_snapshots_header'"
+                ).fetchone()
+                connection.execute("""CREATE INDEX IF NOT EXISTS fundamental_snapshots_header
+                    ON fundamental_snapshots(symbol, filing_set_sha256, sector,
+                                             filing_schema_version, has_mops_filings)""")
+                if existing is None:
+                    count_work("fundamental_header_indexes_created")
             self._remove_legacy_empty_state(connection)
         self._ready = True
 

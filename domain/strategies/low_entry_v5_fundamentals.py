@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from collections.abc import Mapping
 from typing import Any
 
 import pandas as pd
@@ -40,7 +41,7 @@ class LowEntryV5FundamentalEvaluator:
         annual = context.get(ANNUAL_FUNDAMENTALS_ATTR)
         annual = annual if isinstance(annual, pd.DataFrame) else pd.DataFrame()
         snapshot = context.get(FUNDAMENTAL_SNAPSHOT_ATTR)
-        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        snapshot = snapshot if isinstance(snapshot, Mapping) else {}
         signal_date = context.get(SIGNAL_DATE_ATTR)
         if signal_date is None and "Date" in data and not data.empty:
             signal_date = data["Date"].iloc[-1]
@@ -59,7 +60,7 @@ class LowEntryV5FundamentalEvaluator:
         annual = context.get(ANNUAL_FUNDAMENTALS_ATTR)
         annual = annual if isinstance(annual, pd.DataFrame) else pd.DataFrame()
         snapshot = context.get(FUNDAMENTAL_SNAPSHOT_ATTR)
-        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        snapshot = snapshot if isinstance(snapshot, Mapping) else {}
         price_scale = self.positive_float(
             context.get(PRICE_SCALE_ATTR),
             1.0,

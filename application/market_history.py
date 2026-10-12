@@ -10,6 +10,8 @@ from dataclasses import field
 
 import pandas as pd
 
+from domain.numeric_history import metadata_free_frame, SCREEN_SOURCE_ROWS_ATTR
+
 from domain.market_breadth import MARKET_BREADTH_ATTR
 from domain.market_breadth import MARKET_BREADTH_HISTORY_ATTR
 from domain.market_breadth import MARKET_DATA_THROUGH_ATTR
@@ -70,6 +72,7 @@ class MarketHistoryInput:
     ] = field(default_factory=dict)
     market_source: str = "TWSE"
     replay_as_of: str | None = None
+    industry_benchmarks: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.stock_count < 0:
@@ -104,6 +107,8 @@ class MarketHistoryAssembler:
         self,
         market: MarketHistoryInput,
         item: int,
+        *,
+        include_evidence: bool = True,
     ) -> pd.DataFrame:
         if item < 0 or item >= market.stock_count:
             raise IndexError("stock history index is out of range")
@@ -206,7 +211,7 @@ class MarketHistoryAssembler:
         # Preserve only breadth snapshots visible through this stock's signal
         # date. Multi-session regimes must be derived from point-in-time facts,
         # not from a narrative about market direction or future sessions.
-        if market.market_breadth_snapshots:
+        if include_evidence and market.market_breadth_snapshots:
             through_timestamp = pd.to_datetime(
                 market_data_through,
                 errors="coerce",
@@ -241,12 +246,20 @@ class MarketHistoryAssembler:
         if market.replay_as_of:
             history.attrs["replay_as_of"] = market.replay_as_of
         history.attrs["trading_restriction"] = dict(market.trading_restrictions.get(stock_no, {}))
-        history.attrs["les_v6_research_context"] = dict(market.les_v6_research_context.get(stock_no, {}))
-        if stock_no in market.annual_fundamentals:
+        research = market.les_v6_research_context.get(stock_no, {})
+        history.attrs["les_v6_research_context"] = dict(research) if include_evidence else {
+            key: research[key] for key in ("watch", "watch_input_sha256", "watch_result_sha256") if key in research
+        }
+        from domain.industry_benchmark import INDUSTRY_BENCHMARK_ATTR, sector_code
+        snapshot = market.fundamental_snapshots.get(stock_no, {})
+        sector = sector_code(snapshot.get("sector") or market.default_sector)
+        if include_evidence:
+            history.attrs[INDUSTRY_BENCHMARK_ATTR] = market.industry_benchmarks.get(sector)
+        if include_evidence and stock_no in market.annual_fundamentals:
             history.attrs[ANNUAL_FUNDAMENTALS_ATTR] = (
                 market.annual_fundamentals[stock_no].copy()
             )
-        if stock_no in market.fundamental_snapshots:
+        if include_evidence and stock_no in market.fundamental_snapshots:
             history.attrs[FUNDAMENTAL_SNAPSHOT_ATTR] = dict(
                 market.fundamental_snapshots[stock_no]
             )
@@ -260,6 +273,19 @@ class MarketHistoryAssembler:
         if market.account_equity is not None:
             history.attrs[ACCOUNT_EQUITY_ATTR] = market.account_equity
         return history
+
+    def build_screen(self, market: MarketHistoryInput, item: int) -> pd.DataFrame:
+        """Only the watch's 61 bars; retain original row count/index for its key.
+
+        This is not a feature warm-up window. Strategies still build all bars.
+        """
+        history = self.build(market, item, include_evidence=False)
+        # Copy AFTER slicing the metadata-free view. Otherwise a short slice
+        # can retain the full history's ndarray backing storage under CoW.
+        screen = metadata_free_frame(pd.DataFrame(history, copy=False).tail(61))
+        screen.attrs = dict(history.attrs)
+        screen.attrs[SCREEN_SOURCE_ROWS_ATTR] = len(history)
+        return screen
 
     def build_all(
         self,

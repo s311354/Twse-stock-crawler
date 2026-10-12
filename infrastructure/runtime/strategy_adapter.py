@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import time
+
 from application.contracts import AnalysisContext
 from application.contracts import StrategyEvaluation
 from application.observability import NullRunObserver
+from application.daily_performance import measure_stage
 from application.portfolio_allocation_v2 import PortfolioAllocationV2Pipeline
 from application.portfolio_contracts import PortfolioRuntimeContext
 from application.ports import RunObserverPort
@@ -28,6 +31,7 @@ class CrawlerStrategyAdapter:
         self._account_equity = account_equity
 
     def evaluate(self, context: AnalysisContext) -> StrategyEvaluation:
+        started = time.perf_counter()
         crawler = context.resource
         allocator = self._portfolio_allocator
         if context.as_of is not None and allocator is not None:
@@ -63,17 +67,19 @@ class CrawlerStrategyAdapter:
                 for position in self._portfolio_positions
                 if position.entry_decision is not None
             }
-        maxprofits = crawler.cal_max_profit()
+        with measure_stage("profit_diagnostics"):
+            maxprofits = crawler.cal_max_profit()
         decision_builder = getattr(
             crawler,
             "build_strategy_decisions",
             None,
         )
-        decisions = (
-            tuple(decision_builder(maxprofits))
-            if callable(decision_builder)
-            else ()
-        )
+        with measure_stage("strategy_decision_assembly"):
+            decisions = (
+                tuple(decision_builder(maxprofits))
+                if callable(decision_builder)
+                else ()
+            )
         if self._portfolio_allocator is not None and decisions:
             snapshots = getattr(
                 crawler,
@@ -86,18 +92,19 @@ class CrawlerStrategyAdapter:
                 if isinstance(snapshot, dict)
                 and str(snapshot.get("sector", "")).strip()
             }
-            decisions = allocator.enrich(
-                decisions,
-                PortfolioRuntimeContext(
-                    account_equity=self._account_equity,
-                    positions=self._portfolio_positions,
-                    current_cash=self._portfolio_current_cash,
-                    sector_by_symbol=sector_by_symbol,
-                    default_sector=str(
-                        getattr(crawler, "analysis_universe", "UNKNOWN")
+            with measure_stage("pae"):
+                decisions = allocator.enrich(
+                    decisions,
+                    PortfolioRuntimeContext(
+                        account_equity=self._account_equity,
+                        positions=self._portfolio_positions,
+                        current_cash=self._portfolio_current_cash,
+                        sector_by_symbol=sector_by_symbol,
+                        default_sector=str(
+                            getattr(crawler, "analysis_universe", "UNKNOWN")
+                        ),
                     ),
-                ),
-            )
+                )
         evaluation = StrategyEvaluation(
             maxprofits=maxprofits,
             decisions=decisions,
@@ -107,6 +114,7 @@ class CrawlerStrategyAdapter:
             trade_date=context.market_date.isoformat(),
             source="STRATEGY",
             status="SUCCESS",
+            duration_seconds=round(time.perf_counter() - started, 3),
             result_count=len(evaluation.maxprofits),
             pae_status=(
                 evaluation.decisions[0].value("PAE Status")

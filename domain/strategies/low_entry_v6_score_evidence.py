@@ -1,4 +1,4 @@
-"""Observable LES points, separate from admission scores and entry permission.
+"""Single condition ledger for formal LES scores and observable estimates.
 
 Dependencies follow the ordered conditions in score_setups. Unknown conditions
 leave both earned points and available weight; known false conditions retain
@@ -7,6 +7,7 @@ their weight. Coverage is evidence coverage, not a probability of success.
 from __future__ import annotations
 
 from domain.strategies.low_entry_v6_quality import number
+from domain.strategies.low_entry_v6_correlation import excluded_conditions
 
 
 EXECUTION = (("@stop",), ("@reward",), ("spread",), ("amount_ma20",))
@@ -52,10 +53,18 @@ def valid_price_anchor(f: dict) -> bool:
     return 0 < low <= min(opening, close) <= max(opening, close) <= high and volume > 0
 
 
-def score_evidence(name: str, groups: dict, f: dict, plan: dict) -> dict:
-    """Quantify the same scored tests, without filling or rescaling entry gates."""
+def score_evidence(name: str, groups: dict, f: dict, plan: dict, *,
+                   execution_dependencies: tuple | None = None,
+                   setup_dependencies: dict | None = None,
+                   excluded_channels: frozenset[str] = frozenset()) -> dict:
+    """Score once: fixed-budget admission score and available-budget estimate.
+
+    Missing conditions earn no points. Only the estimate divides by available
+    weight; it is never an admission score or entry permission.
+    """
     masks = f.get("score_availability", {})
     anchor = valid_price_anchor(f)
+    exclusions = excluded_conditions(name, excluded_channels)
 
     def known(key: str) -> bool:
         if key == "@stop":
@@ -65,40 +74,60 @@ def score_evidence(name: str, groups: dict, f: dict, plan: dict) -> dict:
                     and known("atr14") and number(f.get("atr14")) > 0)
         if key == "@reward":
             return known("@stop") and all(known(k) for k in ("swing_high", "hh20", "hh60"))
-        if key in masks:
-            return str(masks[key]) == "True"
+        if key == "@net_reward":
+            target = number(plan.get("target_price"))
+            return (known("@stop") and target is not None
+                    and any(known(k) and number(f.get(k)) == target for k in ("swing_high", "hh20", "hh60")))
         # Older snapshots have no masks. Do not reuse stale RS booleans when
         # those snapshots explicitly report an unavailable benchmark.
         if key.startswith(("rs", "resilience")) and key not in {"rsi_cross40", "rsi_pullback", "rsi14"}:
             if str(f.get("market_ready")) != "True":
                 return False
+        if key in masks:
+            return str(masks[key]) == "True"
         value = f.get(key)
         return str(value) in {"True", "False"} or number(value) is not None
 
-    components, missing = {}, set()
-    dependencies = DEPENDENCIES[name]
+    components, missing, conditions = {}, set(), []
+    dependencies = dict(setup_dependencies if setup_dependencies is not None else DEPENDENCIES[name])
+    if execution_dependencies is not None:
+        dependencies["execution"] = execution_dependencies
     if groups.keys() != dependencies.keys():
         raise ValueError("LES_SCORE_EVIDENCE_GROUP_MISMATCH")
     for group, tests in groups.items():
         if len(tests) != len(dependencies[group]):
             raise ValueError("LES_SCORE_EVIDENCE_CONDITION_MISMATCH")
         earned = available = total = 0.
-        for (condition, weight), fields in zip(tests, dependencies[group]):
+        for index, ((condition, weight), fields) in enumerate(zip(tests, dependencies[group])):
             total += weight
             absent = [key for key in fields if not known(key)]
-            if anchor and not absent and condition is not None:
-                earned += float(condition) * weight
+            observed = anchor and not absent and condition is not None
+            original = float(condition) if observed else None
+            excluded = f"{group}:{index}" in exclusions
+            if excluded and observed:
+                condition = 0.
+            points = float(condition) * weight if observed else 0.
+            if observed:
+                earned += points
                 available += weight
             else:
                 missing.update(absent or (["valid_ohlcv"] if not anchor else fields))
+            conditions.append({"id": f"{group}:{index}", "group": group,
+                               "dependencies": list(fields), "weight": weight,
+                               "observed": observed, "fraction": float(condition) if observed else None,
+                               "earned_points": points})
+            if excluded:
+                conditions[-1].update(research_excluded=True, original_fraction=original)
         components[group] = {"earned_points": earned, "available_weight": available, "total_weight": total}
     earned = sum(item["earned_points"] for item in components.values())
     available = sum(item["available_weight"] for item in components.values())
     total = sum(item["total_weight"] for item in components.values())
     return {
+        "policy_version": "fixed-budget-condition-ledger/v1",
+        "formal_score": 100 * earned / total if available else None,
         "estimated_score": 100 * earned / available if available else None,
         "earned_points": earned, "available_weight": available, "total_weight": total,
         "coverage_percent": 100 * available / total,
         "status": "COMPLETE" if available == total else "PARTIAL" if available else "UNAVAILABLE",
-        "components": components, "missing_fields": sorted(missing),
+        "components": components, "conditions": conditions, "missing_fields": sorted(missing),
     }

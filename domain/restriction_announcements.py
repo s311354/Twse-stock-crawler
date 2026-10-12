@@ -147,8 +147,11 @@ def check_history(evidence: Mapping, *, market: str, market_data_date: str,
         bar = pd.Timestamp(market_data_date)
         if pd.isna(bar) or bar.tzinfo is not None or bar != bar.normalize():
             return fail("INVALID_RESTRICTION_TIMESTAMP")
-        if bar.tz_localize("Asia/Taipei") + pd.Timedelta(hours=13, minutes=30) > cutoff:
+        market_close = bar.tz_localize("Asia/Taipei") + pd.Timedelta(hours=13, minutes=30)
+        if market_close > cutoff:
             return fail("INCOMPLETE_OR_FUTURE_MARKET_DATA")
+        result["market_effective_at"] = market_close.isoformat()
+        result["decision_effective_at"] = cutoff.isoformat()
         result["decision_date"] = cutoff.tz_convert("Asia/Taipei").date().isoformat()
         if evidence.get("market") != market:
             return fail("RESTRICTION_MARKET_MISMATCH")
@@ -162,11 +165,12 @@ def check_history(evidence: Mapping, *, market: str, market_data_date: str,
             return fail("INVALID_HISTORICAL_RESTRICTION_SYMBOL")
         coverage = {row["category"]: row for row in evidence["coverage"]}
         for category in CATEGORIES:
-            state = {"status": "UNKNOWN", "reason": "INCOMPLETE_HISTORICAL_COVERAGE", "active_ids": []}
+            state = {"status": "UNKNOWN", "reason": "INCOMPLETE_HISTORICAL_COVERAGE", "active_ids": [],
+                     "market_active_ids": [], "decision_active_ids": []}
             result["categories"][category] = state
             covered = coverage.get(category, {})
             complete = (covered.get("status") == "VERIFIED"
-                        and timestamp(covered["start_at"]) <= cutoff <= timestamp(covered["end_at"]))
+                        and timestamp(covered["start_at"]) <= market_close <= cutoff <= timestamp(covered["end_at"]))
             groups = defaultdict(list)
             for row in evidence["announcements"]:
                 if row["category"] == category:
@@ -196,9 +200,16 @@ def check_history(evidence: Mapping, *, market: str, market_data_date: str,
                 if eligible:
                     current = eligible[-1]
                     end = current.get("effective_until")
-                    if (not current["withdrawn"] and timestamp(current["effective_from"]) <= cutoff
-                            and (end is None or cutoff < timestamp(end))):
-                        state["active_ids"].append(current["id"])
+                    # Publication eligibility uses the research clock. Coverage
+                    # and restrictions must also apply to the actual signal bar;
+                    # a later weekend release cannot erase that day's restriction.
+                    if not current["withdrawn"]:
+                        for at, key in ((market_close, "market_active_ids"), (cutoff, "decision_active_ids")):
+                            if (timestamp(current["effective_from"]) <= at
+                                    and (end is None or at < timestamp(end))):
+                                state[key].append(current["id"])
+                        if current["id"] in state["market_active_ids"] or current["id"] in state["decision_active_ids"]:
+                            state["active_ids"].append(current["id"])
             # Known active restrictions still block when another category is
             # incomplete. Ambiguous revisions cannot certify a restriction ended.
             if state["active_ids"]:

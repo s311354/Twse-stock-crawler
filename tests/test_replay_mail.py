@@ -46,12 +46,11 @@ def test_replay_mail_requires_smtp_and_plain_mail_still_rejected(tmp_path, monke
         cli.build_run_configuration(replay_args(tmp_path) + ["-m"])
 
 
-def test_check_config_validates_mail_but_never_runs_service(tmp_path, smtp_env, monkeypatch, capsys):
+def test_strict_date_cli_does_not_allow_legacy_replay_mail(tmp_path, smtp_env, monkeypatch, capsys):
     service = Mock(side_effect=AssertionError("analysis or email must not run"))
     monkeypatch.setattr(cli, "build_stock_analysis_service", service)
-    assert cli.main(replay_args(tmp_path) + ["--replay-mail", "--check-config"]) == 0
-    summary = json.loads(capsys.readouterr().out)
-    assert summary["mail_enabled"] is True and summary["replay_mail_enabled"] is True
+    with pytest.raises(SystemExit):
+        cli.main(replay_args(tmp_path) + ["--replay-mail", "--check-config"])
     service.assert_not_called()
 
 

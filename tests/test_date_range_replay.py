@@ -148,7 +148,7 @@ def test_date_replay_still_requires_explicit_historical_portfolio():
         build_run_configuration(["2330", "-b", "2024-10-25", "-e", "2026-09-16"])
 
 
-@pytest.mark.parametrize("begin,end", [(0, 792), (9, 792)])
+@pytest.mark.parametrize("begin,end", [(0, 792)])
 def test_integer_mode_unchanged(begin, end):
     live, settings = build_run_configuration(["2330", "-b", str(begin), "-e", str(end)])
     assert (live.beginbacktrack, live.endbacktrack, live.as_of) == (begin, end, None)
@@ -156,13 +156,37 @@ def test_integer_mode_unchanged(begin, end):
     assert build_preflight_summary(live, settings)["evaluation_mode"] == "LIVE"
 
 
+@pytest.mark.parametrize("begin,end", [(9, 792), (54, 754)])
+def test_old_integer_end_cannot_be_evaluated_with_todays_evidence(begin, end, capsys):
+    with pytest.raises(SystemExit):
+        build_run_configuration(["2330", "-b", str(begin), "-e", str(end)])
+    assert "HISTORICAL_RANGE_REQUIRES_DATE_REPLAY" in capsys.readouterr().err
+
+
+def test_service_rejects_old_integer_end_before_any_calendar_or_market_io():
+    from application.contracts import StockAnalysisRequest
+    market, calendar, clock = Mock(), Mock(), Mock()
+    request = StockAnalysisRequest(stocklist=["2330"], stocktype="ELEC", output_file_names="audit",
+                                   beginbacktrack=54, endbacktrack=754)
+    with pytest.raises(ValueError, match="HISTORICAL_RANGE_REQUIRES_DATE_REPLAY"):
+        FetchMarketData(market, calendar, clock, clock).execute(request)
+    assert not market.mock_calls and not calendar.mock_calls and not clock.mock_calls
+
+
 def test_date_preflight_never_runs_service_or_sends_mail(tmp_path, monkeypatch, capsys):
     service = Mock(side_effect=AssertionError("preflight must not start analysis"))
     monkeypatch.setattr("interface.cli.build_stock_analysis_service", service)
-    assert main(date_args(tmp_path) + ["--check-config"]) == 0
+    from infrastructure.replay_evidence import save_evidence
+    from tests.test_strict_replay import payload_fixture
+    payload = payload_fixture()
+    evidence = tmp_path / "evidence.json"
+    save_evidence(payload, evidence)
+    args = date_args(tmp_path, start=payload["start"], end="2026-09-11")
+    args[args.index("--pae-current-cash") + 1] = "1000000"
+    assert main(args + ["--check-config", "--replay-id", "preflight", "--replay-evidence-file", str(evidence)]) == 0
     summary = json.loads(capsys.readouterr().out)
-    assert summary["as_of"] == "2026-09-16T13:30:00+08:00"
-    assert summary["mail_enabled"] is False and summary["date_range"]["start"] == "2024-10-25"
+    assert summary["as_of"] == "2026-09-11T13:30:00+08:00"
+    assert summary["mail_enabled"] is False and summary["history_start"] == payload["start"]
     service.assert_not_called()
 
 
@@ -178,12 +202,24 @@ def test_shell_date_pair_no_live_mail_or_current_holdings_fallback(tmp_path, mai
                             env={"PATH": "/usr/bin:/bin", "PYTHON": str(fake), "CAPTURED_ARGS": str(capture)},
                             text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
+    assert "Historical replay: market and universe from pinned evidence (no email)" in result.stdout
+    assert "Strict historical replay" not in result.stdout
     sent = capture.read_text().splitlines()
     assert sent[sent.index("-b") + 1] == "2024-10-25"
     assert sent[sent.index("-e") + 1] == "2026-09-16"
     assert "-m" not in sent and "--as-of" not in sent
     assert ("--replay-mail" in sent) is mail
     assert sent[sent.index("--pae-holdings-file") + 1] == str(tmp_path / "historical.txt")
+
+
+def test_replay_help_uses_historical_name_without_removing_evidence_contract():
+    result = subprocess.run(["./stockdataanalysis.sh", "--help"], cwd=ROOT,
+                            text=True, capture_output=True)
+    assert result.returncode == 0
+    assert "Historical date replay reads pinned evidence" in result.stdout
+    assert "Strict date replay" not in result.stdout
+    assert "--replay-evidence-file" in result.stdout
+    assert "an empty holdings file declares no holdings" in result.stdout
 
 
 @pytest.mark.parametrize("bounds", [["-b", "0", "-e", "2026-09-16"],
@@ -255,7 +291,7 @@ def test_date_derived_cutoff_matches_explicit_internal_cutoff_decisions(tmp_path
         persistence.load_recent_v2.assert_not_called()
         persistence.record_session_v2.assert_not_called()
         decision = evaluation.decisions[0]
-        assert decision.value("低點決策") == "BUY"
+        assert decision.value("低點決策") == "BUY_SMALL"
         assert decision.value("EREM 分數") is not None
         assert decision.value("PAE Status") is not None
         return builder.project_decisions(evaluation.decisions)

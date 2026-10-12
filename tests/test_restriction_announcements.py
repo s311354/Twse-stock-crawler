@@ -157,6 +157,32 @@ def test_missing_prior_version_never_falls_back_to_clear():
     assert check(bundle(event(version=2, published_at="2026-09-17T08:00:00+08:00")))["status"] == "UNKNOWN"
 
 
+def test_coverage_at_later_cutoff_cannot_certify_uncovered_signal_day():
+    raw = bundle()
+    for row in raw['coverage']:
+        row['start_at'] = '2026-09-12T00:00:00+08:00'
+    result = check(raw, as_of='2026-09-13T13:30:00+08:00', bar='2026-09-11')
+    assert result['status'] == 'UNKNOWN'
+    assert result['market_effective_at'] == '2026-09-11T13:30:00+08:00'
+
+
+@pytest.mark.parametrize('start,end,market_ids,decision_ids', [
+    ('2026-09-11T00:00:00+08:00', '2026-09-12T00:00:00+08:00', ['NOTICE-1'], []),
+    ('2026-09-12T00:00:00+08:00', None, [], ['NOTICE-1']),
+])
+def test_weekend_cutoff_checks_both_signal_day_and_current_restrictions(start, end, market_ids, decision_ids):
+    result = check(bundle(event(effective_from=start, effective_until=end)),
+                   as_of='2026-09-13T13:30:00+08:00', bar='2026-09-11')
+    assert result['status'] == 'RESTRICTED'
+    state = result['categories']['DISPOSITION']
+    assert state['market_active_ids'] == market_ids
+    assert state['decision_active_ids'] == decision_ids
+
+
+def test_complete_empty_historical_coverage_allows_clear_on_weekend():
+    assert check(bundle(), as_of='2026-09-13T13:30:00+08:00', bar='2026-09-11')['status'] == 'CLEAR'
+
+
 @pytest.mark.parametrize("kind", ["hash", "quote", "url", "naive", "precision", "duplicate", "identity", "future_download"])
 def test_import_rejects_unverifiable_or_conflicting_records(kind):
     raw = bundle(event())
@@ -299,7 +325,7 @@ def test_les_erem_pae_share_reconstructed_cutoff_and_remain_research_only(comple
     assert decision.value("PAE Status") is not None
     assert report["data"]["restriction_check"]["status"] == ("CLEAR" if complete else "UNKNOWN")
     if complete:
-        assert report["decision"]["signal"] == "BUY"
+        assert report["decision"]["signal"] == "BUY_SMALL"
         assert report_failure(report, allow_replay=True) is None
     else:
         assert report["decision"]["signal"] not in {"BUY", "BUY_SMALL"}

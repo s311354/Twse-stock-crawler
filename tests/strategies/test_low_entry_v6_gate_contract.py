@@ -40,7 +40,7 @@ def test_raw_twse_mops_pipeline_projects_actual_v6_gate_sources(daily_decision):
         assert field.value is True if column == "No Veto" else field.value == "PASS"
         assert field.unit == (FieldUnit.BOOLEAN if column == "No Veto" else FieldUnit.TEXT)
     assert daily_decision.value("LES v5 Final Quality Status") == "DATA_INSUFFICIENT"
-    assert daily_decision.value("低點決策") == "BUY"
+    assert daily_decision.value("低點決策") == "BUY_SMALL"
 
 
 @pytest.mark.parametrize("column", ["Quality Gate", "No Veto", "LES v6 Score Gate", "LES v6 Trigger Gate", "Risk Gate"])
@@ -121,7 +121,7 @@ def test_direct_plugin_keeps_explicit_matching_config_support():
     from domain.strategies.low_entry_v6_signals import LowEntryV6Config
 
     payload = request()
-    config = LowEntryV6Config(quote_max_age_seconds=45)
+    config = LowEntryV6Config(decision_policy_version=1, quote_max_age_seconds=45)
     payload["report"]["parameters"] = vars(config)
     assert report_failure(payload["report"]) == "EXECUTION_CONFIG_MISMATCH"
     assert report_failure(payload["report"], config=config) is None
@@ -138,8 +138,8 @@ def test_recomputed_veto_cannot_be_cleared_by_a_false_label():
 
 def test_unavailable_data_does_not_display_no_veto_as_pass():
     report = unavailable_report("2330", "測試", "2026-09-11", "2026-09-11T15:00:00+08:00", "MISSING")
-    assert entry_gate_checks(report) == dict(quality="UNKNOWN", no_veto="UNKNOWN", score="NOT_EVALUATED",
-                                           trigger="NOT_EVALUATED", risk="NOT_EVALUATED")
+    assert entry_gate_checks(report) == dict(quality="UNKNOWN", no_veto="UNKNOWN", score="UNKNOWN",
+                                           trigger="UNKNOWN", risk="UNKNOWN")
     assert project_report(report)["No Veto"] is None
     assert project_report(report)["Quality Gate"] == "UNKNOWN"
 
@@ -157,7 +157,7 @@ def test_entry_summary_shows_five_gates_without_claiming_a_fill(daily_decision, 
     rendered = LowEntryV6Renderer().render((daily_decision,))
     for gate in ("quality", "no_veto", "score", "trigger", "risk"):
         assert f'data-entry-gate="{gate}" data-status="PASS"' in rendered
-    assert "Trigger（收盤型態）" in rendered
+    assert "收盤條件明細一致性（非額外資格）" in rendered
     assert "下一交易日確認，尚未成交" in rendered
     assert "毛 RR " in rendered and "淨 RR " in rendered
     assert "低點進場判斷（Low-Entry Model v6）" in rendered
@@ -179,6 +179,6 @@ def test_invalid_published_buy_is_not_a_formal_renderer_candidate(daily_decision
     renderer = LowEntryV6Renderer()
     assert "本次沒有 BUY / BUY_SMALL 訊號" in renderer.render_entry_summary((item,))
     analysis = renderer.render_analysis((item,))
-    assert "訊號無效（BUY）" in analysis
+    assert "訊號無效（BUY_SMALL）" in analysis
     assert "V6_TRIGGER_NOT_CONFIRMED" in analysis
     assert 'data-entry-gate="trigger" data-status="FAIL"' in analysis

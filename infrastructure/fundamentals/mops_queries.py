@@ -8,15 +8,17 @@ import json
 import sqlite3
 from collections.abc import Callable
 from collections.abc import Mapping
-from contextlib import closing
-from dataclasses import replace
+from dataclasses import asdict, replace
 from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
 
 from application.fundamental_ports import FundamentalUnitOfWork
+from application.daily_performance import count_work, measure_stage
+from application.daily_work import current_work
 from domain.fundamental_derivation import CachedFundamentalBundle
+from domain.fundamental_derivation import CachedFundamentalHeader
 from domain.fundamental_derivation import FiledFact
 from domain.fundamental_derivation import FiledFinancials
 from domain.fundamental_derivation import FundamentalBundle
@@ -27,24 +29,51 @@ from domain.fundamental_models import FundamentalSnapshot
 from domain.fundamental_models import NormalizedFact
 from infrastructure.fundamentals.models import MopsFiling
 from infrastructure.fundamentals.models import MopsFilingCandidate
-from infrastructure.fundamentals.ixbrl_parser import decode_mops_content
-from infrastructure.fundamentals.ixbrl_units import UnitParser
+from infrastructure.fundamentals.ixbrl_parser import ixbrl_schema_refs, parse_ixbrl
+from domain.strategies.low_entry_v6_filings import V6_FILING_SCHEMA_VERSION
 from infrastructure.fundamentals.mops_sqlite import row_to_filing
 from infrastructure.fundamentals.mops_sqlite import to_epoch
 from infrastructure.fundamentals.mops_unit_of_work import borrow_connection
 
 
+def _raw_normalized_facts(
+    path: Path, expected_hash: str, signature: tuple[int, int, int], parser_version: str,
+) -> tuple[tuple[FiledFact, ...], tuple[str, ...]] | None:
+    work = current_work()
+    return _raw_normalized_facts_cached(path, expected_hash, signature, parser_version,
+                                        work.version if work is not None else "legacy-single-call")
+
+
 @lru_cache(maxsize=128)
-def _raw_unit_declarations(
-    path: Path, expected_hash: str, signature: tuple[int, int, int],
-) -> dict[str, str | None] | None:
+def _raw_normalized_facts_cached(path, expected_hash, signature, parser_version, work_version):
     """Bounded local-only migration; stat signature invalidates replaced files."""
-    content = path.read_bytes()
+    with measure_stage("filing_original_read_verify"):
+        content = path.read_bytes()
+        count_work("raw_original_reads")
     if hashlib.sha256(content).hexdigest() != expected_hash:
+        count_work("raw_unit_hash_rejections")
         return None
-    parser = UnitParser()
-    parser.feed(decode_mops_content(content))
-    return parser.units
+    def parse():
+        with measure_stage("filing_unit_parse"):
+            count_work("raw_unit_parse_calls")
+            normalized = parse_ixbrl(content)
+        return [dict(facts=[asdict(f) for f in normalized], schema_refs=list(ixbrl_schema_refs(content)))]
+    work = current_work()
+    def build():
+        rows = work.raw_parse(expected_hash, parse, parser_version=parser_version) if work is not None else parse()
+        facts = tuple(FiledFact(concept=f["concept"], context_id=f.get("context_id"), unit=f.get("unit"),
+            numeric_value=f["numeric_value"], text_value=f["text_value"], start_date=f["start_date"],
+            end_date=f["end_date"], instant=f["instant"],
+            dimensions=tuple(tuple(d) for d in f.get("dimensions", ()))) for f in rows[0]["facts"])
+        return facts, tuple(rows[0]["schema_refs"])
+    return (work.memo_immutable("raw_parse", (parser_version, expected_hash), build,
+            lambda value: sum(256 + len(f.text_value or "") + len(f.concept) for f in value[0]))
+            if work is not None else build())
+
+
+# Preserve the existing diagnostic/test hooks while adding job-version keys.
+_raw_normalized_facts.cache_clear = _raw_normalized_facts_cached.cache_clear
+_raw_normalized_facts.cache_info = _raw_normalized_facts_cached.cache_info
 
 
 class MopsQueryRepository:
@@ -63,35 +92,49 @@ class MopsQueryRepository:
         self._ensure_schema = ensure_schema
         self._raw_root = raw_root
 
-    def _resolve_cached_units(self, filing: MopsFiling, facts: list[FiledFact]) -> tuple[FiledFact, ...]:
-        """Upgrade old unitRef-only facts without rewriting filing provenance.
+    def _resolve_cached_document(self, filing: MopsFiling, facts: list[FiledFact]) -> tuple[tuple[FiledFact, ...], tuple[str, ...]]:
+        """Reparse verified local originals without rewriting facts/provenance.
 
-        New facts already carry canonical measures. Old documents are verified
-        by content hash, read locally, and never trigger a network request.
+        Cached facts may predate context/number fixes, even with canonical units.
+        Originals are verified by hash, read locally with a bounded versioned
+        cache, and never trigger a network request or change availability.
         Missing/corrupt originals cannot turn an opaque EPS unit into evidence.
         """
-        if self._raw_root is None or not any(
-            fact.unit and not fact.unit.startswith(("iso4217:", "xbrli:")) for fact in facts
-        ):
-            return tuple(facts)
-        units = None
+        if self._raw_root is None:
+            return tuple(facts), ()
+        original_verified = False
+        schema_refs = ()
         try:
             path = (self._raw_root.parent / filing.raw_path).resolve()
             if path.is_relative_to(self._raw_root.resolve()):
                 stat = path.stat()
-                units = _raw_unit_declarations(
+                reparsed = _raw_normalized_facts(
                     path, filing.content_sha256, (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size),
+                    V6_FILING_SCHEMA_VERSION,
                 )
+                original_verified = reparsed is not None
+                if reparsed is not None:
+                    normalized, schema_refs = reparsed
+                    if normalized:
+                        return normalized, schema_refs
         except OSError:
             pass
         result = []
         for fact in facts:
+            if not original_verified and fact.numeric_value is not None:
+                # Persisted amounts cannot hide a missing/replaced original.
+                # Keep SQLite/filing identity intact; this read model is UNKNOWN.
+                fact = replace(fact, numeric_value=None, unit=None)
+            elif original_verified:
+                # Legacy storage callers may retain their persisted amounts
+                # when a verified original has no parseable iXBRL facts. Such
+                # amounts do NOT have re-established unit evidence for v6.
+                fact = replace(fact, unit=None)
             if fact.unit and not fact.unit.startswith(("iso4217:", "xbrli:")):
                 # Even a familiar unitRef label is not a unit declaration.
-                unit = units.get(fact.unit) if units is not None else None
-                fact = replace(fact, unit=unit)
+                fact = replace(fact, unit=None)
             result.append(fact)
-        return tuple(result)
+        return tuple(result), schema_refs
 
     def load_filing_catalog(
         self, symbol: str, *, as_of: str, uow: FundamentalUnitOfWork | None = None,
@@ -104,7 +147,30 @@ class MopsQueryRepository:
             ).fetchone()
         if row is None:
             return None
-        values = json.loads(row[0])
+        return self._decode_catalog(row[0])
+
+    def load_filing_catalogs_many(self, symbols: list[str], *, as_of: str,
+                                 uow: FundamentalUnitOfWork | None = None) -> dict[str, FilingCatalogState]:
+        """Small metadata only, same cutoff and decoding as the single query."""
+        normalized = list(dict.fromkeys(str(item).strip() for item in symbols if str(item).strip()))
+        if not normalized:
+            return {}
+        self._ensure_schema()
+        result = {}
+        with measure_stage("fundamental_catalog_preflight"), borrow_connection(self._connect, None, uow) as active:
+            for offset in range(0, len(normalized), self._BULK_SYMBOL_CHUNK_SIZE):
+                chunk = normalized[offset:offset + self._BULK_SYMBOL_CHUNK_SIZE]
+                rows = active.execute("SELECT symbol,state_json FROM filing_catalog_cache "
+                    "WHERE symbol IN ({}) AND checked_at_epoch <= ?".format(",".join("?" for _ in chunk)),
+                    [*chunk, to_epoch(as_of)])
+                count_work("fundamental_catalog_queries")
+                for symbol, raw in rows:
+                    result[str(symbol)] = self._decode_catalog(raw)
+        return result
+
+    @staticmethod
+    def _decode_catalog(raw):
+        values = json.loads(raw)
         return FilingCatalogState(
             symbol=values["symbol"], checked_at=values["checked_at"],
             candidates=tuple(FilingCandidate(**item) for item in values["candidates"]),
@@ -265,6 +331,43 @@ class MopsQueryRepository:
             for row in rows
         ]
 
+    def load_filings_many(
+        self, symbols: list[str], *, as_of: str,
+        uow: FundamentalUnitOfWork | None = None,
+    ) -> dict[str, list[MopsFiling]]:
+        """One borrowed connection, bounded queries, no facts or raw documents.
+
+        The identity hash has canonical ordering, independent of facts JOIN
+        order (including filings with no facts). Model input order is unchanged.
+        """
+        normalized = list(dict.fromkeys(str(item).strip() for item in symbols if str(item).strip()))
+        if not normalized:
+            return {}
+        self._ensure_schema()
+        result: dict[str, list[MopsFiling]] = {symbol: [] for symbol in normalized}
+        with borrow_connection(self._connect, None, uow) as active:
+            for offset in range(0, len(normalized), self._BULK_SYMBOL_CHUNK_SIZE):
+                chunk = normalized[offset:offset + self._BULK_SYMBOL_CHUNK_SIZE]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = active.execute(
+                    f"""
+                    SELECT id, symbol, fiscal_year, quarter, report_id, available_at,
+                           fetched_at, revision_number, content_sha256, source_url,
+                           raw_path, period_end, statement_scope, audit_status,
+                           correction_description, availability_source,
+                           correction_announced_on
+                    FROM filings
+                    WHERE symbol IN ({placeholders}) AND available_at_epoch <= ?
+                    ORDER BY symbol, fiscal_year, quarter, revision_number, id
+                    """,
+                    [*chunk, to_epoch(as_of)],
+                ).fetchall()
+                for row in rows:
+                    filing = row_to_filing(row)
+                    if filing is not None:
+                        result[filing.symbol].append(filing)
+        return result
+
     def load_filed_financials(
         self,
         symbol: str,
@@ -272,7 +375,16 @@ class MopsQueryRepository:
         *,
         uow: FundamentalUnitOfWork | None = None,
         connection: sqlite3.Connection | None = None,
+        periods: tuple[tuple[int, int], ...] | None = None,
     ) -> list[FiledFinancials]:
+        if periods is not None and not periods:
+            return []
+        period_predicate, params = "", [symbol, to_epoch(as_of)]
+        if periods is not None:
+            if any(type(y) is not int or type(q) is not int or not 1 <= q <= 4 for y, q in periods):
+                raise ValueError("INVALID_FILING_PERIOD_FILTER")
+            period_predicate = " AND (" + " OR ".join("(f.fiscal_year=? AND f.quarter=?)" for _ in periods) + ")"
+            params.extend(v for item in periods for v in item)
         self._ensure_schema()
         with borrow_connection(self._connect, connection, uow) as active:
             rows = active.execute(
@@ -288,9 +400,10 @@ class MopsQueryRepository:
                 FROM filings AS f
                 LEFT JOIN facts AS x ON x.filing_id = f.id
                 WHERE f.symbol = ? AND f.available_at_epoch <= ?
+                """ + period_predicate + """
                 ORDER BY f.fiscal_year, f.quarter, f.revision_number, x.id
                 """,
-                (symbol, to_epoch(as_of)),
+                params,
             ).fetchall()
 
         grouped: dict[int, tuple[MopsFiling, list[FiledFact]]] = {}
@@ -329,13 +442,15 @@ class MopsQueryRepository:
                     )
                 )
 
-        return [
-            FiledFinancials(
+        result = []
+        for filing, facts in grouped.values():
+            normalized, schema_refs = self._resolve_cached_document(filing, facts)
+            result.append(FiledFinancials(
                 fiscal_year=filing.fiscal_year,
                 quarter=filing.quarter,
                 available_at=filing.available_at,
                 revision_number=filing.revision_number,
-                facts=self._resolve_cached_units(filing, facts),
+                facts=normalized,
                 correction_description=filing.correction_description,
                 availability_source=filing.availability_source,
                 filing_id=filing.filing_id,
@@ -345,9 +460,9 @@ class MopsQueryRepository:
                 period_end=filing.period_end,
                 statement_scope=filing.statement_scope,
                 audit_status=filing.audit_status,
-            )
-            for filing, facts in grouped.values()
-        ]
+                taxonomy_schema_refs=schema_refs,
+            ))
+        return result
 
     def last_full_refresh_epoch(
         self,
@@ -502,7 +617,7 @@ class MopsQueryRepository:
         }
 
     @staticmethod
-    def filing_set_hash(filings: list[FiledFinancials]) -> str:
+    def filing_set_hash(filings: list[FiledFinancials] | list[MopsFiling]) -> str:
         components = [
             "|".join(
                 (
@@ -515,7 +630,9 @@ class MopsQueryRepository:
                     filing.correction_description or "",
                 )
             )
-            for filing in filings
+            for filing in sorted(filings, key=lambda item: (
+                item.fiscal_year, item.quarter, item.revision_number, item.filing_id or 0,
+            ))
         ]
         return hashlib.sha256(
             "\n".join(components).encode("utf-8")
@@ -527,6 +644,7 @@ class MopsQueryRepository:
         *,
         as_of: str,
         derivation_version: str,
+        uow: FundamentalUnitOfWork | None = None,
     ) -> dict[str, CachedFundamentalBundle]:
         self._ensure_schema()
         requested = {
@@ -536,8 +654,7 @@ class MopsQueryRepository:
         }
         if not requested:
             return {}
-        placeholders = ",".join("?" for _ in requested)
-        query = f"""
+        query = """
             SELECT rs.symbol, rs.active_filing_set_sha256,
                    rs.active_derivation_version,
                    rs.active_snapshot_available_at_epoch,
@@ -553,33 +670,83 @@ class MopsQueryRepository:
               AND rs.active_derivation_version = ?
               AND rs.active_snapshot_available_at_epoch <= ?
         """
-        params = [*requested, derivation_version, to_epoch(as_of)]
-        with closing(self._connect()) as connection:
-            rows = connection.execute(query, params).fetchall()
-
+        symbols = list(requested)
         bundles: dict[str, CachedFundamentalBundle] = {}
-        for row in rows:
-            symbol = str(row[0])
-            stored_sector = str(row[8])
-            if requested.get(symbol) != stored_sector:
-                continue
-            annual = pd.read_json(io.StringIO(str(row[9])), orient="records")
-            snapshot = json.loads(str(row[10]))
-            bundles[symbol] = CachedFundamentalBundle(
-                symbol=symbol,
-                sector=stored_sector,
-                filing_set_sha256=str(row[1]),
-                derivation_version=str(row[2]),
-                available_at_epoch=int(row[3]),
-                latest_period=(int(row[4]), int(row[5])),
-                annual_history_years=int(row[6]),
-                full_catalog_checked_at_epoch=int(row[7]),
-                bundle=FundamentalBundle(
-                    annual_fundamentals=annual,
-                    snapshot=snapshot,
-                ),
-            )
+        with borrow_connection(self._connect, None, uow) as connection:
+            for offset in range(0, len(symbols), self._BULK_SYMBOL_CHUNK_SIZE):
+                chunk = symbols[offset:offset + self._BULK_SYMBOL_CHUNK_SIZE]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    query.format(placeholders=placeholders),
+                    [*chunk, derivation_version, to_epoch(as_of)],
+                )
+                for row in rows:
+                    symbol = str(row[0])
+                    stored_sector = str(row[8])
+                    if requested.get(symbol) != stored_sector:
+                        continue
+                    bundles[symbol] = CachedFundamentalBundle(
+                        symbol=symbol, sector=stored_sector,
+                        filing_set_sha256=str(row[1]), derivation_version=str(row[2]),
+                        available_at_epoch=int(row[3]), latest_period=(int(row[4]), int(row[5])),
+                        annual_history_years=int(row[6]), full_catalog_checked_at_epoch=int(row[7]),
+                        bundle=self._decode_bundle(str(row[9]), str(row[10])),
+                    )
         return bundles
+
+    def load_cached_bundle_headers(
+        self, symbol_sectors: Mapping[str, str], *, as_of: str,
+        derivation_version: str, uow: FundamentalUnitOfWork | None = None,
+    ) -> dict[str, CachedFundamentalHeader]:
+        """Bounded metadata JOIN; deliberately excludes both large JSON columns."""
+        requested = {str(s).strip(): str(sector).strip() for s, sector in symbol_sectors.items()
+                     if str(s).strip()}
+        if not requested:
+            return {}
+        self._ensure_schema()
+        result = {}
+        symbols = list(requested)
+        with measure_stage("fundamental_snapshot_headers"), borrow_connection(self._connect, None, uow) as active:
+            for offset in range(0, len(symbols), self._BULK_SYMBOL_CHUNK_SIZE):
+                chunk = symbols[offset:offset + self._BULK_SYMBOL_CHUNK_SIZE]
+                rows = active.execute(
+                    """SELECT rs.symbol, rs.active_filing_set_sha256,
+                              rs.active_derivation_version, rs.active_snapshot_available_at_epoch,
+                              rs.active_latest_fiscal_year, rs.active_latest_quarter,
+                              rs.active_annual_history_years, rs.full_catalog_checked_at_epoch,
+                              fs.sector, rs.active_snapshot_cache_key,
+                              fs.filing_schema_version, fs.has_mops_filings
+                       FROM refresh_state AS rs JOIN fundamental_snapshots AS fs
+                         INDEXED BY fundamental_snapshots_header
+                         ON fs.symbol = rs.symbol AND fs.filing_set_sha256 = rs.active_snapshot_cache_key
+                       WHERE rs.symbol IN ({}) AND rs.active_derivation_version = ?
+                         AND rs.active_snapshot_available_at_epoch <= ?""".format(",".join("?" for _ in chunk)),
+                    [*chunk, derivation_version, to_epoch(as_of)],
+                )
+                count_work("fundamental_header_queries")
+                for row in rows:
+                    if requested.get(str(row[0])) != str(row[8]):
+                        continue
+                    result[str(row[0])] = CachedFundamentalHeader(
+                        symbol=str(row[0]), sector=str(row[8]), filing_set_sha256=str(row[1]),
+                        derivation_version=str(row[2]), available_at_epoch=int(row[3]),
+                        latest_period=(int(row[4]), int(row[5])), annual_history_years=int(row[6]),
+                        full_catalog_checked_at_epoch=int(row[7]), snapshot_cache_key=str(row[9]),
+                        filing_schema_version=str(row[10]) if row[10] is not None else None,
+                        has_mops_filings=bool(row[11]) if row[11] is not None else None,
+                    )
+                    count_work("fundamental_headers_loaded")
+        return result
+
+    @staticmethod
+    def _decode_bundle(annual_json: str, snapshot_json: str) -> FundamentalBundle:
+        with measure_stage("fundamental_snapshot_decode"):
+            count_work("fundamental_snapshot_decodes")
+            count_work("fundamental_snapshot_json_characters", len(annual_json) + len(snapshot_json))
+            return FundamentalBundle(
+                annual_fundamentals=pd.read_json(io.StringIO(annual_json), orient="records"),
+                snapshot=json.loads(snapshot_json),
+            )
 
     def load_fundamental_bundle(
         self,
@@ -591,7 +758,7 @@ class MopsQueryRepository:
         connection: sqlite3.Connection | None = None,
     ) -> FundamentalBundle | None:
         self._ensure_schema()
-        with borrow_connection(self._connect, connection, uow) as active:
+        with measure_stage("fundamental_snapshot_read"), borrow_connection(self._connect, connection, uow) as active:
             row = active.execute(
                 """
                 SELECT annual_json, snapshot_json
@@ -600,14 +767,10 @@ class MopsQueryRepository:
                 """,
                 (symbol, filing_set_sha256, sector),
             ).fetchone()
+            count_work("fundamental_snapshot_reads")
         if row is None:
             return None
-        annual = pd.read_json(io.StringIO(str(row[0])), orient="records")
-        snapshot = json.loads(str(row[1]))
-        return FundamentalBundle(
-            annual_fundamentals=annual,
-            snapshot=snapshot,
-        )
+        return self._decode_bundle(str(row[0]), str(row[1]))
 
 
 __all__ = ["MopsQueryRepository"]

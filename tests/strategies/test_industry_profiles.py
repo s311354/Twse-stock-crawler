@@ -141,9 +141,9 @@ def test_daily_v6_company_sector_keeps_native_buy_through_render_and_validation(
     decision = decisions[0]
     report = json.loads(decision.value("LES v6 Report"))
     assert report["industry_profile"]["name"] == f"{name}_PROFILE"
-    assert report["industry_profile"]["shadow_signal"] == "BUY"
+    assert report["industry_profile"]["shadow_signal"] == "BUY_SMALL"
     assert report["quality"]["status"] == "PASS"
-    assert report["decision"]["signal"] == decision.value("低點決策") == "BUY"
+    assert report["decision"]["signal"] == decision.value("低點決策") == "BUY_SMALL"
     assert report["sizing"]["indicative_shares"] == decision.value("建議股數") > 0
     assert decision.value("Position Fraction") > 0
     assert report_failure(report) is None

@@ -83,7 +83,8 @@ def test_starter_threshold_is_exact_and_quality_matches_pass(monkeypatch, setup,
     result = signals.decide(quality(), f, config=CONFIG)
     assert result["signal"] == "BUY_SMALL" and result["required_score"] == threshold
     assert signals.decide(quality(score=70), f, config=CONFIG)["signal"] == "BUY_SMALL"
-    assert signals.decide(quality(score=69.99), f, config=CONFIG)["signal"] not in signals.EXECUTABLE_SIGNALS
+    assert signals.decide(quality(score=65), f, config=CONFIG)["signal"] == "BUY_SMALL"
+    assert signals.decide(quality(score=64.99), f, config=CONFIG)["signal"] not in signals.EXECUTABLE_SIGNALS
 
 
 def test_confirmed_buy_threshold_and_riskoff_increment(monkeypatch):
@@ -154,12 +155,23 @@ def test_no_quality_exception_for_recovery(status):
                                         "2026-09-25-v6-balanced-quality-net-risk",
                                         "2026-09-25-v6-downside-quality-cost-sized-risk",
                                         "2026-09-26-v6-pit-eps-structural-net-risk",
-                                        "2026-09-26-v6-archived-restrictions-price-derived-risk"])
+                                        "2026-09-26-v6-archived-restrictions-price-derived-risk",
+                                        "2026-09-26-v6-consistent-risk-boundaries",
+                                        "2026-10-02-v6-scoped-quality-causal-structure",
+                                        "2026-10-02-v6-unified-score-ledger-risk-comparison",
+                                        "2026-10-02-v6-penalties-safety-caps-single-decision",
+                                        "2026-10-02-v6-common-execution-risk-score",
+                                        "2026-10-02-v6-source-family-dedup",
+                                        "2026-10-02-v6-pit-leadership",
+                                        "2026-10-04-v6-pit-taxonomy-period-debt",
+                                        "2026-10-04-v6-pit-bounded-quality-penalty-v3",
+                                        "2026-10-04-v6-pit-comparative-quality-ttm-v5",
+                                        "2026-10-04-v6-pit-core-financial-quality-v7"])
 def test_old_parameter_reports_cannot_execute_under_new_rules(old_version):
     report = execution_report()
     old = deepcopy(report)
     old["parameter_version"] = old_version
-    assert PARAMETER_VERSION == "2026-09-26-v6-consistent-risk-boundaries"
+    assert PARAMETER_VERSION == "2026-10-04-v6-pit-reported-period-quality-v8"
     assert report_failure(old) == "EXECUTION_CONFIG_MISMATCH"
     quote = dict(symbol="2330", timestamp="2026-09-14T09:10+08:00", price=100.5, bid=100.4, ask=100.5, restricted=False)
     args = dict(now=quote["timestamp"], trading_sessions=["2026-09-11", "2026-09-14"], portfolio=ACCOUNT)

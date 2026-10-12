@@ -187,7 +187,8 @@ def test_unsupported_sector_updates_final_observation_reasons(monkeypatch):
     prepared = model.attach_low_entry_v6_context(data, symbol="2330", sector="UNSUPPORTED",
                                                 as_of="2026-09-11T15:00+08:00", filings=financials(), portfolio=ACCOUNT)
     report = model.LowEntryScoreV6Strategy().run_latest(prepared).iloc[-1]["LES v6 Report"]
-    assert report["decision"]["signal"] == "NO_MODEL"
+    assert report["decision"]["signal"] == "WATCH"
+    assert report["decision"]["safety_cap"] <= 64
     assert report["sizing"]["indicative_shares"] == 0
     observation = report["decision"]["technical_observation"]
     assert observation["patterns"] == ["RELATIVE_STRENGTH"]

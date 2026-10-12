@@ -786,7 +786,9 @@ def test_daily_analysis_dataset_uses_v6_and_keeps_erem_and_legacy_evidence() -> 
     assert "Risk Gate" in dataset.columns
     assert "RS20" in dataset.columns
     assert dataset.loc[0, "LES v5 Final Quality Status"] == "DATA_INSUFFICIENT"
-    assert dataset.loc[0, "低點決策"] == "DATA_INSUFFICIENT"
+    assert dataset.loc[0, "低點決策"] == "WATCH"
+    assert dataset.loc[0, "LES v6 Safety Cap"] == 61
+    assert dataset.loc[0, "建議股數"] == 0
     assert dataset.loc[0, "Base Data Confidence"] == 0
     assert dataset.loc[0, "Extended Data Confidence"] == 0
     rendered = crawler.build_entry_signal_analysis(decisions)

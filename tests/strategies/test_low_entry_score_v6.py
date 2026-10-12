@@ -23,11 +23,13 @@ from domain.strategy import available_strategies, get_strategy
 from interface.les_v6 import analyze_request, main
 
 
-CONFIG = LowEntryV6Config()
+# Pin the pre-unification contract tests; v2 has separate decision-policy tests.
+CONFIG = LowEntryV6Config(decision_policy_version=1)
 ACCOUNT = {"value": 1_000_000., "available_cash": 500_000., "intended_weight": .2, "capacity_weight": .2}
 
 
 def financials():
+    """Synthetic complete quarterly evidence; never production financials."""
     records = []
     for i, period in enumerate(pd.period_range("2023Q1", "2026Q2", freq="Q")):
         revenue = 5000 * 1.06 ** i
@@ -38,6 +40,9 @@ def financials():
             "available_at": (period.end_time.normalize() + pd.Timedelta(days=40)).isoformat() + "+08:00",
             "revenue": revenue, "cost_of_revenue": revenue * .5, "operating_income": revenue * .3,
             "net_income": revenue * .25, "basic_eps": 2 * 1.06 ** i,
+            "cfo": revenue * .3, "capex": revenue * .1,
+            "pretax_income": revenue * .3125, "income_tax": revenue * .0625,
+            "cash": 1000., "interest_bearing_debt": 1000.,
             "current_assets": 6000., "non_current_assets": 4000., "total_assets": 10000.,
             "current_liabilities": 2000., "total_liabilities": 3000., "total_equity": 7000.,
         })
@@ -100,13 +105,20 @@ def setup_features(setup, **changes):
     return f
 
 
-def test_quality_core_only_is_pass_without_invented_extensions():
-    q = evaluate_quality(financials(), symbol="2330", market="TWSE", as_of="2026-09-11T13:30+08:00")
-    assert q.status == "PASS"
-    assert q.score >= 75 and q.confidence >= 70
+def test_quality_core_without_cash_flow_is_insufficient_without_invented_extensions():
+    records = financials()
+    for row in records:
+        for field in ("cfo", "capex", "pretax_income", "income_tax", "cash", "interest_bearing_debt"):
+            row.pop(field)
+    q = evaluate_quality(records, symbol="2330", market="TWSE", as_of="2026-09-11T13:30+08:00")
+    assert q.status == "DATA_INSUFFICIENT"
+    assert q.score == pytest.approx(sum(q.components.values()) - q.metrics["quality_penalty"])
+    assert q.confidence >= 70
     assert q.optional["cfo"] == q.optional["auditor_opinion"] == "NOT_AVAILABLE"
-    assert q.coverage["profitability"] == 75
-    assert q.metrics["roe"] == pytest.approx(q.metrics["net_income_ttm"] / 7000)
+    assert q.coverage["cash_flow"] == 0 and q.coverage["return_on_capital"] == 100
+    assert q.coverage["profitability"] == 100
+    assert q.metrics["roe_reported"] == q.metrics["roe"] == pytest.approx(records[-1]["net_income"] / 7000)
+    assert q.metrics["roe_ttm"] == pytest.approx(q.metrics["net_income_ttm"] / 7000)
 
 
 def test_future_restatement_cannot_change_past_quality():
@@ -119,8 +131,6 @@ def test_future_restatement_cannot_change_past_quality():
 
 @pytest.mark.parametrize("field,value,reason", [
     ("total_equity", 0, "INVALID_BALANCE"), ("total_assets", 20000, "IDENTITY_FAIL"),
-    ("current_assets", None, "UNRESOLVABLE"), ("symbol", "other", "IDENTITY_AMBIGUOUS"),
-    ("scope", "standalone", "INCOMPARABLE"), ("available_at", None, "MISSING_AVAILABLE"),
     ("auditor_opinion", "ADVERSE", "HARD_RISK"), ("going_concern", True, "HARD_RISK"),
 ])
 def test_financial_hard_rejects(field, value, reason):
@@ -131,8 +141,20 @@ def test_financial_hard_rejects(field, value, reason):
     assert reason in result.reasons[0]
 
 
+@pytest.mark.parametrize("field,value,reason", [
+    ("current_assets", None, "UNRESOLVABLE"), ("symbol", "other", "IDENTITY_AMBIGUOUS"),
+    ("scope", "standalone", "UNVERIFIED_FILING_SCOPE"), ("available_at", None, "MISSING_AVAILABLE"),
+])
+def test_unresolved_evidence_is_not_a_confirmed_financial_reject(field, value, reason):
+    records = financials()
+    records[-1][field] = value
+    result = evaluate_quality(records, symbol="2330", market="TWSE", as_of="2026-09-11")
+    assert result.status == "DATA_INSUFFICIENT" and result.integrity == "UNKNOWN"
+    assert reason in result.reasons[0]
+
+
 def test_missing_growth_coverage_never_becomes_small_buy():
-    q = evaluate_quality(financials()[-5:], symbol="2330", market="TWSE", as_of="2026-09-11")
+    q = evaluate_quality(financials()[-4:], symbol="2330", market="TWSE", as_of="2026-09-11")
     assert q.status == "PROVISIONAL"
     assert decide(q, features(), config=CONFIG)["signal"] == "WATCH_ONLY"
 
@@ -241,7 +263,8 @@ def test_three_starter_paths_require_quality_and_do_not_use_early_buy(setup):
     assert result["signal"] == "BUY_SMALL", result
     assert result["starter_trigger"] and not result["confirmed_trigger"]
     assert decide(quality(score=70), f, config=CONFIG)["signal"] == "BUY_SMALL"
-    assert decide(quality(score=69.99), f, config=CONFIG)["signal"] not in EXECUTABLE_SIGNALS
+    assert decide(quality(score=65), f, config=CONFIG)["signal"] == "BUY_SMALL"
+    assert decide(quality(score=64.99), f, config=CONFIG)["signal"] not in EXECUTABLE_SIGNALS
 
 
 @pytest.mark.parametrize("status,expected", [("REJECT", "NO_BUY"), ("PROVISIONAL", "WATCH_ONLY"), ("WATCH_QUALITY", "WATCH_ONLY"), ("DATA_INSUFFICIENT", "DATA_INSUFFICIENT")])
@@ -251,7 +274,7 @@ def test_high_score_never_overrides_quality(status, expected):
 
 def test_best_setup_is_max_not_sum_and_missing_rs60_removes_weight():
     f = features(rs60=None)
-    scores = score_setups(f, trade_plan(f, config=CONFIG))
+    scores = score_setups(f, trade_plan(f, config=CONFIG), config=CONFIG)
     assert scores["TREND_PULLBACK"]["available_weight"] == 95
     assert scores["LEADERSHIP_CONTINUATION"]["available_weight"] == 93
     result = decide(quality(), f, config=CONFIG)
@@ -342,7 +365,10 @@ def test_incomplete_daily_bar_rejected_and_sector_unsupported():
     with pytest.raises(ValueError, match="INCOMPLETE"):
         LowEntryScoreV6Strategy().run(data)
     data.attrs["les_v6_context"]["as_of"] = "2026-09-11T15:00+08:00"
-    assert LowEntryScoreV6Strategy().run(data).iloc[-1]["LES v6 Decision"] == "NO_MODEL"
+    report = LowEntryScoreV6Strategy().run(data).iloc[-1]["LES v6 Report"]
+    assert report["decision"]["signal"] == "WATCH"
+    assert "SECTOR_UNSUPPORTED" in report["decision"]["reasons"]
+    assert report["decision"]["safety_cap"] <= 64
 
 
 def execution_report():
@@ -355,7 +381,7 @@ def execution_report():
             "data": {"integrity": "PASS", "completed_history": True, "market_aligned": True, "confidence": 90},
             "parameters": vars(CONFIG),
             "quality": {"status": "PASS", "score": 85, "coverage": dict.fromkeys(
-                ("balance_sheet", "profitability", "growth", "return_on_capital"), 100)},
+                ("balance_sheet", "profitability", "growth", "return_on_capital", "cash_flow"), 100)},
             "downtrend_gate": {"hard_veto": False},
             "decision": result, "technical": f, "valuation": {"interpretation": "NEUTRAL"},
             "entry": dict(result["plan"], trigger_price=100.4, rule="NEXT_SESSION_BREAKS_SIGNAL_HIGH", is_fill=False)}
@@ -406,9 +432,11 @@ def test_raw_ohlcv_to_quality_setup_signal_and_next_session_execution():
     """Synthetic causal example, not a market-performance claim or injected LES score."""
     report = raw_execution_report()
     assert report["quality"]["status"] == "PASS"
-    assert report["decision"]["signal"] == "BUY"
+    assert report["decision"]["signal"] == "BUY_SMALL"
     assert report["decision"]["setup"] == "REVERSAL"
-    assert report["setups"]["les_v6"] >= 80
+    assert report["decision"]["raw_score"] == 89
+    assert report["decision"]["penalty"] == 18
+    assert report["setups"]["les_v6"] == report["decision"]["score"] == 71
     assert report["entry"]["is_fill"] is False
     quote = {"symbol": "2330", "timestamp": "2026-09-14T09:10+08:00", "price": 96.9,
              "bid": 96.8, "ask": 96.9, "restricted": False}

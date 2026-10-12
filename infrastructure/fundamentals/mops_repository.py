@@ -15,6 +15,7 @@ from application.fundamental_ports import FundamentalUnitOfWork
 from config.settings import DATA_DIR
 from config.settings import AppSettings
 from domain.fundamental_derivation import CachedFundamentalBundle
+from domain.fundamental_derivation import CachedFundamentalHeader
 from domain.fundamental_derivation import FiledFinancials
 from domain.fundamental_derivation import FundamentalBundle
 from domain.fundamental_models import FundamentalSnapshot
@@ -90,6 +91,9 @@ class MopsRepository:
 
     def load_filing_catalog(self, symbol, *, as_of, uow=None) -> FilingCatalogState | None:
         return self.queries.load_filing_catalog(symbol, as_of=as_of, uow=uow)
+
+    def load_filing_catalogs_many(self, symbols, *, as_of, uow=None) -> dict[str, FilingCatalogState]:
+        return self.queries.load_filing_catalogs_many(symbols, as_of=as_of, uow=uow)
 
     def save_filing_catalog(self, state: FilingCatalogState, *, uow=None) -> None:
         self.revision_writer.save_filing_catalog(state, uow=uow)
@@ -213,6 +217,12 @@ class MopsRepository:
             connection=connection,
         )
 
+    def load_filings_many(
+        self, symbols: list[str], *, as_of: str,
+        uow: FundamentalUnitOfWork | None = None,
+    ) -> dict[str, list[MopsFiling]]:
+        return self.queries.load_filings_many(symbols, as_of=as_of, uow=uow)
+
     def load_filed_financials(
         self,
         symbol: str,
@@ -220,12 +230,14 @@ class MopsRepository:
         *,
         uow: FundamentalUnitOfWork | None = None,
         connection: sqlite3.Connection | None = None,
+        periods: tuple[tuple[int, int], ...] | None = None,
     ) -> list[FiledFinancials]:
         return self.queries.load_filed_financials(
             symbol,
             as_of,
             uow=uow,
             connection=connection,
+            periods=periods,
         )
 
     def last_full_refresh_epoch(
@@ -375,7 +387,7 @@ class MopsRepository:
         )
 
     @staticmethod
-    def filing_set_hash(filings: list[FiledFinancials]) -> str:
+    def filing_set_hash(filings: list[FiledFinancials] | list[MopsFiling]) -> str:
         return MopsQueryRepository.filing_set_hash(filings)
 
     def load_cached_bundles(
@@ -384,11 +396,29 @@ class MopsRepository:
         *,
         as_of: str,
         derivation_version: str,
+        uow: FundamentalUnitOfWork | None = None,
     ) -> dict[str, CachedFundamentalBundle]:
         return self.queries.load_cached_bundles(
             symbol_sectors,
             as_of=as_of,
             derivation_version=derivation_version,
+            uow=uow,
+        )
+
+    def load_cached_bundle_headers(
+        self, symbol_sectors: Mapping[str, str], *, as_of: str,
+        derivation_version: str, uow: FundamentalUnitOfWork | None = None,
+    ) -> dict[str, CachedFundamentalHeader]:
+        return self.queries.load_cached_bundle_headers(
+            symbol_sectors, as_of=as_of, derivation_version=derivation_version, uow=uow,
+        )
+
+    def record_fundamental_bundle_format(
+        self, symbol: str, snapshot_cache_key: str, sector: str,
+        bundle: FundamentalBundle, *, uow: FundamentalUnitOfWork | None = None,
+    ) -> None:
+        self.revision_writer.record_fundamental_bundle_format(
+            symbol, snapshot_cache_key, sector, bundle, uow=uow,
         )
 
     def mark_active_fundamental_bundle(

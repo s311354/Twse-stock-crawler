@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import time
 from dataclasses import replace
+from math import isfinite
 
+import numpy as np
 import pandas as pd
 
 from domain.features import FeatureFrame, SharedFeaturePipeline
+from domain.numeric_history import metadata_free_frame
+from domain.industry_benchmark import aligned_index
 from domain.fundamental_models import FundamentalSnapshot
 from domain.industry_admission import industry_entry_signal, industry_profile_metadata
 from domain.industry_profiles import IndustryProfileRegistry
@@ -19,7 +25,9 @@ from domain.strategy import Strategy
 from domain.trading_restrictions import restriction_check
 from domain.strategies.low_entry_v6_features import build_features
 from domain.strategies.low_entry_v6_quality import evaluate_quality, number, snapshot_record
-from domain.strategies.low_entry_v6_payoff import payoff_scenarios
+from domain.strategies.low_entry_v6_payoff import payoff_scenarios, resistance_target_research
+from domain.strategies.low_entry_v6_valuation import valuation_context
+from domain.strategies.low_entry_v6_leadership import recognition
 from domain.strategies.low_entry_v6_signals import (
     EXECUTABLE_SIGNALS, SETUPS, LowEntryV6Config, decide, net_reward_risk, risk_pass,
     size_position, trade_plan, technical_observation,
@@ -27,8 +35,25 @@ from domain.strategies.low_entry_v6_signals import (
 
 
 V6_CONTEXT_ATTR = "les_v6_context"
-PARAMETER_VERSION = "2026-09-26-v6-consistent-risk-boundaries"
+PARAMETER_VERSION = "2026-10-04-v6-pit-reported-period-quality-v8"
+
+
+def parameter_version(config: LowEntryV6Config, convex_weights: Mapping | None = None) -> str:
+    if config.decision_policy_version in {3, 4}:
+        from domain.strategies.low_entry_v6_hybrid import model_spec
+        hybrid_version = model_spec(config)["parameter_version"]
+        if convex_weights is not None:
+            if config.decision_policy_version != 3:
+                raise ValueError("CONVEX_WEIGHTS_REQUIRE_BASELINE_HYBRID_POLICY")
+            from domain.strategies.low_entry_v6_weights import FrozenWeights
+            return hybrid_version + ":convex:" + FrozenWeights.from_record(dict(convex_weights)).sha256
+        return hybrid_version
+    return PARAMETER_VERSION
+
+
 V6_OUTPUT_COLUMNS = (
+    "LES v6 Raw Score", "LES v6 Penalty", "LES v6 Adjusted Score", "LES v6 Safety Cap", "LES v6 Final Score",
+    "LES v6 Formal Score", "LES v6 Estimated Score", "LES v6 Score Coverage",
     "LES v6 Score", "LES v6 Decision", "LES v6 Setup", "Quality Score", "Data Confidence",
     "Quality Status", "Falling Knife Veto", "Risk Gate", "建議股數", "LES v6 Report",
 )
@@ -40,7 +65,9 @@ SUPPORTED_SECTORS = {v.name for v in Stocktype} | {
 def attach_low_entry_v6_context(data: pd.DataFrame, *, symbol: str, sector: str,
                                as_of: str, filings: Sequence[Mapping | FundamentalSnapshot],
                                market: str = "TWSE", taiex: pd.DataFrame | None = None,
-                               portfolio: Mapping | None = None, name: str = "") -> pd.DataFrame:
+                               portfolio: Mapping | None = None, name: str = "",
+                               industry_benchmark: Mapping | None = None,
+                               convex_weights: Mapping | None = None) -> pd.DataFrame:
     """Attach explicit PIT context, optionally joining benchmark by exact session date.
 
     Canonical amounts are raw TWD, volume is shares. Financial amounts may use
@@ -59,15 +86,27 @@ def attach_low_entry_v6_context(data: pd.DataFrame, *, symbol: str, sector: str,
         "symbol": str(symbol), "name": name, "sector": sector, "market": market,
         "as_of": as_of, "portfolio": dict(portfolio or {}),
         "filings": [snapshot_record(row, market=market) if isinstance(row, FundamentalSnapshot) else deepcopy(dict(row)) for row in filings],
+        "industry_benchmark": deepcopy(industry_benchmark),
     }
+    if convex_weights is not None:
+        from domain.strategies.low_entry_v6_weights import FrozenWeights
+        result.attrs[V6_CONTEXT_ATTR]["convex_weights"] = FrozenWeights.from_record(dict(convex_weights)).record()
     return result
 
 
 def _clean(value):
     """JSON-safe output: missing numerics are null, never NaN or fabricated zero."""
-    if isinstance(value, Mapping):
+    kind = type(value)
+    # Most financial proof leaves are already Python scalars. Avoid repeated
+    # ABC/attribute checks and float conversion for every such leaf; retain
+    # the generic path for NumPy scalars, readonly mappings and legacy types.
+    if kind in (str, int, bool, type(None)):
+        return value
+    if kind is float:
+        return value if isfinite(value) else None
+    if kind is dict or isinstance(value, Mapping):
         return {str(key): _clean(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if kind in (list, tuple) or isinstance(value, (list, tuple)):
         return [_clean(item) for item in value]
     if hasattr(value, "item"):
         value = value.item()
@@ -112,21 +151,32 @@ class LowEntryScoreV6Strategy(Strategy):
     def run(self, data: pd.DataFrame) -> pd.DataFrame:
         return self.run_with_features(data, SharedFeaturePipeline().build(data))
 
-    def run_latest(self, data: pd.DataFrame) -> pd.DataFrame:
+    def run_latest(self, data: pd.DataFrame, *, features: FeatureFrame | None = None,
+                   context: Mapping | None = None) -> pd.DataFrame:
         """Daily snapshot: warm indicators over history, evaluate only at explicit as_of.
 
         Historical run() retains close-time PIT evaluation. Snapshot availability
         may be after the final close, e.g. a financial filing published that evening.
         """
-        return self.run_with_features(data, SharedFeaturePipeline().build(data), latest_only=True)
+        return self.run_with_features(data, features if features is not None else SharedFeaturePipeline().build(data),
+                                      latest_only=True, context=context)
 
-    def run_with_features(self, data: pd.DataFrame, features: FeatureFrame, *, latest_only: bool = False) -> pd.DataFrame:
+    def run_with_features(self, data: pd.DataFrame, features: FeatureFrame, *, latest_only: bool = False,
+                          context: Mapping | None = None) -> pd.DataFrame:
+        context = data.attrs.get(V6_CONTEXT_ATTR, {}) if context is None else context
+        observer = context.get("_stage")
+        stage = observer if callable(observer) else lambda name: nullcontext()
+        data = metadata_free_frame(data)
         result = (data.tail(1) if latest_only else data).copy(deep=True)
         if data.empty:
             for column in V6_OUTPUT_COLUMNS:
                 result[column] = pd.Series(index=result.index, dtype=object)
             return result
-        context = data.attrs.get(V6_CONTEXT_ATTR, {})
+        if context.get("convex_weights") is not None:
+            from domain.strategies.low_entry_v6_weights import FrozenWeights
+            if self.config.decision_policy_version != 3:
+                raise ValueError("CONVEX_WEIGHTS_REQUIRE_HYBRID_POLICY")
+            FrozenWeights.from_record(context["convex_weights"]).require_compatible(self.config, context.get("as_of"))
         as_of = pd.to_datetime(context.get("as_of"), utc=True, errors="coerce")
         if "Date" not in data or pd.isna(as_of):
             raise ValueError("LES v6 requires Date and an explicit as_of timestamp")
@@ -140,14 +190,18 @@ class LowEntryScoreV6Strategy(Strategy):
             raise ValueError("INCOMPLETE_OR_FUTURE_DAILY_BAR")
         if "Complete" in data and not data["Complete"].eq(True).all():
             raise ValueError("INCOMPLETE_DAILY_BAR")
-        frame = build_features(data, features)
+        with stage("les_feature_extension"):
+            frame = build_features(data, features)
         rows = []
-        for position, (_, feature) in enumerate(frame.iterrows()):
-            if latest_only and position != len(frame) - 1:
-                continue
+        positions = (len(frame) - 1,) if latest_only else range(len(frame))
+        for position in positions:
+            feature = frame.iloc[position]
             decision_time = as_of if latest_only else closes.iloc[position].tz_convert("UTC")
-            quality = evaluate_quality(context.get("filings", []), symbol=str(context.get("symbol", "")),
-                                       market=context.get("market", "TWSE"), as_of=decision_time)
+            quality_stage = context.get("_quality_stage")
+            with quality_stage() if callable(quality_stage) else nullcontext():
+                quality = evaluate_quality(context.get("filings", []), symbol=str(context.get("symbol", "")),
+                                           market=context.get("market", "TWSE"), as_of=decision_time,
+                                           preprocessing=context.get("_quality_preprocessing"))
             risk_evidence = context.get("hard_risk_evidence", {})
             risk_at = pd.to_datetime(risk_evidence.get("available_at"), utc=True, errors="coerce")
             if pd.notna(risk_at) and risk_at <= decision_time and risk_evidence.get("reasons"):
@@ -158,6 +212,15 @@ class LowEntryScoreV6Strategy(Strategy):
                 elif pd.notna(risk_at) and risk_at <= decision_time and risk_evidence.get("review_reasons"):
                     quality = replace(quality, status="DATA_INSUFFICIENT", reasons=tuple(risk_evidence["review_reasons"]))
             f = feature.to_dict()
+            if self.config.decision_policy_version in {3, 4}:
+                # Added only to the Hybrid contract; legacy report payloads stay stable.
+                prior_rsi = number(frame["rsi14"].iloc[position - 1]) if position else None
+                current_rsi = number(f.get("rsi14"))
+                f["rsi_change"] = current_rsi - prior_rsi if current_rsi is not None and prior_rsi is not None else None
+                f["score_availability"] = dict(f.get("score_availability", {}))
+                f["score_availability"].update(rsi_change=f["rsi_change"] is not None,
+                    rsi14=current_rsi is not None,
+                    volume_ma20_strict=f["score_availability"].get("volume_ratio", False))
             restriction = None
             if "restriction_evidence" in context:
                 restriction = restriction_check(
@@ -167,19 +230,43 @@ class LowEntryScoreV6Strategy(Strategy):
                     symbol=str(context.get("symbol", "")),
                 )
                 f["restricted"] = restriction["restricted"]
+                if self.config.decision_policy_version in {3, 4}:
+                    # Daily raw bars intentionally have no restriction flag.
+                    # Replace their availability mask only after the separate
+                    # cutoff/market-aware evidence check, never from a quote or
+                    # the absence of a symbol in an unverified list.
+                    f["score_availability"]["restricted"] = restriction["restricted"] is not None
             eps = quality.metrics.get("basic_eps_ttm")
             history = pd.to_numeric(frame["pe"].iloc[max(0, position - 59):position + 1], errors="coerce")
             valuation = valuation_evidence(f.get("pe"), history, eps)
-            decision = decide(quality, f, valuation=valuation["interpretation"], config=self.config)
             sector = str(context.get("sector", "UNKNOWN")).upper()
+            start = max(0, position - 60)
+            industry_index, industry_evidence = aligned_index(context.get("industry_benchmark"),
+                dates.iloc[start:position + 1], symbol=str(context.get("symbol", "")),
+                sector=sector, market=context.get("market", "TWSE"), as_of=str(decision_time))
+            stock = frame["close"].iloc[start:position + 1]
+            f["score_availability"] = dict(f.get("score_availability", {}))
+            for period in (20, 60):
+                paired = pd.concat([stock.tail(period + 1), industry_index.tail(period + 1)], axis=1)
+                known = len(paired) == period + 1 and np.isfinite(paired).all().all() and paired.gt(0).all().all()
+                f[f"industry_rs{period}"] = (paired.iloc[-1, 0] / paired.iloc[0, 0]
+                    - paired.iloc[-1, 1] / paired.iloc[0, 1]) if known else None
+                f["score_availability"][f"industry_rs{period}"] = known
+            f["industry_status"] = industry_evidence["status"]
             profile = IndustryProfileRegistry.resolve(sector)
-            if profile is None and sector not in SUPPORTED_SECTORS:
+            industry_mode = industry_profile_metadata(profile).get("mode", "UNSUPPORTED") if profile else "UNSUPPORTED"
+            with stage("les_decision"):
+                decision = decide(quality, f, valuation=valuation["interpretation"], config=self.config,
+                                  industry_mode=industry_mode, convex_weights=context.get("convex_weights"),
+                                  as_of=decision_time.isoformat())
+            if self.config.decision_policy_version == 1 and profile is None and sector not in SUPPORTED_SECTORS:
                 decision.update(signal="NO_MODEL", reasons=["SECTOR_UNSUPPORTED"], risk_fraction=0.)
                 decision["technical_observation"] = technical_observation(
                     quality, f, decision, valuation=valuation["interpretation"], config=self.config,
                 )
             shadow_signal = decision["signal"]
-            admitted = industry_entry_signal(shadow_signal, profile)
+            admitted = (industry_entry_signal(shadow_signal, profile)
+                        if self.config.decision_policy_version == 1 else shadow_signal)
             if admitted != shadow_signal:
                 decision.update(signal=admitted, risk_fraction=0., position_multiplier=0.)
                 decision["reasons"] = list(decision["reasons"]) + [
@@ -189,9 +276,14 @@ class LowEntryScoreV6Strategy(Strategy):
             shares = size_position(decision, portfolio_value=account.get("value"), available_cash=account.get("available_cash"),
                                    intended_weight=account.get("intended_weight"), portfolio_capacity_weight=account.get("capacity_weight"),
                                    amount_ma20=f.get("amount_ma20"), config=self.config)
+            with stage("les_portfolio_valuation"):
+                portfolio_valuation = valuation_context(context.get("filings", []),
+                    symbol=str(context.get("symbol", "")), market=context.get("market", "TWSE"),
+                    as_of=decision_time, quality=quality,
+                    preprocessing=context.get("_quality_preprocessing"))
             report = {
                 "symbol": str(context.get("symbol", "")), "name": context.get("name", ""),
-                "model_version": self.version, "parameter_version": PARAMETER_VERSION,
+                "model_version": self.version, "parameter_version": parameter_version(self.config, context.get("convex_weights")),
                 "parameters": vars(self.config),
                 "industry_profile": dict(industry_profile_metadata(profile), shadow_signal=shadow_signal),
                 "signal_date": dates.iloc[position].date().isoformat(), "decision_time": decision_time.isoformat(),
@@ -204,9 +296,13 @@ class LowEntryScoreV6Strategy(Strategy):
                             "coverage": quality.coverage, "metrics": quality.metrics,
                             "warnings": quality.warnings, "reasons": quality.reasons, "optional": quality.optional},
                 "valuation": valuation,
+                "portfolio_valuation": portfolio_valuation,
                 "market": {"regime": f["market_regime"], "exchange": context.get("market", "TWSE")},
                 "relative_strength": dict({key: f[key] for key in ("rs20", "rs60", "rs_slope5")}, correction_resilience=f["resilience"]),
-                "setups": dict(decision["setups"], **{f"{key.lower()}_score": value["score"] for key, value in decision["setups"].items()}, selected_setup=decision["setup"], les_v6=decision["score"]),
+                "leadership": recognition(f), "industry_benchmark": industry_evidence,
+                "setups": (dict(selection=decision["selection"], selected_setup=decision["setup"])
+                    if self.config.decision_policy_version in {3, 4} else
+                    dict(decision["setups"], **{f"{key.lower()}_score": value["score"] for key, value in decision["setups"].items()}, selected_setup=decision["setup"], les_v6=decision["score"])),
                 "downtrend_gate": {"hard_veto": bool(decision["hard_vetoes"]), "reasons": decision["hard_vetoes"],
                                    "warnings": [reason for reason, active in (
                                        ("ATR_EXPANSION", number(f.get("atr_expansion")) is not None and f["atr_expansion"] > 1.2),
@@ -218,6 +314,9 @@ class LowEntryScoreV6Strategy(Strategy):
                               earliest_execution="NEXT_TRADING_SESSION", is_fill=False),
                 "payoff_scenarios": payoff_scenarios(decision["plan"], buy_cost_rate=self.config.buy_fee_rate,
                                                      sell_cost_rate=self.config.sell_cost_rate),
+                "target_policy_research": resistance_target_research(
+                    decision["plan"], f, buy_cost_rate=self.config.buy_fee_rate,
+                    sell_cost_rate=self.config.sell_cost_rate),
                 "liquidity": {"passed": decision["plan"]["liquidity_pass"], "spread": f.get("spread"), "trading_value_ma20": f.get("amount_ma20")},
                 "decision": {key: value for key, value in decision.items() if key not in {"setups", "plan"}},
                 "sizing": {"indicative_shares": shares, "portfolio_data_pass": shares > 0,
@@ -226,19 +325,55 @@ class LowEntryScoreV6Strategy(Strategy):
             if context.get("historical_replay") is True:
                 report["evaluation_mode"] = "HISTORICAL_REPLAY"
                 report["replay_as_of"] = str(decision_time)
+            if context.get("convex_weights") is not None:
+                # Weight provenance must not erase the historical replay boundary.
+                report["weight_evaluation_mode"] = "AS_OF_SNAPSHOT" if latest_only else "CLOSE_TIME_REPLAY"
+                report.setdefault("evaluation_mode", "CONVEX_WEIGHT_SNAPSHOT" if latest_only else "CONVEX_WEIGHT_CLOSE_TIME_REPLAY")
             report["decision"]["conviction"] = "HIGH" if decision["signal"] == "BUY" else "STARTER" if decision["signal"] == "BUY_SMALL" else "NONE"
             if restriction is not None:
                 report["data"].update(restriction_check=restriction,
                                       restriction_evidence=deepcopy(context["restriction_evidence"]))
+            with stage("les_report_normalize"):
+                clean_report = _clean(report)
             rows.append({
+                "LES v6 Raw Score": decision.get("raw_score"),
+                "LES v6 Penalty": decision.get("penalty"),
+                "LES v6 Adjusted Score": decision.get("adjusted_score"),
+                "LES v6 Safety Cap": decision.get("safety_cap"),
+                "LES v6 Final Score": decision.get("final_score"),
+                "LES v6 Formal Score": decision["formal_score"],
+                "LES v6 Estimated Score": decision["estimated_score"],
+                "LES v6 Score Coverage": decision["score_coverage"],
                 "LES v6 Score": decision["score"], "LES v6 Decision": decision["signal"], "LES v6 Setup": decision["setup"],
                 "Quality Score": quality.score, "Data Confidence": quality.confidence, "Quality Status": quality.status,
                 "Falling Knife Veto": bool(decision["hard_vetoes"]), "Risk Gate": decision["risk_gate"],
-                "建議股數": shares, "LES v6 Report": _clean(report),
+                "建議股數": shares, "LES v6 Report": clean_report,
             })
         for column in V6_OUTPUT_COLUMNS:
             result[column] = [row[column] for row in rows]
         return result
+
+
+class LowEntryScoreV6HybridStrategy(LowEntryScoreV6Strategy):
+    """Context-first fixed factors, explicitly deployed by the daily pipeline."""
+    name = "low_entry_score_v6_hybrid"
+    description = "Context-first six-factor score; uncalibrated research candidate"
+
+    def __init__(self, config: LowEntryV6Config | None = None):
+        from domain.strategies.low_entry_v6_signals import relaxed_hybrid_config
+        config = config or relaxed_hybrid_config()
+        if config.decision_policy_version not in {3, 4}:
+            raise ValueError("HYBRID_PLUGIN_REQUIRES_POLICY_3_OR_4")
+        super().__init__(config)
+
+
+class LowEntryScoreV6HybridLegacyStrategy(LowEntryScoreV6HybridStrategy):
+    """Explicit 75/65 comparison policy; never migrate archived decisions."""
+    name = "low_entry_score_v6_hybrid_legacy"
+    description = "Baseline Hybrid 75/65 with original six-factor budgets"
+
+    def __init__(self):
+        super().__init__(LowEntryV6Config(decision_policy_version=3))
 
 
 def assess_execution(report: Mapping, quote: Mapping, *, now: str,
@@ -250,15 +385,23 @@ def assess_execution(report: Mapping, quote: Mapping, *, now: str,
     Portfolio capacity already incorporates holdings, pending orders, PAE,
     sector and correlation constraints; no capacity is inferred from cash.
     """
-    config = config or LowEntryV6Config()
+    from domain.strategies.low_entry_v6_report import report_config, report_weights
     def skip(reason):
         return {"action": "SKIP", "shares": 0, "reason": reason}
+    try:
+        config = report_config(report, config)
+    except (TypeError, ValueError):
+        return skip("EXECUTION_CONFIG_MISMATCH")
     if report.get("evaluation_mode") == "HISTORICAL_REPLAY":
         return skip("HISTORICAL_REPLAY_NOT_EXECUTABLE")
     decision = deepcopy(report.get("decision", {}))
     if decision.get("signal") not in EXECUTABLE_SIGNALS or report.get("quality", {}).get("status") != "PASS" or report.get("downtrend_gate", {}).get("hard_veto") is not False or hard_risk:
         return skip("INELIGIBLE_PUBLISHED_SIGNAL_OR_HARD_RISK")
-    if report.get("parameter_version") != PARAMETER_VERSION:
+    try:
+        expected_version = parameter_version(config, report_weights(report))
+    except (TypeError, ValueError, KeyError):
+        return skip("PARAMETER_VERSION_MISMATCH")
+    if report.get("parameter_version") != expected_version:
         return skip("PARAMETER_VERSION_MISMATCH")
     if report.get("parameters") != vars(config):
         return skip("EXECUTION_CONFIG_MISMATCH")
@@ -308,6 +451,9 @@ def assess_execution(report: Mapping, quote: Mapping, *, now: str,
         return skip("TRIGGER_NOT_REACHED")
     price = max(price, ask)
     f = dict(report["technical"], spread=(ask - bid) / ((ask + bid) / 2), restricted=False)
+    if config.decision_policy_version in {3, 4}:
+        from domain.strategies.low_entry_v6_hybrid import known_features
+        f = known_features(f)
     atr = number(f.get("atr14"))
     if atr is None or atr <= 0:
         return skip("INVALID_ATR")
@@ -323,7 +469,10 @@ def assess_execution(report: Mapping, quote: Mapping, *, now: str,
         plan["target_price"] = target
         plan["reward_risk"] = (target - price) / (price - plan["stop_price"]) if plan["stop_price"] is not None and price > plan["stop_price"] else None
     plan["net_reward_risk"] = net_reward_risk(plan, config)
-    valid, _, _ = risk_pass(decision["setup"], decision["signal"], f, plan, report["valuation"]["interpretation"], config)
+    risk_setup = decision["setup"]
+    if config.decision_policy_version in {3, 4} and risk_setup == "NO_CLEAR_CONTEXT":
+        risk_setup = "REVERSAL"
+    valid, _, _ = risk_pass(risk_setup, decision["signal"], f, plan, report["valuation"]["interpretation"], config)
     if not valid or not plan["liquidity_pass"]:
         return skip("REPRICED_RISK_OR_LIQUIDITY_FAIL")
     decision["plan"] = plan

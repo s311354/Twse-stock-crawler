@@ -135,11 +135,12 @@ def make_report(f, monkeypatch):
     f = dict(f, pe=None)
     monkeypatch.setattr(strategy_module, "build_features", lambda data, shared: pd.DataFrame([f]))
     complete_quality = quality(coverage=dict.fromkeys(
-        ("balance_sheet", "profitability", "growth", "return_on_capital"), 100.))
+        ("balance_sheet", "profitability", "growth", "return_on_capital", "cash_flow"), 100.))
     monkeypatch.setattr(strategy_module, "evaluate_quality", lambda *a, **kw: complete_quality)
     data = strategy_module.attach_low_entry_v6_context(bars(1), symbol="2330", sector="24",
             as_of="2026-09-11T15:00+08:00", filings=[], portfolio=ACCOUNT)
-    return strategy_module.LowEntryScoreV6Strategy().run_latest(data).iloc[-1]["LES v6 Report"]
+    # These regressions pin the former forming/setup admission policy explicitly.
+    return strategy_module.LowEntryScoreV6Strategy(config=CONFIG).run_latest(data).iloc[-1]["LES v6 Report"]
 
 
 @pytest.mark.parametrize("setup", signals.SETUPS)

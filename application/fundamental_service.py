@@ -6,10 +6,12 @@ import datetime as dt
 import logging
 import time
 from collections.abc import Callable
+from dataclasses import fields
 
 import pandas as pd
 
 from application.fundamental_deriver import FundamentalDeriver
+from application.daily_performance import count_work
 from application.mops_refresh_control import MopsRefreshControl, MopsRefreshPolicy, RefreshDeferred
 from application.fundamental_point_in_time import PointInTimeResolver
 from application.fundamental_refresh import RefreshPlanner
@@ -30,6 +32,7 @@ from domain.errors import DataErrorCategory
 from domain.errors import NoDataError
 from domain.fundamental_derivation import FUNDAMENTAL_DERIVATION_VERSION
 from domain.fundamental_derivation import CachedFundamentalBundle
+from domain.fundamental_derivation import CachedFundamentalHeader
 from domain.fundamental_derivation import FundamentalBundle
 from domain.fundamental_derivation import derive_fundamentals
 from domain.fundamental_models import FilingAnnouncement
@@ -118,53 +121,147 @@ class MopsFundamentalService:
         ] = {}
         self._individual_scope_fallback_symbols: set[str] = set()
         self._access_blocked_cache_fallback_symbols: set[str] = set()
+        self._history_cache_progress: dict[str, tuple[bool, int]] = {}
 
     def begin_run(self) -> None:
+        self._history_cache_progress.clear()
         self.refresh_control.begin_run()
         reset = getattr(self.filing_catalog, "begin_refresh_run", None)
         if callable(reset):
             reset()
 
+    def consume_history_cache_summary(self) -> dict[str, int]:
+        """Latest progress per refreshed issuer, excluding untouched cache hits."""
+        progress = tuple(self._history_cache_progress.values())
+        self._history_cache_progress.clear()
+        complete = sum(done for done, _ in progress)
+        return {
+            "completed_companies": complete,
+            "partial_companies": len(progress) - complete,
+            "pending_work": sum(pending for _, pending in progress),
+        }
+
     def migrate_local_cache(self, symbols: list[str], *, signal_date: str, sector: str) -> int:
         """Convert PIT-eligible cached facts before *any* MOPS backfill in this run."""
         signal = self.point_in_time.effective_signal_time(pd.to_datetime(signal_date, utc=True))
         sectors = {symbol: self._resolve_sector(symbol, sector) for symbol in dict.fromkeys(symbols)}
-        cached = self.repository.load_cached_bundles(
-            sectors, as_of=signal.isoformat(), derivation_version=FUNDAMENTAL_DERIVATION_VERSION,
-        )
+        with self.repository.unit_of_work() as uow:
+            cached = self._load_active_entries(
+                sectors, as_of=signal.isoformat(), derivation_version=FUNDAMENTAL_DERIVATION_VERSION, uow=uow,
+            )
+            identities = self.repository.load_filings_many(list(sectors), as_of=signal.isoformat(), uow=uow)
         migrated = 0
         for symbol in sectors:
             existing = cached.get(symbol)
-            if (existing is not None and "les_v6_mops_filings" in existing.bundle.snapshot
-                    and existing.bundle.snapshot.get("les_v6_filing_schema_version") == V6_FILING_SCHEMA_VERSION):
+            if existing is not None and existing.filing_set_sha256 == self.repository.filing_set_hash(identities[symbol]):
+                if self._current_format(existing) and (
+                    not isinstance(existing, CachedFundamentalHeader)
+                    or existing.snapshot_cache_key == self.fundamental_deriver.snapshot_cache_key(existing.filing_set_sha256)
+                ):
+                    count_work("fundamental_migration_header_skips")
+                    continue
+                if isinstance(existing, CachedFundamentalHeader) and existing.has_mops_filings is None:
+                    # Older rows have no indexed format. Inspect one row at a
+                    # time, then index it without rewriting its JSON/times.
+                    with self.repository.unit_of_work() as uow:
+                        inspected = self._hydrate_entry(existing, uow=uow)
+                        if inspected is not None:
+                            self.repository.record_fundamental_bundle_format(
+                                symbol, existing.snapshot_cache_key, existing.sector,
+                                inspected.bundle, uow=uow,
+                            )
+                            count_work("fundamental_legacy_format_inspections")
+                            if self._current_format(inspected):
+                                continue
+            if not identities[symbol]:
                 continue
             with self.repository.unit_of_work() as uow:
                 try:
-                    self._load_cached_bundle(symbol, parsed_signal=signal, sector=sector, uow=uow)
+                    self._load_cached_bundle(symbol, parsed_signal=signal, sector=sector, uow=uow,
+                                             filings=identities[symbol])
                 except NoDataError:
                     continue
                 migrated += 1
         return migrated
 
+    def _load_active_entries(self, sectors, *, as_of, derivation_version, uow):
+        loader = getattr(self.repository, "load_cached_bundle_headers", None)
+        if callable(loader):
+            return loader(sectors, as_of=as_of, derivation_version=derivation_version, uow=uow)
+        # Preserve compatibility for existing alternate repositories.
+        return self.repository.load_cached_bundles(
+            sectors, as_of=as_of, derivation_version=derivation_version, uow=uow,
+        )
+
+    @staticmethod
+    def _current_format(entry):
+        if isinstance(entry, CachedFundamentalHeader):
+            return entry.has_mops_filings is True and entry.filing_schema_version == V6_FILING_SCHEMA_VERSION
+        return ("les_v6_mops_filings" in entry.bundle.snapshot
+                and entry.bundle.snapshot.get("les_v6_filing_schema_version") == V6_FILING_SCHEMA_VERSION)
+
+    def _hydrate_entry(self, entry, *, uow):
+        if not isinstance(entry, CachedFundamentalHeader):
+            return entry
+        # The active pointer is not sufficient; its content key must match the
+        # currently selected filing identities and derivation version.
+        expected_key = self.fundamental_deriver.snapshot_cache_key(entry.filing_set_sha256)
+        if entry.snapshot_cache_key != expected_key:
+            return None
+        bundle = self.repository.load_fundamental_bundle(
+            entry.symbol, entry.snapshot_cache_key, entry.sector, uow=uow,
+        )
+        if bundle is None:
+            return None
+        return CachedFundamentalBundle(
+            **{field.name: getattr(entry, field.name) for field in fields(CachedFundamentalBundle)
+               if field.name != "bundle"}, bundle=bundle,
+        )
+
     def reset_scope_fallback_diagnostics(self) -> None:
         self._individual_scope_fallback_symbols.clear()
 
-    def inspect_local_evidence(self, symbols: list[str], *, signal_date: str, market: str = "TWSE") -> dict[str, dict]:
+    def inspect_local_evidence(self, symbols: list[str], *, signal_date: str, market: str = "TWSE",
+                               sector: str = "") -> dict[str, dict]:
         """Inspect stored source facts/batch snapshots only; never download to diagnose."""
         if market not in {"TWSE", "TPEX"}:
             raise ValueError("Unsupported fundamental evidence market")
         signal = self.point_in_time.effective_signal_time(pd.to_datetime(signal_date, utc=True))
         result = {}
+        symbols = list(dict.fromkeys(symbols))
+        # Inspection is local-only: do not fetch today's company master merely
+        # to look for a compatible bundle. Migration has normally resolved it.
+        fallback = sector if sector.isdigit() else ""
+        sectors = {symbol: (self._company_sectors or {}).get(symbol, fallback) for symbol in symbols}
         with self.repository.unit_of_work() as uow:
-            for symbol in dict.fromkeys(symbols):
-                filings = self.repository.load_filed_financials(symbol, signal.isoformat(), uow=uow)
+            identities = self.repository.load_filings_many(symbols, as_of=signal.isoformat(), uow=uow)
+            cached = self._load_active_entries(
+                sectors, as_of=signal.isoformat(), derivation_version=FUNDAMENTAL_DERIVATION_VERSION, uow=uow,
+            )
+            histories = self.repository.load_financial_batch_snapshots_many(
+                symbols, as_of=signal.isoformat(), uow=uow,
+            ) if market == "TWSE" else {}
+            for symbol in symbols:
+                entry = cached.get(symbol)
+                if entry is not None and entry.filing_set_sha256 == self.repository.filing_set_hash(identities[symbol]):
+                    entry = self._hydrate_entry(entry, uow=uow)
+                else:
+                    entry = None
+                if (entry is not None
+                        and entry.filing_set_sha256 == self.repository.filing_set_hash(identities[symbol])
+                        and entry.bundle.snapshot.get("les_v6_filing_schema_version") == V6_FILING_SCHEMA_VERSION
+                        and "les_v6_mops_filings" in entry.bundle.snapshot):
+                    filing_records = entry.bundle.snapshot["les_v6_mops_filings"]
+                else:
+                    filings = self.repository.load_filed_financials(symbol, signal.isoformat(), uow=uow) if identities[symbol] else []
+                    filing_records = [ixbrl_record(symbol, filing) for filing in filings]
                 # The batch repository currently contains TWSE observations only.
                 # MOPS issuer filings are shared, but a TWSE snapshot cannot
                 # certify an OTC issuer or hide its missing-quarter backfill.
-                batches = self.repository.load_financial_batch_snapshots(symbol, as_of=signal.isoformat(), uow=uow) if market == "TWSE" else []
+                batches = histories.get(symbol, [])
                 twse = [snapshot_record(item) for item in batches]
                 records = combine_filing_sources(
-                    [dict(ixbrl_record(symbol, filing), market=market) for filing in filings],
+                    [dict(filing, market=market) for filing in filing_records],
                     twse, as_of=signal,
                 )
                 diagnostic = verification_diagnostics(records, symbol=symbol, as_of=signal, market=market)
@@ -268,52 +365,48 @@ class MopsFundamentalService:
             if symbol
         }
         preload_started = time.perf_counter()
-        cached = self.repository.load_cached_bundles(
-            symbol_sectors,
-            as_of=effective_signal.isoformat(),
-            derivation_version=FUNDAMENTAL_DERIVATION_VERSION,
-        )
-        eligible: dict[
-            str,
-            tuple[CachedFundamentalBundle, FundamentalSnapshot | None],
-        ] = {}
-        for symbol, entry in cached.items():
-            if ("les_v6_mops_filings" not in entry.bundle.snapshot
-                    or entry.bundle.snapshot.get("les_v6_filing_schema_version") != V6_FILING_SCHEMA_VERSION):
-                continue
-            periods = set()
-            for filing in entry.bundle.snapshot["les_v6_mops_filings"]:
-                period_end = pd.to_datetime(filing.get("period_end"), errors="coerce")
-                available_at = pd.to_datetime(filing.get("available_at"), utc=True, errors="coerce")
-                if pd.notna(period_end) and pd.notna(available_at) and available_at <= effective_signal:
-                    periods.add((period_end.year, period_end.quarter))
-            if not periods or not self.planner.history_periods(max(periods), history_years).issubset(periods):
-                continue
-            if entry.annual_history_years < history_years:
-                continue
-            if self.planner.is_monthly_refresh_due(
-                entry.full_catalog_checked_at_epoch,
-                effective_signal.to_pydatetime(),
-            ):
-                continue
-            if self._daily_corrections.get(symbol):
-                continue
-            current_batch = self.snapshot_assembler.eligible_batch_snapshot(
-                self._daily_financials,
-                symbol,
-                effective_signal,
-            )
-            if (
-                current_batch is not None
-                and current_batch.period > entry.latest_period
-            ):
-                continue
-            eligible[symbol] = (entry, current_batch)
-
         reusable: dict[str, FundamentalBundle] = {}
-        eligible_symbols = list(eligible)
-        if eligible_symbols:
-            with self.repository.unit_of_work() as uow:
+        with self.repository.unit_of_work() as uow:
+            cached = self._load_active_entries(
+                symbol_sectors, as_of=effective_signal.isoformat(),
+                derivation_version=FUNDAMENTAL_DERIVATION_VERSION, uow=uow,
+            )
+            identities = self.repository.load_filings_many(
+                list(cached), as_of=effective_signal.isoformat(), uow=uow,
+            )
+            catalog_loader = getattr(self.repository, "load_filing_catalogs_many", None)
+            catalogs = (catalog_loader(list(cached), as_of=effective_signal.isoformat(), uow=uow)
+                        if callable(catalog_loader) else {})
+            # Reject stale/incomplete/monthly-due/corrected identities BEFORE
+            # reading JSON. Full format/period validation still follows hydration.
+            hydrated = {}
+            for symbol, entry in cached.items():
+                if isinstance(entry, CachedFundamentalHeader):
+                    selected = identities.get(symbol, [])
+                    current_batch = self.snapshot_assembler.eligible_batch_snapshot(
+                        self._daily_financials, symbol, effective_signal,
+                    )
+                    reasons = self._preload_reasons(symbol, entry, selected, current_batch,
+                        effective_signal=effective_signal, history_years=history_years,
+                        catalog=catalogs.get(symbol))
+                    if any(reasons.values()):
+                        count_work("fundamental_preload_header_rejections")
+                        # Overlapping reasons, not mutually exclusive issuers.
+                        # This diagnoses the 407 header rejects without claiming
+                        # that incomplete evidence is safe to preload.
+                        for reason, rejected in reasons.items():
+                            if rejected:
+                                count_work("fundamental_preload_reject_" + reason)
+                        continue
+                inspected = self._hydrate_entry(entry, uow=uow)
+                if inspected is not None:
+                    hydrated[symbol] = inspected
+            eligible = self._eligible_cached_bundles(
+                hydrated, identities, effective_signal=effective_signal, history_years=history_years,
+                catalogs=catalogs,
+            )
+            eligible_symbols = list(eligible)
+            if eligible_symbols:
                 histories = (
                     self.repository.load_financial_batch_snapshots_many(
                         eligible_symbols,
@@ -357,7 +450,15 @@ class MopsFundamentalService:
                             uow=uow,
                         )
                     snapshot = dict(bundle.snapshot)
-                    snapshot["remote_refresh_skipped"] = True
+                    # Preserve the original route's full output: nominally
+                    # complete snapshots already carried this preload marker;
+                    # newly reusable partial catalogs previously used load(),
+                    # whose local hit does not add it. Work completeness must
+                    # not change financial evidence or operational metadata.
+                    if not any(self._preload_reasons(symbol, entry, identities[symbol], current_batch,
+                            effective_signal=effective_signal, history_years=history_years,
+                            catalog=None).values()):
+                        snapshot["remote_refresh_skipped"] = True
                     reusable[symbol] = FundamentalBundle(
                         annual_fundamentals=bundle.annual_fundamentals,
                         snapshot=snapshot,
@@ -380,6 +481,62 @@ class MopsFundamentalService:
             },
         )
         return reusable
+
+    def _eligible_cached_bundles(
+        self, cached: dict[str, CachedFundamentalBundle], identities: dict[str, list[FilingRecord]],
+        *, effective_signal: pd.Timestamp, history_years: int,
+        catalogs=None,
+    ) -> dict[str, tuple[CachedFundamentalBundle, FundamentalSnapshot | None]]:
+        """Metadata-only invalidation; completeness never substitutes for Quality."""
+        eligible = {}
+        for symbol, entry in cached.items():
+            if ("les_v6_mops_filings" not in entry.bundle.snapshot
+                    or entry.bundle.snapshot.get("les_v6_filing_schema_version") != V6_FILING_SCHEMA_VERSION
+                    or not identities[symbol]
+                    or entry.filing_set_sha256 != self.repository.filing_set_hash(identities[symbol])):
+                continue
+            periods = set()
+            for filing in entry.bundle.snapshot["les_v6_mops_filings"]:
+                period_end = pd.to_datetime(filing.get("period_end"), errors="coerce")
+                available_at = pd.to_datetime(filing.get("available_at"), utc=True, errors="coerce")
+                if pd.notna(period_end) and pd.notna(available_at) and available_at <= effective_signal:
+                    periods.add((period_end.year, period_end.quarter))
+            current_batch = self.snapshot_assembler.eligible_batch_snapshot(
+                self._daily_financials, symbol, effective_signal,
+            )
+            catalog = (catalogs or {}).get(symbol)
+            if (not periods or not {(item.fiscal_year, item.quarter) for item in identities[symbol]}.issubset(periods)
+                    or any(self._preload_reasons(symbol, entry, identities[symbol], current_batch,
+                        effective_signal=effective_signal, history_years=history_years, catalog=catalog).values())):
+                continue
+            eligible[symbol] = (entry, current_batch)
+        return eligible
+
+    def _pending_daily_corrections(self, symbol, cached, catalog):
+        pending = self.refresh_planner.event_corrected_periods(symbol, cached, self._daily_corrections)
+        if catalog is not None:
+            acknowledged = {(event.fiscal_year, event.quarter): event.announced_on
+                            for event in catalog.verified_corrections}
+            pending = {period for period in pending if self._daily_corrections[symbol][period].announced_on
+                       > acknowledged.get(period, "")}
+        return pending
+
+    def _preload_reasons(self, symbol, entry, selected, current_batch, *, effective_signal,
+                         history_years, catalog):
+        periods = {(item.fiscal_year, item.quarter) for item in selected}
+        complete = (self.catalog_refresh.locally_complete(catalog, selected,
+            signal=effective_signal, history_years=history_years) if catalog is not None else
+            bool(periods) and self.planner.history_periods(max(periods), history_years).issubset(periods))
+        checked_epoch = int(pd.Timestamp(catalog.checked_at).timestamp()) if catalog is not None else entry.full_catalog_checked_at_epoch
+        return {
+            "selection": not selected or entry.filing_set_sha256 != self.repository.filing_set_hash(selected),
+            "format": isinstance(entry, CachedFundamentalHeader) and entry.has_mops_filings is not None and not self._current_format(entry),
+            "periods": not complete,
+            "annual_history": catalog is None and entry.annual_history_years < history_years,
+            "monthly_due": self.planner.is_monthly_refresh_due(checked_epoch, effective_signal.to_pydatetime()),
+            "correction": bool(self._pending_daily_corrections(symbol, selected, catalog)),
+            "new_batch_period": current_batch is not None and current_batch.period > entry.latest_period,
+        }
 
     def load(
         self,
@@ -425,23 +582,7 @@ class MopsFundamentalService:
                 symbol,
                 uow=uow,
             )
-            event_corrected_periods = (
-                self.refresh_planner.event_corrected_periods(
-                    symbol,
-                    cached_filings,
-                    self._daily_corrections,
-                )
-            )
-            if cached_catalog is not None:
-                acknowledged = {
-                    (event.fiscal_year, event.quarter): event.announced_on
-                    for event in cached_catalog.verified_corrections
-                }
-                event_corrected_periods = {
-                    period for period in event_corrected_periods
-                    if self._daily_corrections[symbol][period].announced_on
-                    > acknowledged.get(period, "")
-                }
+            event_corrected_periods = self._pending_daily_corrections(symbol, cached_filings, cached_catalog)
             batch_has_new_period = self.refresh_planner.batch_has_new_period(
                 batch_snapshot,
                 cached_filings,
@@ -455,30 +596,25 @@ class MopsFundamentalService:
                 )
             )
             if cached_catalog is not None:
-                eligible_catalog = self.refresh_planner.select_refresh_candidates(
-                    list(cached_catalog.candidates), effective_signal,
-                )
-                local_plan = self.planner.plan(eligible_catalog, cached_filings, history_years=history_years)
-                required_periods = {(item.fiscal_year, item.quarter) for item in local_plan.reuse}
                 # Young issuers / catalog gaps do not justify downloading the
                 # same catalog daily. Financial coverage remains unchanged.
-                pending_corrections = self.catalog_refresh.unverified_periods(
-                    cached_catalog, cached_filings,
-                )
-                cache_history_complete = (
-                    bool(local_plan.reuse)
-                    and not cached_catalog.announcements_pending
-                    and not local_plan.download
-                    and not pending_corrections
-                    and required_periods.issubset(cached_catalog.scanned_periods)
-                )
+                cache_history_complete = self.catalog_refresh.locally_complete(cached_catalog, cached_filings,
+                    signal=effective_signal, history_years=history_years)
             # Format migration is local and must not depend on remote availability.
             local_bundle = None
+            local_reuse = None
             if cached_filings:
                 try:
+                    local_filings = repository.load_filings_many(
+                        [symbol], as_of=effective_signal.isoformat(), uow=uow,
+                    )[symbol]
                     local_bundle = self._load_cached_bundle(
                         symbol, parsed_signal=effective_signal, sector=sector, uow=uow,
+                        filings=local_filings,
                     )
+                    # Only this load/transaction owns the bundle. Never share
+                    # mutable snapshots across companies, dates or callers.
+                    local_reuse = (self._bundle_selection_key(symbol, local_filings, sector), local_bundle)
                 except NoDataError:
                     pass
             if (
@@ -568,6 +704,7 @@ class MopsFundamentalService:
                     bundle = self._load_cached_fallback(
                         symbol, parsed_signal=self.point_in_time.effective_signal_time(parsed_signal),
                         sector=sector, uow=uow, refresh_error=refresh_error,
+                        local_reuse=local_reuse,
                     )
                 except DataSourceError:
                     # Keep successful partial downloads and negative-attempt cooldown.
@@ -575,12 +712,10 @@ class MopsFundamentalService:
                     raise refresh_error
                 return bundle
 
-            filed_financials = repository.load_filed_financials(
-                symbol,
-                effective_signal.isoformat(),
-                uow=uow,
-            )
-            if not filed_financials:
+            eligible_filings = repository.load_filings_many(
+                [symbol], as_of=effective_signal.isoformat(), uow=uow,
+            )[symbol]
+            if not eligible_filings:
                 self.refresh_control.finish(symbol, "NO_ELIGIBLE_FILINGS", uow=uow)
                 uow.commit()
                 raise NoDataError(
@@ -593,15 +728,11 @@ class MopsFundamentalService:
             )
             if len(batch) == len(pending):
                 repository.mark_full_refresh(symbol, catalog_state.checked_at, uow=uow)
-            resolved_sector = self._resolve_sector(symbol, sector)
-            bundle, cache_hit = self.fundamental_deriver.load_or_derive(
-                symbol,
-                parsed_signal=effective_signal,
-                resolved_sector=resolved_sector,
-                filed_financials=filed_financials,
-                uow=uow,
+            bundle, cache_hit, filing_count = self._load_cached_bundle(
+                symbol, parsed_signal=effective_signal, sector=sector, uow=uow,
+                filings=eligible_filings,
+                local_reuse=local_reuse,
             )
-            bundle = self.point_in_time.bundle_as_of(bundle, effective_signal)
             bundle = self.snapshot_assembler.attach_base_evidence(
                 bundle,
                 batch_resolution,
@@ -612,7 +743,7 @@ class MopsFundamentalService:
             if batch_snapshot is not None:
                 latest_filing_period = max(
                     (filing.fiscal_year, filing.quarter)
-                    for filing in filed_financials
+                    for filing in eligible_filings
                 )
                 state_is_not_newer = (
                     batch_state is None
@@ -648,7 +779,7 @@ class MopsFundamentalService:
                 remote_refresh_skipped=False,
                 remote_refresh_status="PARTIAL" if len(batch) < len(pending) else "SUCCESS",
             )
-            actual_periods = {(item.fiscal_year, item.quarter) for item in filed_financials}
+            actual_periods = {(item.fiscal_year, item.quarter) for item in eligible_filings}
             expected_periods = self.planner.history_periods(
                 max(actual_periods | {
                     (item.fiscal_year, item.quarter)
@@ -664,7 +795,10 @@ class MopsFundamentalService:
                 "expected_periods": len(expected_periods),
                 "status": "COMPLETE" if cached_count == len(expected_periods) else "PARTIAL",
             }
-            logging.info(
+            self._history_cache_progress[symbol] = (
+                cached_count == len(expected_periods), len(pending) - len(batch),
+            )
+            logging.debug(
                 "%s symbol=%s quarters=%s/%s pending=%s",
                 "建立五年歷史資料" if history_years == 5 else "建立{}年歷史資料".format(history_years),
                 symbol, cached_count, len(expected_periods), len(pending) - len(batch),
@@ -677,7 +811,7 @@ class MopsFundamentalService:
             "first_observation_seed=%s bundle_cache_hit=%s evaluation_at=%s "
             "snapshot_available_at=%s derivation_version=%s",
             symbol,
-            len(filed_financials),
+            filing_count,
             len(bundle.annual_fundamentals),
             len(plan.reuse),
             len(plan.download),
@@ -728,8 +862,29 @@ class MopsFundamentalService:
         parsed_signal: pd.Timestamp,
         sector: str,
         uow: FundamentalUnitOfWork,
+        filings: list[FilingRecord] | None = None,
+        local_reuse: tuple | None = None,
     ) -> tuple[FundamentalBundle, bool, int]:
         repository = self.repository
+        if filings is None:
+            filings = repository.load_filings_many(
+                [symbol], as_of=parsed_signal.isoformat(), uow=uow,
+            )[symbol]
+        if not filings:
+            raise NoDataError(
+                f"Cached MOPS filings for {symbol} are not point-in-time eligible", retryable=False,
+            )
+        if local_reuse is not None and local_reuse[0] == self._bundle_selection_key(symbol, filings, sector):
+            bundle, cache_hit, filing_count = local_reuse[1]
+            if bundle.snapshot.get("les_v6_filing_schema_version") == V6_FILING_SCHEMA_VERSION:
+                count_work("fundamental_transaction_bundle_reuses")
+                return self.point_in_time.bundle_as_of(bundle, parsed_signal), cache_hit, filing_count
+        resolved_sector = self._resolve_sector(symbol, sector)
+        cached = self.fundamental_deriver.load_matching_bundle(
+            symbol, filings=filings, resolved_sector=resolved_sector, uow=uow,
+        )
+        if cached is not None:
+            return self.point_in_time.bundle_as_of(cached, parsed_signal), True, len(filings)
         filed_financials = repository.load_filed_financials(
             symbol,
             parsed_signal.isoformat(),
@@ -742,7 +897,6 @@ class MopsFundamentalService:
                 ),
                 retryable=False,
             )
-        resolved_sector = self._resolve_sector(symbol, sector)
         bundle, cache_hit = self.fundamental_deriver.load_or_derive(
             symbol,
             parsed_signal=parsed_signal,
@@ -755,6 +909,13 @@ class MopsFundamentalService:
             cache_hit,
             len(filed_financials),
         )
+
+    def _bundle_selection_key(self, symbol, filings, sector):
+        # Includes availability/revision provenance via the repository's native
+        # selection hash. Callers reselect at their cutoff before comparing.
+        selected_hash = self.repository.filing_set_hash(filings)
+        return (symbol, self._resolve_sector(symbol, sector),
+                self.fundamental_deriver.snapshot_cache_key(selected_hash), V6_FILING_SCHEMA_VERSION, selected_hash)
 
     def _resolve_batch_snapshot(
         self,
@@ -780,24 +941,15 @@ class MopsFundamentalService:
         sector: str,
         uow: FundamentalUnitOfWork,
         refresh_error: DataSourceError,
+        local_reuse: tuple | None = None,
     ) -> FundamentalBundle:
-        repository = self.repository
-        filed_financials = repository.load_filed_financials(
-            symbol,
-            parsed_signal.isoformat(),
-            uow=uow,
-        )
-        if not filed_financials:
+        try:
+            bundle, cache_hit, filing_count = self._load_cached_bundle(
+                symbol, parsed_signal=parsed_signal, sector=sector, uow=uow,
+                local_reuse=local_reuse,
+            )
+        except NoDataError:
             raise refresh_error
-        resolved_sector = self._resolve_sector(symbol, sector)
-        bundle, cache_hit = self.fundamental_deriver.load_or_derive(
-            symbol,
-            parsed_signal=parsed_signal,
-            resolved_sector=resolved_sector,
-            filed_financials=filed_financials,
-            uow=uow,
-        )
-        bundle = self.point_in_time.bundle_as_of(bundle, parsed_signal)
         batch_resolution = self._resolve_batch_snapshot(
             symbol,
             parsed_signal,
@@ -824,7 +976,7 @@ class MopsFundamentalService:
                 "MOPS refresh status=ACCESS_BLOCKED symbol=%s "
                 "cache_fallback=true filings=%s bundle_cache_hit=%s detail=%s",
                 symbol,
-                len(filed_financials),
+                filing_count,
                 cache_hit,
                 refresh_error,
                 extra={
@@ -840,7 +992,7 @@ class MopsFundamentalService:
                 "filings=%s bundle_cache_hit=%s detail=%s",
                 refresh_error.category.value.upper(),
                 symbol,
-                len(filed_financials),
+                filing_count,
                 cache_hit,
                 refresh_error,
             )

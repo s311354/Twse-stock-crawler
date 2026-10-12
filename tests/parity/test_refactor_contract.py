@@ -260,6 +260,11 @@ def test_cli_strategy_dataset_and_renderer_contracts_are_stable() -> None:
     replay_options = [
         {"dest": "replay_mail", "options": ["--replay-mail"], "nargs": 0, "choices": None},
         {"dest": "replay_restrictions_file", "options": ["--replay-restrictions-file"], "nargs": None, "choices": None},
+        {"dest": "replay_id", "options": ["--replay-id"], "nargs": None, "choices": None},
+        {"dest": "replay_evidence_file", "options": ["--replay-evidence-file"], "nargs": None, "choices": None},
+        {"dest": "replay_state_path", "options": ["--replay-state-path"], "nargs": None, "choices": None},
+        {"dest": "replay_output_dir", "options": ["--replay-output-dir"], "nargs": None, "choices": None},
+        {"dest": "replay_parse_cache", "options": ["--replay-parse-cache"], "nargs": None, "choices": None},
     ]
     replay_names = {action["dest"] for action in replay_options}
     assert [action for action in cli_actions if action["dest"] in replay_names] == replay_options
@@ -269,8 +274,11 @@ def test_cli_strategy_dataset_and_renderer_contracts_are_stable() -> None:
 
     expected_columns = fixture["analysis_columns"]
     assert isinstance(expected_columns, dict)
-    # Intentional additive industry evidence; retain the original schema hash.
-    added = {"Industry Quality Profile", "Industry Profile Version", "Industry Profile Mode", "Industry Shadow Decision"}
+    # Explicitly reviewed additive fields, not a regenerated golden schema.
+    # Formal score, estimate and coverage must not share a misleading column.
+    added = {"Industry Quality Profile", "Industry Profile Version", "Industry Profile Mode", "Industry Shadow Decision",
+             "LES v6 Formal Score", "LES v6 Estimated Score", "LES v6 Score Coverage",
+             "LES v6 Raw Score", "LES v6 Penalty", "LES v6 Adjusted Score", "LES v6 Safety Cap", "LES v6 Final Score"}
     assert added.issubset(ANALYSIS_COLUMNS)
     original_columns = [name for name in ANALYSIS_COLUMNS if name not in added]
     assert len(original_columns) == expected_columns["count"]
@@ -278,12 +286,17 @@ def test_cli_strategy_dataset_and_renderer_contracts_are_stable() -> None:
 
     expected_strategies = fixture["strategies"]
     assert isinstance(expected_strategies, dict)
-    assert sorted(_BUILTIN_STRATEGIES) == sorted(expected_strategies)
+    # Explicit opt-in addition; all earlier plugin versions and renderers stay pinned.
+    hybrid = {"low_entry_score_v6_hybrid", "low_entry_score_v6_hybrid_legacy"}
+    assert hybrid.issubset(_BUILTIN_STRATEGIES)
+    assert get_strategy("low_entry_score_v6_hybrid").version == "6.0.0"
+    assert sorted(set(_BUILTIN_STRATEGIES) - hybrid) == sorted(expected_strategies)
     assert {
         name: get_strategy(name).version
         for name in sorted(expected_strategies)
     } == expected_strategies
-    assert sorted(RendererFactory._renderers) == fixture["renderers"]
+    assert hybrid.issubset(RendererFactory._renderers)
+    assert sorted(set(RendererFactory._renderers) - hybrid) == fixture["renderers"]
     assert STRATEGY_DECISION_SCHEMA_VERSION == fixture["decision_schema_version"]
 
 
@@ -345,4 +358,14 @@ def test_sqlite_storage_contracts_are_stable(tmp_path: Path) -> None:
         "portfolio": _sqlite_contract(portfolio_path),
         "mops": _sqlite_contract(mops.database_path),
     }
-    assert observed == _fixture()["sqlite"]
+    expected = _fixture()["sqlite"]
+    # Reviewed additive header metadata/index only; keep the legacy golden fixture and
+    # compare every other table/column/index unchanged, rather than regenerate it.
+    snapshot_columns = observed["mops"]["tables"]["fundamental_snapshots"]
+    assert snapshot_columns == expected["mops"]["tables"]["fundamental_snapshots"] + [
+        "filing_schema_version", "has_mops_filings",
+    ]
+    observed["mops"]["tables"]["fundamental_snapshots"] = snapshot_columns[:-2]
+    assert "fundamental_snapshots_header" in observed["mops"]["indexes"]
+    observed["mops"]["indexes"].remove("fundamental_snapshots_header")
+    assert observed == expected

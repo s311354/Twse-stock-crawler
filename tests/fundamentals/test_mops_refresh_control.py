@@ -60,13 +60,12 @@ def test_existing_v6_cache_with_old_schema_is_migrated_locally_once(tmp_path, mo
     client = _FakeMopsClient(repo, [], [])
     svc = service(repo, client, Clock())
     assert svc.migrate_local_cache(["2330"], signal_date=SIGNAL, sector="24") == 1
-    real_load = repo.load_cached_bundles
+    real_load = repo.load_cached_bundle_headers
     from dataclasses import replace
     def old_schema(*args, **kwargs):
         entries = real_load(*args, **kwargs)
         entry = entries["2330"]
-        snapshot = dict(entry.bundle.snapshot, les_v6_filing_schema_version="old")
-        entries["2330"] = replace(entry, bundle=replace(entry.bundle, snapshot=snapshot))
+        entries["2330"] = replace(entry, filing_schema_version="old")
         return entries
     migrated = []
     real_migrate = svc._load_cached_bundle
@@ -74,12 +73,12 @@ def test_existing_v6_cache_with_old_schema_is_migrated_locally_once(tmp_path, mo
         migrated.append(args[0])
         return real_migrate(*args, **kwargs)
     with monkeypatch.context() as patch:
-        patch.setattr(repo, "load_cached_bundles", old_schema)
+        patch.setattr(repo, "load_cached_bundle_headers", old_schema)
         patch.setattr(svc, "_load_cached_bundle", record_migration)
         assert svc.migrate_local_cache(["2330"], signal_date=SIGNAL, sector="24") == 1
     assert migrated == ["2330"]
     assert svc.migrate_local_cache(["2330"], signal_date=SIGNAL, sector="24") == 0
-    entries = real_load({"2330": "24"}, as_of=SIGNAL,
+    entries = repo.load_cached_bundles({"2330": "24"}, as_of=SIGNAL,
                         derivation_version=FUNDAMENTAL_DERIVATION_VERSION)
     assert entries["2330"].bundle.snapshot["les_v6_filing_schema_version"] == V6_FILING_SCHEMA_VERSION
     assert client.discovery_calls == 0
@@ -332,6 +331,9 @@ def test_otc_local_evidence_uses_mops_without_twse_batch_contamination(monkeypat
     repo = Mock()
     repo.unit_of_work.side_effect = lambda: nullcontext(None)
     repo.load_filed_financials.return_value = records
+    repo.load_filings_many.return_value = {"3105": records}
+    repo.load_cached_bundles.return_value = {}
+    repo.load_cached_bundle_headers.return_value = {}
     # Must not even read the TWSE-only batch table for an OTC issuer.
     repo.load_financial_batch_snapshots.side_effect = AssertionError("TWSE batch read for TPEX")
     monkeypatch.setattr("application.fundamental_service.ixbrl_record", lambda symbol, row: dict(row))
@@ -344,6 +346,7 @@ def test_otc_local_evidence_uses_mops_without_twse_batch_contamination(monkeypat
     assert not result["backfill_needed"]
     assert all(row["market"] == "TWSE" for row in records)  # Caller-owned cache unchanged.
     repo.load_financial_batch_snapshots.assert_not_called()
+    repo.load_financial_batch_snapshots_many.assert_not_called()
 
 
 def test_otc_missing_filings_remain_insufficient_despite_twse_batch():
@@ -353,6 +356,9 @@ def test_otc_missing_filings_remain_insufficient_despite_twse_batch():
     repo = Mock()
     repo.unit_of_work.side_effect = lambda: nullcontext(None)
     repo.load_filed_financials.return_value = []
+    repo.load_filings_many.return_value = {"3105": []}
+    repo.load_cached_bundles.return_value = {}
+    repo.load_cached_bundle_headers.return_value = {}
     svc = service(repo, _FakeMopsClient(repo, [], []), Clock())
     result = svc.inspect_local_evidence(["3105"], signal_date=SIGNAL, market="TPEX")["3105"]
 
@@ -360,6 +366,7 @@ def test_otc_missing_filings_remain_insufficient_despite_twse_batch():
     assert result["backfill_needed"]
     assert result["quality_reasons"] == ["NO_POINT_IN_TIME_FINANCIALS"]
     repo.load_financial_batch_snapshots.assert_not_called()
+    repo.load_financial_batch_snapshots_many.assert_not_called()
 
 
 def test_zero_request_budget_converts_cache_without_remote_or_fabricating_facts(tmp_path):

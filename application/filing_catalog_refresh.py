@@ -18,6 +18,21 @@ class FilingCatalogRefresh:
         self.planner = planner
         self.eligibility = eligibility
 
+    def locally_complete(self, state: FilingCatalogState, cached: list[FilingRecord],
+                         *, signal: pd.Timestamp, history_years: int) -> bool:
+        """Catalog work completeness, NOT financial completeness or Quality.
+
+        Shared by bulk preload and individual refresh. Young issuers/catalog
+        gaps may have no pending download while still lacking model evidence.
+        Never invent absent catalog periods or acknowledge pending revisions.
+        """
+        eligible = self.eligibility.select_refresh_candidates(list(state.candidates), signal)
+        plan = self.planner.plan(eligible, cached, history_years=history_years)
+        required = {(item.fiscal_year, item.quarter) for item in plan.reuse}
+        return (bool(plan.reuse) and not state.announcements_pending and not plan.download
+                and not self.unverified_periods(state, cached)
+                and required.issubset(state.scanned_periods))
+
     def prepare(
         self, symbol: str, *, state: FilingCatalogState | None,
         cached: list[FilingRecord], signal: pd.Timestamp, history_years: int,

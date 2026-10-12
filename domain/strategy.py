@@ -75,6 +75,8 @@ _BUILTIN_STRATEGIES = {
     "low_entry_score_v4_1": "domain.strategies.low_entry_score_v4_1.LowEntryScoreV41Strategy",
     "low_entry_score_v5": "domain.strategies.low_entry_score_v5.LowEntryScoreV5Strategy",
     "low_entry_score_v6": "domain.strategies.low_entry_score_v6.LowEntryScoreV6Strategy",
+    "low_entry_score_v6_hybrid": "domain.strategies.low_entry_score_v6.LowEntryScoreV6HybridStrategy",
+    "low_entry_score_v6_hybrid_legacy": "domain.strategies.low_entry_score_v6.LowEntryScoreV6HybridLegacyStrategy",
     "portfolio_allocation_v1": "domain.strategies.portfolio_allocation_v1.PortfolioAllocationV1Strategy",
     "portfolio_allocation_v2": "domain.strategies.portfolio_allocation_v2.PortfolioAllocationV2Strategy",
 }

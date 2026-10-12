@@ -9,10 +9,12 @@ import pandas as pd
 
 from application.fundamental_ports import FundamentalRepositoryPort
 from application.fundamental_ports import FundamentalUnitOfWork
+from application.daily_performance import count_work, measure_stage
 from domain.fundamental_derivation import FiledFinancials
 from domain.fundamental_derivation import FUNDAMENTAL_DERIVATION_VERSION
 from domain.fundamental_derivation import FundamentalBundle
 from domain.fundamental_derivation import derive_fundamentals
+from domain.fundamental_models import FilingRecord
 from domain.strategies.low_entry_v6_filings import V6_FILING_SCHEMA_VERSION, ixbrl_record
 
 
@@ -27,6 +29,36 @@ class FundamentalDeriver:
         self._repository = repository
         self._derive_bundle = derive_bundle
 
+    @staticmethod
+    def snapshot_cache_key(filing_set_sha256: str) -> str:
+        """Shared identity for facts derivation and metadata-only reuse."""
+        return hashlib.sha256(
+            f"{FUNDAMENTAL_DERIVATION_VERSION}:{filing_set_sha256}".encode("ascii")
+        ).hexdigest()
+
+    def load_matching_bundle(
+        self, symbol: str, *, filings: list[FilingRecord], resolved_sector: str,
+        uow: FundamentalUnitOfWork,
+    ) -> FundamentalBundle | None:
+        """Reuse only the exact cutoff selection, version, sector and format.
+
+        The caller supplies metadata already filtered at its cutoff. No facts
+        read, raw-document parse, activation write or availability promotion is
+        necessary on a match. A miss still takes the normal derivation path.
+        """
+        if not filings:
+            return None
+        filing_set_sha256 = self._repository.filing_set_hash(filings)
+        bundle = self._repository.load_fundamental_bundle(
+            symbol, self.snapshot_cache_key(filing_set_sha256), resolved_sector, uow=uow,
+        )
+        if (bundle is None or "les_v6_mops_filings" not in bundle.snapshot
+                or bundle.snapshot.get("les_v6_filing_schema_version") != V6_FILING_SCHEMA_VERSION):
+            count_work("fundamental_snapshot_misses")
+            return None
+        count_work("fundamental_snapshot_hits")
+        return bundle
+
     def load_or_derive(
         self,
         symbol: str,
@@ -39,11 +71,7 @@ class FundamentalDeriver:
         filing_set_sha256 = self._repository.filing_set_hash(
             filed_financials
         )
-        snapshot_cache_key = hashlib.sha256(
-            f"{FUNDAMENTAL_DERIVATION_VERSION}:{filing_set_sha256}".encode(
-                "ascii"
-            )
-        ).hexdigest()
+        snapshot_cache_key = self.snapshot_cache_key(filing_set_sha256)
         bundle = self._repository.load_fundamental_bundle(
             symbol,
             snapshot_cache_key,
@@ -54,11 +82,13 @@ class FundamentalDeriver:
         if (bundle is None or "les_v6_mops_filings" not in bundle.snapshot
                 or bundle.snapshot.get("les_v6_filing_schema_version") != V6_FILING_SCHEMA_VERSION):
             if bundle is None:
-                bundle = self._derive_bundle(
-                    filed_financials,
-                    signal_date=parsed_signal,
-                    sector=resolved_sector,
-                )
+                with measure_stage("fundamental_derivation"):
+                    count_work("fundamental_derivation_calls")
+                    bundle = self._derive_bundle(
+                        filed_financials,
+                        signal_date=parsed_signal,
+                        sector=resolved_sector,
+                    )
             snapshot = dict(bundle.snapshot)
             snapshot["les_v6_mops_filings"] = [ixbrl_record(symbol, filing) for filing in filed_financials]
             snapshot["les_v6_filing_schema_version"] = V6_FILING_SCHEMA_VERSION

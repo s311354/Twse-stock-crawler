@@ -21,6 +21,7 @@ def test_list_strategies_displays_all_registered_strategies(capsys):
     # Check that key strategies are listed
     assert "low_entry_score_v5" in captured.out
     assert "low_entry_score_v6" in captured.out
+    assert "low_entry_score_v6_hybrid" in captured.out
     assert "expected_return_exit_v3" in captured.out
     assert "low_entry_score_v4_1" in captured.out
     assert "portfolio_allocation_v1" in captured.out
@@ -57,9 +58,11 @@ def test_available_strategies_returns_all_builtin_names():
     names = available_strategies()
     
     assert isinstance(names, list)
-    assert len(names) == 12
+    assert len(names) == 14
     assert "low_entry_score_v5" in names
     assert "low_entry_score_v6" in names
+    assert "low_entry_score_v6_hybrid" in names
+    assert "low_entry_score_v6_hybrid_legacy" in names
     assert "expected_return_exit_v3" in names
     assert "low_entry_score_v4_1" in names
     assert "portfolio_allocation_v1" in names

@@ -449,12 +449,15 @@ class MopsRevisionWriter:
                     """
                     INSERT INTO fundamental_snapshots (
                         symbol, filing_set_sha256, sector, annual_json,
-                        snapshot_json, created_at_epoch
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        snapshot_json, created_at_epoch,
+                        filing_schema_version, has_mops_filings
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(symbol, filing_set_sha256, sector) DO UPDATE SET
                         annual_json = excluded.annual_json,
                         snapshot_json = excluded.snapshot_json,
-                        created_at_epoch = excluded.created_at_epoch
+                        created_at_epoch = excluded.created_at_epoch,
+                        filing_schema_version = excluded.filing_schema_version,
+                        has_mops_filings = excluded.has_mops_filings
                     """,
                     (
                         symbol,
@@ -466,8 +469,32 @@ class MopsRevisionWriter:
                         ),
                         json.dumps(bundle.snapshot, ensure_ascii=True),
                         created_at_epoch,
+                        bundle.snapshot.get("les_v6_filing_schema_version"),
+                        int("les_v6_mops_filings" in bundle.snapshot),
                     ),
                 )
+
+    def record_fundamental_bundle_format(
+        self, symbol: str, snapshot_cache_key: str, sector: str,
+        bundle: FundamentalBundle, *, uow: FundamentalUnitOfWork | None = None,
+    ) -> None:
+        """Lazy legacy index only, inside the transaction that inspected the row."""
+        if uow is None:
+            raise ValueError("FORMAT_INDEX_REQUIRES_INSPECTION_TRANSACTION")
+        with borrow_connection(self._connect, None, uow) as active:
+            active.execute(
+                """UPDATE fundamental_snapshots
+                   SET filing_schema_version = ?, has_mops_filings = ?
+                   WHERE symbol = ? AND filing_set_sha256 = ? AND sector = ?
+                     AND has_mops_filings IS NULL
+                     AND json_extract(snapshot_json, '$.les_v6_filing_schema_version') IS ?
+                     AND (json_type(snapshot_json, '$.les_v6_mops_filings') IS NOT NULL) = ?""",
+                (bundle.snapshot.get("les_v6_filing_schema_version"),
+                 int("les_v6_mops_filings" in bundle.snapshot),
+                 symbol, snapshot_cache_key, sector,
+                 bundle.snapshot.get("les_v6_filing_schema_version"),
+                 int("les_v6_mops_filings" in bundle.snapshot)),
+            )
 
 
 __all__ = ["MopsRevisionWriter"]

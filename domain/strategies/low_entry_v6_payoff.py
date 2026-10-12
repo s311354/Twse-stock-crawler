@@ -59,3 +59,50 @@ def payoff_scenarios(plan: Mapping, *, buy_cost_rate: float, sell_cost_rate: flo
         result["net_reward_risk"] = reward / -loss
         result["break_even_win_rate"] = -loss / (reward - loss)
     return result
+
+
+def resistance_target_research(plan: Mapping, features: Mapping, *, buy_cost_rate: float,
+                               sell_cost_rate: float, first_exit_fraction: float = .5) -> dict:
+    """Compare known resistance policies; never used for formal entry admission.
+
+    All levels come from completed bars supplied by the caller. The 50% split
+    is an illustrative policy, not a calibrated probability or expected payoff.
+    No 2R backsolve, future high, or missing price-discovery target is invented.
+    """
+    fraction = number(first_exit_fraction)
+    if fraction is None or not 0 < fraction < 1:
+        raise ValueError("INVALID_RESEARCH_EXIT_FRACTION")
+    base = payoff_scenarios(plan, buy_cost_rate=buy_cost_rate, sell_cost_rate=sell_cost_rate)
+    entry = number(plan.get("entry_price"))
+    levels: dict[float, list[str]] = {}
+    for key in ("swing_high", "hh20", "hh60"):
+        level = number(features.get(key))
+        if entry is not None and level is not None and 0 < entry < level:
+            levels.setdefault(level, []).append(key)
+    targets = sorted(levels)
+    scenarios = []
+    for target in targets:
+        payoff = payoff_scenarios(dict(plan, target_price=target), buy_cost_rate=buy_cost_rate,
+                                  sell_cost_rate=sell_cost_rate)
+        scenarios.append(dict(target_price=target, sources=levels[target], payoff=payoff))
+    blended = None
+    if len(targets) >= 2:
+        # Compare T1/T2, not the most optimistic of all observed levels.
+        target = fraction * targets[0] + (1 - fraction) * targets[1]
+        blended = dict(first_target=targets[0], second_target=targets[1], first_exit_fraction=fraction,
+                       conditional_both_targets_payoff=payoff_scenarios(
+                           dict(plan, target_price=target), buy_cost_rate=buy_cost_rate,
+                           sell_cost_rate=sell_cost_rate))
+        cost, stop = base["entry_cost_per_share"], base["stop_price"]
+        # Expose the less optimistic path too: T1 reached, then the unsold
+        # fraction exits at the ORIGINAL stop (no assumed break-even stop).
+        proceeds = (number((fraction * targets[0] + (1 - fraction) * stop) * (1 - sell_cost_rate))
+                    if cost is not None and stop is not None and entry is not None and 0 < stop < entry else None)
+        blended["conditional_first_target_then_stop_net_return"] = (proceeds / cost - 1
+                                                                   if proceeds is not None else None)
+    return dict(policy_version="known-resistance-research/v1", research_only=True,
+                affects_entry_gate=False, formal_policy="NEAREST_KNOWN_RESISTANCE",
+                formal_target_price=number(plan.get("target_price")),
+                scenarios=scenarios, staged_exit=blended,
+                expected_return=None, estimated_win_rate=None,
+                limitation="CONDITIONAL_TARGET_HITS_ONLY_NOT_A_FORECAST_OR_BACKTEST")

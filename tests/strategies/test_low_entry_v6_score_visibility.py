@@ -125,7 +125,8 @@ def test_missing_history_estimate_survives_report_projection_but_not_execution(m
 
 def test_unavailable_report_does_not_invent_a_score():
     report = unavailable_report("2330", "", "2026-09-11", "2026-09-11T15:00+08:00", "NO_HISTORY")
-    assert setup_score_summary(report) == "N/A（技術資料不足）"
+    rendered = setup_score_summary(report)
+    assert "Final N/A" in rendered and "非實際 0 分" in rendered
     assert project_report(report)["LES v6 Score"] is None
 
 

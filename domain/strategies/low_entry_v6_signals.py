@@ -8,16 +8,25 @@ from math import floor, isclose
 from domain.strategies.low_entry_v6_quality import MINIMUM_ENTRY_QUALITY, QualityResult, number, ratio
 from domain.strategies.low_entry_v6_payoff import payoff_scenarios
 from domain.strategies.low_entry_v6_score_evidence import score_evidence, valid_price_anchor
+from domain.strategies.low_entry_v6_execution_score import (
+    DEPENDENCIES as EXECUTION_DEPENDENCIES, execution_conditions, validate_score_budget,
+)
 
 
 SETUPS = ("REVERSAL", "TREND_PULLBACK", "LEADERSHIP_CONTINUATION")
 EXECUTABLE_SIGNALS = frozenset({"BUY", "BUY_SMALL"})
+VETO_NUMERIC_FIELDS = ("new_lows3", "clv", "ema5_slope", "ema20_slope", "atr_expansion",
+                       "r5", "atr_percent", "close", "open", "volume_ratio", "gap",
+                       "support", "rs20", "rs_slope5", "resilience")
+VETO_BOOLEAN_FIELDS = ("support_break", "new_low", "undercut_reclaim")
 
 
 @dataclass(frozen=True)
 class LowEntryV6Config:
     """Uncalibrated choices are versioned and described in the v6 implementation notes."""
 
+    decision_policy_version: int = 2
+    correlation_policy_version: int = 2
     minimum_amount_ma20: float = 30_000_000.
     maximum_spread: float = .01
     maximum_order_adv: float = .01
@@ -51,8 +60,15 @@ class LowEntryV6Config:
     pullback_minimum_drawdown: float = .01
     pullback_maximum_drawdown: float = .15
     leadership_rs20_tolerance: float = .01
+    leadership_policy_version: int = 2
 
     def __post_init__(self):
+        if type(self.decision_policy_version) is not int or self.decision_policy_version not in {1, 2, 3, 4}:
+            raise ValueError("Unsupported LES decision policy version")
+        if type(self.correlation_policy_version) is not int or self.correlation_policy_version not in {1, 2}:
+            raise ValueError("Unsupported LES correlation policy version")
+        if type(self.leadership_policy_version) is not int or self.leadership_policy_version not in {1, 2}:
+            raise ValueError("Unsupported LES leadership policy version")
         for name, value in vars(self).items():
             if number(value) is None or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
@@ -69,7 +85,8 @@ class LowEntryV6Config:
             raise ValueError("Invalid liquidity or fee cap")
         starters = (self.reversal_starter_score_minimum, self.pullback_starter_score_minimum,
                     self.leadership_starter_score_minimum)
-        if not 75 <= self.buy_score_minimum <= 100 or any(not 65 <= v <= self.buy_score_minimum for v in starters):
+        buy_floor, small_floor = (72, 62) if self.decision_policy_version == 4 else (75, 65)
+        if not buy_floor <= self.buy_score_minimum <= 100 or any(not small_floor <= v <= self.buy_score_minimum for v in starters):
             raise ValueError("Invalid entry score thresholds")
         if not 1.2 <= self.starter_maximum_stop_atr <= 3.:
             raise ValueError("Invalid starter structural stop bound")
@@ -87,6 +104,15 @@ class LowEntryV6Config:
             raise ValueError("Invalid balanced setup bounds")
 
 
+def relaxed_hybrid_config(**overrides) -> LowEntryV6Config:
+    """Explicit versioned deployment; legacy constructor defaults stay intact."""
+    parameters = dict(decision_policy_version=4, buy_score_minimum=72.,
+                      reversal_starter_score_minimum=62., pullback_starter_score_minimum=62.,
+                      leadership_starter_score_minimum=62.)
+    parameters.update(overrides)
+    return LowEntryV6Config(**parameters)
+
+
 def truth(value: object) -> bool:
     return value is not None and str(value) == "True"
 
@@ -94,6 +120,14 @@ def truth(value: object) -> bool:
 def _n(f: dict, key: str) -> float:
     value = number(f.get(key))
     return float("nan") if value is None else value
+
+
+def veto_evidence_complete(f: dict) -> bool:
+    masks = f.get("score_availability", {})
+    return (all(number(f.get(key)) is not None and (key not in masks or truth(masks[key]))
+                for key in VETO_NUMERIC_FIELDS)
+            and all(str(f.get(key)) in {"True", "False"} for key in VETO_BOOLEAN_FIELDS)
+            and f.get("market_regime") in {"RISK_ON", "NEUTRAL", "RISK_OFF"})
 
 
 def hard_vetoes(f: dict) -> tuple[str, ...]:
@@ -131,8 +165,10 @@ def trade_plan(f: dict, entry_price: float | None = None, *, config: LowEntryV6C
     stop = support - config.stop_buffer_atr * atr if support is not None and atr is not None and atr > 0 else None
     risk = entry - stop if entry is not None and stop is not None and 0 < stop < entry else None
     stop_source = "CONFIRMED_SWING_LOW"
+    anchor_age = number(f.get("swing_low_confirmation_age"))
     if truth(f.get("undercut_reclaim")):
         stop_source = "CONFIRMED_UNDERCUT_LOW"
+        anchor_age = 1.
     # Anchor selection uses the completed signal bar, never the live fill. A
     # high ATR must not hide an over-wide percentage stop. Keep a valid old stop
     # otherwise; a new anchor still requires independently confirmed structure.
@@ -154,6 +190,7 @@ def trade_plan(f: dict, entry_price: float | None = None, *, config: LowEntryV6C
         stop = support - config.stop_buffer_atr * atr
         risk = entry - stop if 0 < stop < entry else None
         stop_source = "CONFIRMED_BREAKOUT_RETEST"
+        anchor_age = number(f.get("breakout_retest_age"))
     # A held short base is a distinct, starter-only invalidation point. Select
     # it from completed signal-day evidence, never from the live entry price.
     if (setup in {"REVERSAL", "TREND_PULLBACK"} and risk is not None and atr is not None
@@ -163,6 +200,8 @@ def trade_plan(f: dict, entry_price: float | None = None, *, config: LowEntryV6C
         stop = support - config.stop_buffer_atr * atr
         risk = entry - stop if 0 < stop < entry else None
         stop_source = "CONFIRMED_CONSOLIDATION_LOW"
+        sessions = number(f.get("consolidation_sessions"))
+        anchor_age = sessions - 1 if sessions is not None else None
     # Known resistance only, never manufacture reward for a leader in price discovery.
     levels = [number(f.get(key)) for key in ("swing_high", "hh20", "hh60")]
     targets = [v for v in levels if v is not None and entry is not None and v > entry]
@@ -174,6 +213,7 @@ def trade_plan(f: dict, entry_price: float | None = None, *, config: LowEntryV6C
     plan = {
         "entry_price": entry, "stop_price": stop, "target_price": target,
         "stop_source": stop_source, "stop_support": support,
+        "stop_anchor_age_sessions": anchor_age,
         "stop_distance_atr": ratio(risk, atr), "stop_distance_fraction": ratio(risk, entry), "reward_risk": rr,
         "spread_pass": spread_ok, "amount_pass": amount_ok,
         "liquidity_pass": spread_ok and amount_ok and unrestricted,
@@ -216,8 +256,11 @@ def stop_fraction_limit(signal: str, config: LowEntryV6Config) -> float:
     return config.starter_maximum_stop_fraction if signal == "BUY_SMALL" else config.buy_maximum_stop_fraction
 
 
-def score_setups(f: dict, plan: dict, *, config: LowEntryV6Config | None = None) -> dict:
+def score_setups(f: dict, plan: dict, *, config: LowEntryV6Config | None = None,
+                 score_exclusions: frozenset[str] = frozenset()) -> dict:
     config = config or LowEntryV6Config()
+    if config.decision_policy_version in {3, 4}:
+        raise ValueError("HYBRID_REQUIRES_CONTEXT_FIRST_PIPELINE")
     n = lambda key: _n(f, key)
     b = lambda key: truth(f.get(key))
     above = lambda key: n("close") > n(key)
@@ -225,9 +268,12 @@ def score_setups(f: dict, plan: dict, *, config: LowEntryV6Config | None = None)
     trend = n("ema10") > n("ema20") and n("ema20_slope") > 0
     demand = [n("clv") > .4, b("cmf_improving"), n("obv_slope5") > 0,
               n("up_volume_ratio") > 1, above("vwap20")]
-    # Relaxed eligibility must not also award extra execution-quality points.
-    # Keep the existing 1.8 ATR scoring budget separate from the 3 ATR small-entry cap.
-    def execution(setup: str, minimum: float) -> list:
+    # Only explicit policy 1 evaluates these legacy, setup-specific scales.
+    def legacy_execution(setup: str, minimum: float) -> list:
+        if setup == "LEADERSHIP_CONTINUATION":
+            distance, _ = checked_stop_distances(leader_plan, f.get("atr14"))
+            return [(_within_stop_limit(distance, min(config.starter_maximum_stop_atr, 1.8)), 4),
+                    (plan["spread_pass"], 2), (plan["amount_pass"], 2), (plan["unrestricted"], 2)]
         base_plan = trade_plan(f, plan["entry_price"], config=config, setup=setup)
         active = base_plan if base_plan["stop_source"] == "CONFIRMED_CONSOLIDATION_LOW" else plan
         distance, _ = checked_stop_distances(active, f.get("atr14"))
@@ -237,7 +283,6 @@ def score_setups(f: dict, plan: dict, *, config: LowEntryV6Config | None = None)
     retest_plan = trade_plan(f, plan["entry_price"], config=config, setup="LEADERSHIP_CONTINUATION")
     leader_plan = retest_plan if retest_plan["stop_source"] == "CONFIRMED_BREAKOUT_RETEST" else plan
     retest = leader_plan.get("stop_source") == "CONFIRMED_BREAKOUT_RETEST"
-    leader_distance, _ = checked_stop_distances(leader_plan, f.get("atr14"))
     consolidation = _confirmed_consolidation(f)
     stable_low = b("no_new_low2") or b("undercut_reclaim") or consolidation
     reversal = {
@@ -248,7 +293,6 @@ def score_setups(f: dict, plan: dict, *, config: LowEntryV6Config | None = None)
         "demand": list(zip(demand, (6, 5, 5, 4, 5))),
         "momentum": [(b("rsi_cross40"), 6), (b("macd_improving"), 5), (n("macd_strict") > n("macd_signal_strict"), 4)],
         "relative_strength": [(b("rs_improving"), 4), (n("rs_slope5") > 0, 3), (b("resilience_improving"), 3)],
-        "execution": execution("REVERSAL", 2),
     }
     pullback = {
         "primary_trend": [(n("ema10") > n("ema20"), 7), (n("ema20_slope") > 0, 7),
@@ -263,7 +307,6 @@ def score_setups(f: dict, plan: dict, *, config: LowEntryV6Config | None = None)
         "demand": [(b("reclaim10") or b("reclaim20"), 4), (n("clv") > .3, 3),
                    (b("cmf_improving"), 3), (n("obv_slope5") > 0, 3), (n("up_volume_ratio") >= 1, 2)],
         "momentum": [(b("rsi_pullback"), 2), (b("macd_improving"), 2), (b("break_previous_high"), 1)],
-        "execution": execution("TREND_PULLBACK", 1.8),
     }
     extension, breakout = n("ema20_extension"), n("breakout_extension")
     extension_points = 7 if extension <= 1 else 4 if extension <= 1.5 else 1 if extension <= 2 else 0
@@ -276,9 +319,25 @@ def score_setups(f: dict, plan: dict, *, config: LowEntryV6Config | None = None)
         "demand": [(n("clv") > .5, 5), (n("volume_ratio") >= 1.1, 5), (n("amount_ratio") > 1, 3),
                    (n("cmf20") > 0, 3), (n("obv_slope5") > 0, 4)],
         "extension": [(extension_points / 7, 7), (breakout_points / 8, 8)],
-        "execution": [(_within_stop_limit(leader_distance, min(config.starter_maximum_stop_atr, 1.8)), 4),
-                      (plan["spread_pass"], 2), (plan["amount_pass"], 2), (plan["unrestricted"], 2)],
     }
+    leadership_dependencies = None
+    if config.decision_policy_version == 2 and config.leadership_policy_version == 2:
+        # Replace existing slots, never add a second bonus budget. Optional
+        # industry/correction evidence remains unobserved rather than neutral.
+        from domain.strategies.low_entry_v6_score_evidence import DEPENDENCIES
+        leadership["relative_strength"][0] = (n("industry_rs20") > 0, 8)
+        industry60 = number(f.get("industry_rs60"))
+        leadership["relative_strength"][1] = (industry60 > 0 if industry60 is not None else None, 7)
+        leadership["relative_strength"][3] = (f.get("downside_resilience"), 7)
+        leadership["trend"][3] = (f.get("base_compression"), 6)
+        leadership["demand"][0] = (number(f.get("clv_breakout_quality")), 5)
+        leadership["demand"][1] = (n("breakout_volume_ratio") >= 1.1, 5)
+        leadership["demand"][2] = (n("breakout_amount_ratio") >= 1.2, 3)
+        leadership_dependencies = dict(DEPENDENCIES["LEADERSHIP_CONTINUATION"],
+            relative_strength=(("industry_rs20",), ("industry_rs60",), ("rs_near_high",), ("downside_resilience",)),
+            trend=DEPENDENCIES["LEADERSHIP_CONTINUATION"]["trend"][:3] + (("base_compression",),),
+            demand=(("clv_breakout_quality",), ("breakout_volume_ratio",), ("breakout_amount_ratio",),
+                    ("cmf20",), ("obv_slope5",)))
     # Absolute price recovery need not already outperform a rising benchmark.
     # This alternative requires stronger base/demand evidence and cannot grant BUY.
     held_higher_floor = (b("no_new_low2") and b("higher_low") and b("support_intact"))
@@ -389,23 +448,38 @@ def score_setups(f: dict, plan: dict, *, config: LowEntryV6Config | None = None)
     )
     result = {}
     for name, groups, confirmed, checks, shape in zip(SETUPS, (reversal, pullback, leadership), strict_valid, recovery_checks, recognition_checks):
-        earned = {key: sum(float(condition) * weight for condition, weight in values if condition is not None) for key, values in groups.items()}
-        available = sum(weight for values in groups.values() for condition, weight in values if condition is not None)
         recovered = all(checks.values())
         base_plan = trade_plan(f, plan["entry_price"], config=config, setup=name)
+        execution_policy = None
+        if config.decision_policy_version == 2:
+            groups["execution"], execution_policy = execution_conditions(
+                f, base_plan, distances=checked_stop_distances(base_plan, f.get("atr14")), config=config)
+            validate_score_budget(groups)
+        else:
+            groups["execution"] = legacy_execution(name, 1.8 if name == "TREND_PULLBACK" else 2.)
+        evidence = score_evidence(name, groups, f, base_plan,
+            execution_dependencies=EXECUTION_DEPENDENCIES if execution_policy is not None else None,
+            setup_dependencies=leadership_dependencies if name == "LEADERSHIP_CONTINUATION" else None,
+            excluded_channels=score_exclusions)
+        earned = {key: value["earned_points"] for key, value in evidence["components"].items()}
         starter_only = ((retest and name == "LEADERSHIP_CONTINUATION")
                         or base_plan["stop_source"] == "CONFIRMED_CONSOLIDATION_LOW"
                         or (name == "REVERSAL" and consolidation
                             and not (b("no_new_low2") or b("undercut_reclaim"))))
         recognized = confirmed or recovered or all(shape.values())
-        result[name] = {"score": 100 * sum(earned.values()) / available,
+        result[name] = {"score": evidence["formal_score"],
+                        "formal_score": evidence["formal_score"],
+                        "estimated_score": evidence["estimated_score"],
+                        "score_coverage": evidence["coverage_percent"],
                         "valid": confirmed or recovered, "strict_valid": confirmed and not starter_only,
                         "recognized": recognized, "recognition_checks": shape,
                         "entry_tier": "CONFIRMED" if confirmed and not starter_only else "STARTER_ONLY" if confirmed or recovered else "FORMING" if recognized else "NONE",
                         "recovery_checks": checks,
                         "blocking_conditions": [] if confirmed or recovered else [key for key, passed in checks.items() if not passed],
-                        "components": earned, "available_weight": available,
-                        "score_evidence": score_evidence(name, groups, f, base_plan)}
+                        "components": earned, "available_weight": evidence["available_weight"],
+                        "score_evidence": evidence}
+        if execution_policy is not None:
+            result[name]["execution_score"] = dict(execution_policy, **evidence["components"]["execution"])
     return result
 
 
@@ -537,8 +611,27 @@ def technical_observation(quality: QualityResult, f: dict, decision: dict, *, va
     return result
 
 
-def decide(quality: QualityResult, f: dict, *, valuation: str = "NOT_AVAILABLE", config: LowEntryV6Config, entry_price: float | None = None) -> dict:
-    result = _decide(quality, f, valuation=valuation, config=config, entry_price=entry_price)
+def decide(quality: QualityResult, f: dict, *, valuation: str = "NOT_AVAILABLE", config: LowEntryV6Config,
+           entry_price: float | None = None, industry_mode: str = "ACTIVE",
+           convex_weights: dict | None = None, as_of: str | None = None) -> dict:
+    if convex_weights is not None and config.decision_policy_version != 3:
+        raise ValueError("CONVEX_WEIGHTS_REQUIRE_HYBRID_POLICY")
+    if config.decision_policy_version in {3, 4}:
+        from domain.strategies.low_entry_v6_hybrid import decide_hybrid
+        result = decide_hybrid(quality, f, valuation=valuation, config=config,
+                               entry_price=entry_price, industry_mode=industry_mode,
+                               convex_weights=convex_weights, as_of=as_of)
+        result["technical_observation"] = dict(patterns=[], is_entry_signal=False,
+            blocking_reasons=list(result["reasons"]), checks={"context": result["setup"]})
+        return result
+    if config.decision_policy_version == 2:
+        from domain.strategies.low_entry_v6_decision import decide_unified
+        result = decide_unified(quality, f, valuation=valuation, config=config,
+                                entry_price=entry_price, industry_mode=industry_mode)
+    else:
+        # Explicit compatibility policy for retained v1 callers; daily defaults
+        # use v2. Never silently upgrade an archived score or decision.
+        result = _decide(quality, f, valuation=valuation, config=config, entry_price=entry_price)
     result["technical_observation"] = technical_observation(quality, f, result, valuation=valuation, config=config)
     return result
 
@@ -549,11 +642,12 @@ def _decide(quality: QualityResult, f: dict, *, valuation: str, config: LowEntry
     candidates = [(name, values) for name, values in setups.items() if values["valid"]]
     recognized = [(name, values) for name, values in setups.items() if values.get("recognized")]
     selectable = candidates or recognized
-    selected, best = max(selectable, key=lambda item: item[1]["score"]) if selectable else (None, None)
+    ranking_score = lambda values: number(values["score"]) if number(values["score"]) is not None else -1.
+    selected, best = max(selectable, key=lambda item: ranking_score(item[1])) if selectable else (None, None)
     # A setup's measured score exists even when its shape is ineligible. Keep
     # the scoring reference separate from `setup`, which controls admission.
     # Eligible/forming setups retain their own score, not a higher rejected one.
-    score_setup, measured = (selected, best) if selected else max(setups.items(), key=lambda item: item[1]["score"])
+    score_setup, measured = (selected, best) if selected else max(setups.items(), key=lambda item: ranking_score(item[1]))
     score_ready = truth(f.get("history_ready")) and truth(f.get("market_ready")) and valid_price_anchor(f)
     score_basis = ("SELECTED_SETUP" if candidates else "FORMING_SETUP" if selected else "UNQUALIFIED_SETUP")
     if not score_ready:
@@ -565,6 +659,8 @@ def _decide(quality: QualityResult, f: dict, *, valuation: str, config: LowEntry
     display_score = measured["score"] if score_ready else evidence["estimated_score"]
     vetoes = hard_vetoes(f)
     result = {"signal": "AVOID", "setup": selected, "score": display_score, "setups": setups,
+              "formal_score": evidence["formal_score"], "estimated_score": evidence["estimated_score"],
+              "score_coverage": evidence["coverage_percent"],
               "score_setup": score_setup if display_score is not None else None,
               "score_basis": score_basis if score_ready else "PARTIAL_DATA" if display_score is not None else "INSUFFICIENT_HISTORY",
               "score_evidence": evidence,
@@ -598,6 +694,8 @@ def _decide(quality: QualityResult, f: dict, *, valuation: str, config: LowEntry
         return finish("NO_BUY", ";".join(vetoes))
     if not valid_price_anchor(f):
         return finish("DATA_INSUFFICIENT", "INVALID_CURRENT_OHLCV")
+    if not veto_evidence_complete(f):
+        return finish("DATA_INSUFFICIENT", "INCOMPLETE_VETO_EVIDENCE")
     if selected is None:
         return finish("AVOID", "NO_VALID_SETUP")
     if not candidates:
@@ -607,16 +705,42 @@ def _decide(quality: QualityResult, f: dict, *, valuation: str, config: LowEntry
         return finish("WATCH" if result["score"] >= 55 else "AVOID", "SETUP_FORMING_WAIT_CONFIRMATION")
     # Evaluate each eligible setup's trigger and risk separately. A high-scoring
     # but non-executable setup must not hide another genuinely qualified one.
-    outcomes = [_decide_setup(dict(result, setup=name, score=values["score"], score_setup=name, score_basis="SELECTED_SETUP", score_evidence=values["score_evidence"], entry_tier=values["entry_tier"], entry_checks={},
+    outcomes = [_decide_setup(dict(result, setup=name, score=values["score"], formal_score=values["formal_score"], estimated_score=values["estimated_score"], score_coverage=values["score_coverage"], score_setup=name, score_basis="SELECTED_SETUP", score_evidence=values["score_evidence"], entry_tier=values["entry_tier"], entry_checks={},
                                   plan=trade_plan(f, entry_price, config=config, setup=name)),
                               quality, f, valuation=valuation, config=config)
                 for name, values in candidates]
     executable = [outcome for outcome in outcomes if outcome["signal"] in EXECUTABLE_SIGNALS]
-    chosen = max(executable, key=lambda outcome: (outcome["signal"] == "BUY", outcome["score"])) if executable else max(outcomes, key=lambda outcome: outcome["score"])
+    for outcome in outcomes:
+        outcome["comparison"] = setup_comparison(outcome)
+    # Admission is evaluated BEFORE comparison; no rank can upgrade a signal.
+    chosen = max(executable, key=setup_rank) if executable else max(outcomes, key=lambda outcome: ranking_score(outcome))
     chosen["setup_decisions"] = {outcome["setup"]: {key: outcome[key] for key in
-                                ("signal", "score", "entry_tier", "risk_gate", "reasons", "required_score", "entry_checks")}
+                                ("signal", "score", "formal_score", "estimated_score", "score_coverage",
+                                 "entry_tier", "risk_gate", "reasons", "required_score", "entry_checks", "comparison")}
                                 for outcome in outcomes}
     return chosen
+
+
+def setup_comparison(outcome: dict) -> dict:
+    """Common risk/evidence axes, not a calibrated cross-setup probability."""
+    plan = outcome["plan"]
+    check = outcome.get("entry_checks", {}).get(outcome["signal"], {})
+    rr, minimum = number(plan.get("net_reward_risk")), number(check.get("minimum_rr"))
+    return {"policy_version": "coverage-net-risk-surplus/v1",
+            "coverage_percent": outcome["score_evidence"]["coverage_percent"],
+            "stop_fraction": number(plan.get("stop_distance_fraction")),
+            "net_rr": rr, "required_net_rr": minimum,
+            "net_rr_surplus": rr - minimum if rr is not None and minimum is not None else None,
+            "rr_status": "KNOWN" if rr is not None and minimum is not None else "PRICE_DISCOVERY_OR_UNKNOWN",
+            "allocation_value_status": "NOT_EVALUATED_USE_PAE"}
+
+
+def setup_rank(outcome: dict) -> tuple:
+    comparison = outcome["comparison"]
+    surplus, stop = comparison["net_rr_surplus"], comparison["stop_fraction"]
+    return (outcome["signal"] == "BUY", comparison["coverage_percent"],
+            surplus is not None, surplus if surplus is not None else 0.,
+            -stop if stop is not None else float("-inf"))
 
 
 def _decide_setup(result: dict, quality: QualityResult, f: dict, *, valuation: str, config: LowEntryV6Config) -> dict:

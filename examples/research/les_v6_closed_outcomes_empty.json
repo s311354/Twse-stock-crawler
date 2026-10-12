@@ -1,0 +1,20 @@
+{
+  "schema": "les-v6-closed-outcomes/v1",
+  "source_kind": "SYNTHETIC_TEST_ONLY",
+  "inclusion_policy": "ALL_CLOSED_EPISODES_NO_WINNER_FILTER",
+  "versions": {
+    "model": "synthetic-v6-not-a-production-model-identity",
+    "parameters": "synthetic-not-a-production-parameter-hash",
+    "code": "synthetic-not-a-production-code-hash",
+    "execution_policy": "synthetic-one-entry-full-exit-v1"
+  },
+  "as_of": "2026-10-01T13:30:00+08:00",
+  "validation_start": "2026-09-01T13:30:00+08:00",
+  "definition": {
+    "success": "POSITIVE_NET_CASH_RETURN",
+    "position_policy": "ONE_ENTRY_FULL_EXIT_NO_ADDS",
+    "max_holding_sessions": 20,
+    "max_adverse_fraction": 0.04
+  },
+  "outcomes": []
+}

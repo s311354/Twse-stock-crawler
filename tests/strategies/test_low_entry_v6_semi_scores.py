@@ -27,8 +27,20 @@ def test_semi_daily_output_keeps_actual_scores_while_restriction_is_unknown(has_
     assert report["quality"]["status"] == ("PASS" if has_financials else "DATA_INSUFFICIENT")
     assert decision["score"] == row.value("LES v6 Score") > 0
     assert decision["score_setup"] in {"REVERSAL", "TREND_PULLBACK", "LEADERSHIP_CONTINUATION"}
-    assert decision["score"] == report["setups"][decision["score_setup"]]["score"]
-    assert "N/A" not in setup_score_summary(report)
+    assert decision["policy_version"] == "context-aware-unified-score/v2"
+    assert report["setups"] == dict(selection=decision["selection"], selected_setup=decision["setup"])
+    assert "setup_decisions" not in decision
+    assert decision["raw_score"] == pytest.approx(sum(group["earned"] for group in decision["budget_groups"].values()))
+    assert decision["score"] == min(decision["adjusted_score"], decision["safety_cap"]) == 61
+    html = setup_score_summary(report)
+    assert "Final 61.00" in html and "Raw N/A" not in html
+    assert "相對強弱" in html and "缺失槽位不給分" in html
+    assert report["technical"]["industry_rs20"] is None
+    assert report["technical"]["industry_rs60"] is None
+    unknown_industry = [item for item in decision["score_evidence"]["conditions"]
+                        if item["id"] in {"relative_strength:industry_rs20", "relative_strength:industry_rs60"}]
+    assert len(unknown_industry) == 2
+    assert all(item["earned_points"] == 0 and item["status"] == "UNKNOWN" for item in unknown_industry)
     assert report["data"]["restriction_check"]["status"] == "UNKNOWN"
     assert decision["signal"] not in {"BUY", "BUY_SMALL"}
     assert report["sizing"]["indicative_shares"] == 0

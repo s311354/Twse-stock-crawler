@@ -605,13 +605,15 @@ def main() -> int:
         from .les_v6_execution import is_supported_execution_symbol, load_reports, next_sessions
         from .les_v6_premarket import apply_reports
         if versions["les"] == ["6.0.0"]:
+            from infrastructure.storage.report_evidence import ReportEvidenceReader
             if "LES v6 Report" not in frame:
                 raise ValueError("MISSING_V6_REPORTS")
-            v6_reports = {
-                str(row["證券代號"]): json.loads(row["LES v6 Report"])
-                for _, row in frame.iterrows()
-                if is_supported_execution_symbol(str(row["證券代號"]))
-            }
+            with ReportEvidenceReader(dataset_path.parent) as reader:
+                v6_reports = {
+                    str(row["證券代號"]): reader.resolve(json.loads(row["LES v6 Report"]))
+                    for _, row in frame.iterrows()
+                    if is_supported_execution_symbol(str(row["證券代號"]))
+                }
             for code, report in v6_reports.items():
                 if report.get("symbol") != code or report.get("signal_date") != data_date or report.get("model_version") != "6.0.0":
                     raise ValueError("V6_REPORT_IDENTITY_OR_DATE_MISMATCH")

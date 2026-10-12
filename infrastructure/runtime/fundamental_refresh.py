@@ -11,8 +11,10 @@ from zoneinfo import ZoneInfo
 
 from application.contracts import AnalysisContext
 from application.contracts import StockAnalysisRequest
+from application.daily_performance import measure_stage
 from application.observability import NullRunObserver
 from application.mops_refresh_control import RefreshDeferred
+from application.leadership_screen import screen_once, watch_result_key
 from application.ports import RunObserverPort
 from domain.fundamental_derivation import FundamentalBundle
 from domain.security_identity import SecurityIdentity
@@ -115,7 +117,8 @@ class FundamentalRefreshCoordinator:
         # Research observations use completed bars and official restrictions;
         # no financial or entry status is rewritten by this pre-refresh pass.
         crawler.les_v6_research_context = {}
-        build_history = getattr(crawler, "build_strategy_history", None)
+        build_history = (getattr(crawler, "build_strategy_screen_history", None)
+                         or getattr(crawler, "build_strategy_history", None))
         if callable(build_history):
             watch_histories = []
             for item, stock_no in enumerate(stocknumbers):
@@ -128,8 +131,12 @@ class FundamentalRefreshCoordinator:
             # Use the batch's scheduled session, retaining stale-symbol checks.
             watch_session = max((h.attrs.get("les_v6_analysis_session") or str(h["Date"].iloc[-1])
                                  for h in watch_histories if len(h)), default="")
-            watches = screen_leadership(watch_histories, session_date=watch_session, as_of=analysis_signal_date)
-            crawler.les_v6_research_context = {watch["symbol"]: {"watch": watch} for watch in watches}
+            watches, watch_key = screen_once(watch_histories, session_date=watch_session,
+                                            as_of=analysis_signal_date, screener=screen_leadership)
+            crawler.les_v6_research_context = {watch["symbol"]: {"watch": watch, "watch_input_sha256": watch_key,
+                                                                "watch_result_sha256": watch_result_key(watch)}
+                                             for watch in watches}
+            del watch_histories
         begin_run = getattr(self.fundamental_service, "begin_run", None)
         if callable(begin_run):
             begin_run()
@@ -142,9 +149,10 @@ class FundamentalRefreshCoordinator:
         migrate = getattr(self.fundamental_service, "migrate_local_cache", None)
         if callable(migrate):
             try:
-                migrated = migrate(
-                    issuer_symbols, signal_date=analysis_signal_date, sector=sector,
-                )
+                with measure_stage("fundamental_local_migration"):
+                    migrated = migrate(
+                        issuer_symbols, signal_date=analysis_signal_date, sector=sector,
+                    )
                 self._observer.record(
                     "fundamental_local_migration_completed", source="MOPS_CACHE", status="SUCCESS",
                     migrated_symbols=migrated,
@@ -177,7 +185,8 @@ class FundamentalRefreshCoordinator:
         )
         if callable(prepare_daily_batch) and request.market_source == "TWSE":
             try:
-                company_count = prepare_daily_batch(localized_time)
+                with measure_stage("fundamental_batch_fetch_save"):
+                    company_count = prepare_daily_batch(localized_time)
                 self._observer.record(
                     "financial_batch_loaded",
                     trade_date=context.market_date.isoformat(),
@@ -207,7 +216,8 @@ class FundamentalRefreshCoordinator:
         )
         if callable(prepare_daily_revisions):
             try:
-                correction_count = prepare_daily_revisions(localized_time)
+                with measure_stage("fundamental_revision_scan"):
+                    correction_count = prepare_daily_revisions(localized_time)
                 self._observer.record(
                     "fundamental_revision_scan_completed",
                     trade_date=context.market_date.isoformat(),
@@ -239,12 +249,13 @@ class FundamentalRefreshCoordinator:
         if callable(preload_cached_bundles):
             preload_started = time.monotonic()
             try:
-                preloaded_bundles = preload_cached_bundles(
-                    list(dict.fromkeys(issuer_symbols)),
-                    signal_date=analysis_signal_date,
-                    sector=sector,
-                    history_years=request.mops_history_years,
-                )
+                with measure_stage("fundamental_bulk_preload"):
+                    preloaded_bundles = preload_cached_bundles(
+                        list(dict.fromkeys(issuer_symbols)),
+                        signal_date=analysis_signal_date,
+                        sector=sector,
+                        history_years=request.mops_history_years,
+                    )
                 self._observer.record(
                     "fundamental_cache_preload_completed",
                     trade_date=context.market_date.isoformat(),
@@ -289,7 +300,7 @@ class FundamentalRefreshCoordinator:
                 research = crawler.les_v6_research_context
                 candidates = [symbol for symbol, row in research.items() if row["watch"]["priority_eligible"]]
                 inspect = getattr(self.fundamental_service, "inspect_local_evidence", None)
-                diagnostics = inspect(candidates, signal_date=analysis_signal_date, market=request.market_source) if callable(inspect) else {}
+                diagnostics = inspect(candidates, signal_date=analysis_signal_date, market=request.market_source, sector=sector) if callable(inspect) else {}
                 for symbol, diagnostic in diagnostics.items():
                     research[symbol]["before_refresh"] = diagnostic
                 priority_symbols = [symbol for symbol in candidates
@@ -342,12 +353,13 @@ class FundamentalRefreshCoordinator:
                 if bundle is None:
                     bundle = preloaded_bundles.get(issuer_symbol)
                     if bundle is None:
-                        bundle = self.fundamental_service.load(
-                            issuer_symbol,
-                            signal_date=analysis_signal_date,
-                            sector=sector,
-                            history_years=request.mops_history_years,
-                        )
+                        with measure_stage("fundamental_issuer_refresh"):
+                            bundle = self.fundamental_service.load(
+                                issuer_symbol,
+                                signal_date=analysis_signal_date,
+                                sector=sector,
+                                history_years=request.mops_history_years,
+                            )
                     bundles_by_issuer[issuer_symbol] = bundle
                 bundle = self._attach_security_identity(bundle, identity)
                 if request.market_source == "TPEX":
@@ -572,6 +584,18 @@ class FundamentalRefreshCoordinator:
                 account_equity=request.account_equity,
                 signal_date=bundle.as_of or analysis_signal_date,
             )
+
+        consume_history = getattr(self.fundamental_service, "consume_history_cache_summary", None)
+        if callable(consume_history):
+            with measure_stage("fundamental_history_summary"):
+                summary = consume_history()
+            if summary["completed_companies"] or summary["partial_companies"]:
+                logging.info(
+                    "MOPS history cache summary completed_companies=%s partial_companies=%s "
+                    "pending_work=%s; scope=refreshed_companies. Use debug mode for per-symbol details.",
+                    summary["completed_companies"], summary["partial_companies"], summary["pending_work"],
+                    extra=structured_extra(source="MOPS_CACHE", status="HISTORY_CACHE_SUMMARY", summary=summary),
+                )
 
         control = getattr(self.fundamental_service, "refresh_control", None)
         if control is not None:

@@ -364,28 +364,23 @@ def test_service_bulk_preload_skips_facts_and_filters_refresh_events(
     assert cached["2330"].snapshot["remote_refresh_skipped"] is True
 
     # Old v6 schemas are not eligible for the no-facts fast path.
-    schema_preload = repository.load_cached_bundles
+    schema_preload = repository.load_fundamental_bundle
     def old_v6_schema(*args, **kwargs):
-        entries = schema_preload(*args, **kwargs)
-        entry = entries["2330"]
-        snapshot = dict(entry.bundle.snapshot, les_v6_filing_schema_version="old")
-        entries["2330"] = replace(entry, bundle=replace(entry.bundle, snapshot=snapshot))
-        return entries
+        bundle = schema_preload(*args, **kwargs)
+        return replace(bundle, snapshot=dict(bundle.snapshot, les_v6_filing_schema_version="old"))
     with monkeypatch.context() as patch:
-        patch.setattr(repository, "load_cached_bundles", old_v6_schema)
+        patch.setattr(repository, "load_fundamental_bundle", old_v6_schema)
         assert service.load_cached_bundles(["2330"], signal_date="2026-07-22T13:30:00+08:00", sector="ELEC", history_years=5) == {}
 
     # A version marker alone must not make annual-only v6 evidence reusable.
-    real_preload = repository.load_cached_bundles
+    real_preload = repository.load_fundamental_bundle
     def annual_only(*args, **kwargs):
-        entries = real_preload(*args, **kwargs)
-        entry = entries["2330"]
-        snapshot = dict(entry.bundle.snapshot)
+        bundle = real_preload(*args, **kwargs)
+        snapshot = dict(bundle.snapshot)
         snapshot["les_v6_mops_filings"] = [record for record in snapshot["les_v6_mops_filings"] if record["period_end"].endswith("12-31")]
-        entries["2330"] = replace(entry, bundle=replace(entry.bundle, snapshot=snapshot))
-        return entries
+        return replace(bundle, snapshot=snapshot)
     with monkeypatch.context() as patch:
-        patch.setattr(repository, "load_cached_bundles", annual_only)
+        patch.setattr(repository, "load_fundamental_bundle", annual_only)
         assert service.load_cached_bundles(["2330"], signal_date="2026-07-22T13:30:00+08:00", sector="ELEC", history_years=5) == {}
 
     service._daily_corrections = {

@@ -9,6 +9,7 @@ from typing import Protocol
 from typing import Self
 
 from domain.fundamental_derivation import CachedFundamentalBundle
+from domain.fundamental_derivation import CachedFundamentalHeader
 from domain.fundamental_derivation import FiledFinancials
 from domain.fundamental_derivation import FundamentalBundle
 from domain.fundamental_models import FilingAnnouncement
@@ -43,6 +44,10 @@ class FundamentalRepositoryPort(Protocol):
         self, symbol: str, *, as_of: str, uow: FundamentalUnitOfWork | None = None,
     ) -> FilingCatalogState | None: ...
 
+    def load_filing_catalogs_many(
+        self, symbols: list[str], *, as_of: str, uow: FundamentalUnitOfWork | None = None,
+    ) -> dict[str, FilingCatalogState]: ...
+
     def save_filing_catalog(
         self, state: FilingCatalogState, *, uow: FundamentalUnitOfWork | None = None,
     ) -> None: ...
@@ -66,6 +71,13 @@ class FundamentalRepositoryPort(Protocol):
         as_of: str | None = None,
         uow: FundamentalUnitOfWork | None = None,
     ) -> list[FilingRecord]: ...
+
+    def load_filings_many(
+        self, symbols: list[str], *, as_of: str,
+        uow: FundamentalUnitOfWork | None = None,
+    ) -> dict[str, list[FilingRecord]]:
+        """Read cutoff-eligible filing identities in bounded batches, without facts."""
+        ...
 
     def load_filed_financials(
         self,
@@ -191,7 +203,7 @@ class FundamentalRepositoryPort(Protocol):
         uow: FundamentalUnitOfWork | None = None,
     ) -> FilingRecord: ...
 
-    def filing_set_hash(self, filings: list[FiledFinancials]) -> str: ...
+    def filing_set_hash(self, filings: list[FiledFinancials] | list[FilingRecord]) -> str: ...
 
     def load_cached_bundles(
         self,
@@ -199,8 +211,23 @@ class FundamentalRepositoryPort(Protocol):
         *,
         as_of: str,
         derivation_version: str,
+        uow: FundamentalUnitOfWork | None = None,
     ) -> dict[str, CachedFundamentalBundle]:
         """Load version-compatible active snapshots without reading facts."""
+        ...
+
+    def load_cached_bundle_headers(
+        self, symbol_sectors: Mapping[str, str], *, as_of: str,
+        derivation_version: str, uow: FundamentalUnitOfWork | None = None,
+    ) -> dict[str, CachedFundamentalHeader]:
+        """Read active identities without fetching or decoding snapshot JSON."""
+        ...
+
+    def record_fundamental_bundle_format(
+        self, symbol: str, snapshot_cache_key: str, sector: str,
+        bundle: FundamentalBundle, *, uow: FundamentalUnitOfWork | None = None,
+    ) -> None:
+        """Index the inspected stored format; do not rewrite evidence or times."""
         ...
 
     def mark_active_fundamental_bundle(

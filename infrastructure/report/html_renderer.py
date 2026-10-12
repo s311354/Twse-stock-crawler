@@ -1152,6 +1152,8 @@ class RendererFactory:
         "low_entry_score_v4_1": LowEntryV41Renderer(),
         "low_entry_score_v5": LowEntryV5Renderer(),
         "low_entry_score_v6": LowEntryV6Renderer(),
+        "low_entry_score_v6_hybrid": LowEntryV6Renderer(),
+        "low_entry_score_v6_hybrid_legacy": LowEntryV6Renderer(),
         "expected_return_exit_v3": ExpectedReturnExitV3Renderer(),
         "portfolio_allocation_v1": PortfolioAllocationRenderer(),
         "portfolio_allocation_v2": PortfolioAllocationRenderer(),

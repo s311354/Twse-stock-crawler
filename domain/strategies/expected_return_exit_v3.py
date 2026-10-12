@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+from domain.numeric_history import metadata_free_frame
 
 from domain.features import FeatureFrame
 from domain.features import SharedFeatureConfig
@@ -167,6 +168,8 @@ class ExpectedReturnExitV3Strategy(Strategy):
         self,
         data: pd.DataFrame,
         features: FeatureFrame,
+        *,
+        latest_only: bool = False,
     ) -> pd.DataFrame:
         if data.empty:
             return pd.DataFrame([self._empty_result()])
@@ -176,7 +179,7 @@ class ExpectedReturnExitV3Strategy(Strategy):
             raise ValueError(
                 "FeatureFrame config does not match EREM strategy"
             )
-        df = data.copy()
+        df = metadata_free_frame(data)
         feature_data = features.to_pandas()
         high = feature_data["high"]
         low = feature_data["low"]
@@ -534,12 +537,17 @@ class ExpectedReturnExitV3Strategy(Strategy):
                     vwap_score=vwap_score,
                     vwap_state=vwap_state,
                     decision=decision,
+                    latest_only=latest_only,
                 ),
             },
-            index=df.index,
+            index=df.tail(1).index if latest_only else df.index,
         )
 
-        return pd.concat([df, result], axis=1)
+        return pd.concat([df.tail(1) if latest_only else df, result], axis=1)
+
+    def run_latest_with_features(self, data: pd.DataFrame, features: FeatureFrame) -> pd.DataFrame:
+        """Keep full warm-up/exit sequence; materialize only the daily result."""
+        return self.run_with_features(data, features, latest_only=True)
 
     def _shared_feature_config(self) -> SharedFeatureConfig:
         return SharedFeatureConfig(
@@ -782,6 +790,7 @@ class ExpectedReturnExitV3Strategy(Strategy):
         vwap_score: pd.Series,
         vwap_state: pd.Series,
         decision: pd.Series,
+        latest_only: bool = False,
     ) -> pd.Series:
         score_frame = pd.DataFrame(
             {
@@ -847,6 +856,8 @@ class ExpectedReturnExitV3Strategy(Strategy):
                 "決策={decision}{missing_note}"
             ).format(**values)
 
+        if latest_only:
+            score_frame = score_frame.tail(1)
         return score_frame.apply(format_reason, axis=1)
 
     def _empty_result(self) -> dict[str, object]:

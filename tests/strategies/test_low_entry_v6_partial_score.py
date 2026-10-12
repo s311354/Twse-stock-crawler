@@ -12,7 +12,7 @@ from domain.strategies.low_entry_v6_signals import SETUPS, decide, score_setups,
 from domain.strategies.low_entry_score_v6 import LowEntryScoreV6Strategy, attach_low_entry_v6_context
 from application.low_entry_v6_daily import project_report
 from infrastructure.report.low_entry_v6_renderer import setup_score_summary
-from tests.strategies.test_low_entry_score_v6 import CONFIG, bars, features, quality, financials, execution_report
+from tests.strategies.test_low_entry_score_v6 import CONFIG, bars, features, setup_features, quality, financials, execution_report
 
 
 def computed(data):
@@ -139,16 +139,20 @@ def test_native_partial_pipeline_serializes_counts_scores_and_zero_position():
     decoded = json.loads(json.dumps(report, allow_nan=False))
     projected = project_report(decoded)
     assert projected["LES v6 Score"] == report["decision"]["score"] > 0
-    assert projected["建議股數"] == 0 and report["decision"]["signal"] == "DATA_INSUFFICIENT"
+    assert projected["建議股數"] == 0 and report["decision"]["signal"] == "AVOID"
+    assert report["decision"]["final_score"] < 55
+    assert report["decision"]["final_score"] <= report["decision"]["safety_cap"] == 64
     assert report["data"]["stock_history_observations"] == 40
     assert report["data"]["market_history_observations"] == 21
     html = setup_score_summary(decoded)
     assert "日線 40/60；大盤 21/21" in html
-    assert "部分資料估算；不可進場" in html and "評分覆蓋率" in html
+    assert "可得證據比例估分" in html and "不替代 Final" in html and "Safety Cap 64.00" in html
 
 
 def test_missing_technical_input_exposes_estimate_without_inflating_admission_score():
-    f = features(macd_improving=None, macd_strict=None, macd_signal_strict=None)
+    # Isolate reversal: coverage-aware comparison may legitimately select the
+    # fully observed leadership setup when all three setups are executable.
+    f = setup_features("REVERSAL", macd_improving=None, macd_strict=None, macd_signal_strict=None)
     result = decide(quality(), f, config=CONFIG)
     measured = result["setups"][result["score_setup"]]
     assert result["score"] == measured["score"]

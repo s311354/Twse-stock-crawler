@@ -7,6 +7,9 @@ import re
 import pytest
 
 from infrastructure.report.low_entry_v6_renderer import LowEntryV6Renderer
+from domain.strategies.low_entry_v6_quality import QualityResult
+from domain.strategies.low_entry_v6_signals import LowEntryV6Config, decide
+from domain.strategies.low_entry_score_v6 import parameter_version
 from tests.strategies.test_daily_v6_pipeline import build
 
 
@@ -23,6 +26,21 @@ def with_report(decision, report):
 
 def observation_report(decision, *, signal="NO_BUY", quality="REJECT"):
     report = json.loads(decision.value("LES v6 Report"))
+    # This legacy rendering contract permits manually selected lower tiers;
+    # v2 validates its sole native decision and is covered by unified tests.
+    config = LowEntryV6Config(decision_policy_version=1)
+    q, data = report["quality"], report["data"]
+    original = QualityResult(q["status"], q["score"], data["confidence"], data["integrity"],
+                             q["components"], q["coverage"], q["metrics"], reasons=tuple(q["reasons"]))
+    report["parameters"] = vars(config)
+    report["parameter_version"] = parameter_version(config)
+    report["decision"] = decide(original, report["technical"], config=config,
+                                valuation=report["valuation"]["interpretation"])
+    # Keep the explicit legacy fixture internally consistent after daily
+    # scoring switched to Hybrid. No production report is relabelled here.
+    report["entry"].update(report["decision"]["plan"],
+                          starter_trigger=report["decision"]["starter_trigger"],
+                          confirmed_trigger=report["decision"]["confirmed_trigger"])
     report["quality"]["status"] = quality
     report["decision"].update(signal=signal, reasons=["ORIGINAL_DECISION_REASON"], technical_observation={
         "patterns": ["RELATIVE_STRENGTH", "LOW_ZONE_RECOVERY"], "is_entry_signal": False,

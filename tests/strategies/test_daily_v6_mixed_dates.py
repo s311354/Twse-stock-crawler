@@ -40,8 +40,9 @@ def mixed_market():
 def test_mixed_bar_dates_publish_current_reports_without_relabelling_or_dropping_diagnostics(tmp_path, caplog):
     builder, decisions = build(mixed_market())
     current, stale = decisions
-    assert current.value("低點決策") == "BUY"
-    assert stale.value("低點決策") == "DATA_INSUFFICIENT"
+    assert current.value("低點決策") == "BUY_SMALL"
+    assert stale.value("低點決策") == "WATCH"
+    assert stale.value("LES v6 Final Score") is None
     assert stale.value("低點理由") == "STALE_MARKET_DATA"
     assert stale.value("建議股數") == 0 and stale.value("Position Fraction") == 0
     assert stale.value("Risk Gate") != "PASS"
@@ -70,7 +71,7 @@ def test_all_stale_preserves_scheduled_session_and_publishes_no_executable_repor
               "trade_values", "bids", "asks", "pe_ratios", "taiex_closes")
     market = replace(market, **{name: [getattr(market, name)[0][:-2], getattr(market, name)[1]] for name in fields})
     builder, decisions = build(market)
-    assert all(d.value("低點決策") == "DATA_INSUFFICIENT" for d in decisions)
+    assert all(d.value("低點決策") == "WATCH" and d.value("LES v6 Final Score") is None for d in decisions)
     CsvRepository(tmp_path).write_analysis_dataset("elec", builder.project_decisions(decisions))
     payload = json.loads((tmp_path / "elec_les_v6_reports.json").read_text())
     assert payload["signal_date"] == "2026-09-11" and payload["reports"] == []
@@ -123,6 +124,7 @@ def test_loader_skips_an_unsupported_non_executable_report(tmp_path):
     ("stale_buy", "STALE_EXECUTABLE_V6_REPORT"),
     ("stale_shares", "STALE_EXECUTABLE_V6_REPORT"),
     ("different_sessions", "MIXED_DAILY_ANALYSIS_SESSIONS"),
+    ("different_policy", "MIXED_DAILY_V6_SCORE_POLICIES"),
     ("identity", "V6_REPORT_IDENTITY_OR_DATE_MISMATCH"),
     ("future_date", "FUTURE_DAILY_SIGNAL_DATE"),
 ])
@@ -141,6 +143,8 @@ def test_writer_still_rejects_unsafe_reports_before_overwriting_files(tmp_path, 
         report["sizing"]["indicative_shares"] = 10
     elif mutation == "different_sessions":
         report["data"]["analysis_session_date"] = "2026-09-10"
+    elif mutation == "different_policy":
+        report["parameters"]["decision_policy_version"] = 2
     elif mutation == "identity":
         report["symbol"] = "9999"
     else:

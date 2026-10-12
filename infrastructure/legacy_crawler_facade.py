@@ -54,8 +54,13 @@ class LegacyCrawlerFacade:
     ) -> None:
         self.csv_repository = csv_repository or CsvRepository()
         self.app_settings = app_settings
+        stock_executor = None
+        workers = getattr(app_settings, "daily_strategy_workers", 1)
+        if analysis_dataset_builder is None and type(workers) is int and workers > 1:
+            from infrastructure.daily_parallel import DailyProcessExecutor
+            stock_executor = DailyProcessExecutor(workers)
         self._analysis_dataset_builder = (
-            analysis_dataset_builder or AnalysisDatasetBuilder()
+            analysis_dataset_builder or AnalysisDatasetBuilder(stock_executor=stock_executor)
         )
 
     def _market_history_input(self) -> MarketHistoryInput:
@@ -256,6 +261,11 @@ class LegacyCrawlerFacade:
         return self._analysis_dataset_builder.build_history(
             self._market_history_input(),
             item,
+        )
+
+    def build_strategy_screen_history(self, item: int) -> pd.DataFrame:
+        return self._analysis_dataset_builder.history_assembler.build_screen(
+            self._market_history_input(), item,
         )
 
     def set_low_entry_v4_fundamentals(

@@ -237,13 +237,14 @@ def test_daily_component_evidence_is_published_without_changing_native_v6_qualit
     assert evidence["score"] == 100 and evidence["available_weight"] == 100
     assert evidence["metrics"]["eleccomp_roic_5y_p25"]["value"] == .10
     assert report["quality"]["score"] == decision.value("Quality Score")
-    assert report["decision"]["signal"] == "BUY" and report["sizing"]["indicative_shares"] > 0
+    assert report["decision"]["signal"] == "BUY_SMALL" and report["sizing"]["indicative_shares"] > 0
     html = RendererFactory.get_renderer("daily_strategy_email").render(decisions)
     assert "產業 QS 100.00" in html and ELECCOMP_QUALITY_PROFILE_VERSION in html
     assert "ACTIVE" in html and "進場已啟用" in html and "SHADOW" not in html
     CsvRepository(tmp_path).write_analysis_dataset("eleccomp", builder.project_decisions(decisions))
     restored = pd.read_csv(tmp_path / "eleccomp_analysis_dataset.csv")
-    assert json.loads(restored.iloc[0]["LES v6 Report"])["industry_profile"] == profile
+    from infrastructure.storage.report_evidence import resolve_csv_report
+    assert resolve_csv_report(restored.iloc[0]["LES v6 Report"], tmp_path)["industry_profile"] == profile
     _, partial = build(replace(market, annual_fundamentals={}))
     partial_report = json.loads(partial[0].value("LES v6 Report"))
     assert partial_report["industry_profile"]["quality_evaluation"]["available_weight"] < 100

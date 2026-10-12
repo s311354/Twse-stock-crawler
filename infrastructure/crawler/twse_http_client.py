@@ -413,6 +413,13 @@ class TwseHttpClient:
             detail = f" content_type={content_type or 'unknown'}"
             if preview:
                 detail += f" body_prefix={preview!r}"
+            # TWSE serves this maintenance page with HTTP 200. A DOCTYPE-only
+            # prefix hides the actionable cause, which appears in the title.
+            title = re.search(rb"<title[^>]*>(.*?)</title>", content[:8192], re.I | re.S)
+            if title:
+                label = " ".join(title.group(1).decode("utf-8", errors="replace").split())
+                if "網站維護中" in label or "under maintenance" in label.lower():
+                    detail += " reason=UPSTREAM_MAINTENANCE"
             return TwseNetworkError(
                 f"{context} returned a transient non-JSON response;{detail}",
                 retryable=True,

@@ -1,0 +1,112 @@
+{
+  "schema": "twse-reviewed-emergency-calendar/v1",
+  "source": "TWSE_OFFICIAL",
+  "coverage": "REVIEWED_ANNOUNCEMENTS_ONLY_NOT_COMPLETE_ARCHIVE",
+  "announcements": [
+    {
+      "date": "2024-10-02",
+      "status": "CLOSED",
+      "market": "TWSE",
+      "proof": {
+        "status": "VERIFIED",
+        "verified_by": "Codex official PDF visual and extracted-text review",
+        "verified_at": "2026-10-10T06:11:52.404495+00:00",
+        "verification_method": "OFFICIAL_PDF_DATE_TITLE_AND_MARKET_CLOSURE_REVIEW",
+        "binding": {
+          "kind": "CALENDAR_EXCEPTION",
+          "market": "TWSE",
+          "date": "2024-10-02",
+          "status": "CLOSED"
+        },
+        "published_at": "2024-10-01",
+        "publication_precision": "DATE",
+        "extraction_reviewed": true,
+        "quotes": [
+          "中華民國 113 年 10 月 1 日",
+          "臺灣證券交易所集中交易市場113年10月2日休市一天"
+        ],
+        "document": {
+          "url": "https://investoredu.twse.com.tw/Mobile_pages/..%2FFileSystem%2FFileUpload%2F6bef49cf-89e8-4bfd-87d8-8acf99fb802f.pdf",
+          "sha256": "3b3674ead9f6dec254a0e333aeb51da996719ee71148b8ef586492d914aa43f9",
+          "retrieved_at": "2026-10-10T06:11:52.404495+00:00",
+          "extracted_text": "中華民國 113 年 10 月 1 日\n交易部\n\n\n臺灣證券交易所集中交易市場113年10月2日休市一天\n\n   臺灣證券交易所表示，由於山陀兒颱風來襲，臺北市政府宣布全體公教機關停止上班，113\n年 10 月 2 日集中交易市場全日休市，當日應屆交割款券順延辦理。\n\n\n\n\n                                          頁 1\n\f",
+          "body_ref": {
+            "schema": "research-document-ref/v1",
+            "sha256": "3b3674ead9f6dec254a0e333aeb51da996719ee71148b8ef586492d914aa43f9",
+            "size_bytes": 155218
+          }
+        }
+      }
+    },
+    {
+      "date": "2024-10-03",
+      "status": "CLOSED",
+      "market": "TWSE",
+      "proof": {
+        "status": "VERIFIED",
+        "verified_by": "Codex official PDF visual and extracted-text review",
+        "verified_at": "2026-10-10T06:11:52.404495+00:00",
+        "verification_method": "OFFICIAL_PDF_DATE_TITLE_AND_MARKET_CLOSURE_REVIEW",
+        "binding": {
+          "kind": "CALENDAR_EXCEPTION",
+          "market": "TWSE",
+          "date": "2024-10-03",
+          "status": "CLOSED"
+        },
+        "published_at": "2024-10-02",
+        "publication_precision": "DATE",
+        "extraction_reviewed": true,
+        "quotes": [
+          "中華民國 113 年 10 月 2 日",
+          "臺灣證券交易所集中交易市場113年10月3日休市一天"
+        ],
+        "document": {
+          "url": "https://investoredu.twse.com.tw/Mobile_pages/..%2FFileSystem%2FFileUpload%2F2c6e50d4-a390-439c-a2c4-823937dee4b2.pdf",
+          "sha256": "56ba9f85f7668e8ac81ea079b4349a83aaabeb517243d683fdf31596ee28d62b",
+          "retrieved_at": "2026-10-10T06:11:52.404495+00:00",
+          "extracted_text": "中華民國 113 年 10 月 2 日\n交易部\n\n\n臺灣證券交易所集中交易市場113年10月3日休市一天\n\n   臺灣證券交易所表示，由於山陀兒颱風來襲，臺北市政府宣布全體公教機關停止上班，113\n年 10 月 3 日集中交易市場全日休市，當日應屆交割款券順延辦理。\n\n\n\n\n                                          頁 1\n\f",
+          "body_ref": {
+            "schema": "research-document-ref/v1",
+            "sha256": "56ba9f85f7668e8ac81ea079b4349a83aaabeb517243d683fdf31596ee28d62b",
+            "size_bytes": 154569
+          }
+        }
+      }
+    },
+    {
+      "date": "2024-10-31",
+      "status": "CLOSED",
+      "market": "TWSE",
+      "proof": {
+        "status": "VERIFIED",
+        "verified_by": "Codex official PDF visual and extracted-text review",
+        "verified_at": "2026-10-10T06:43:54.346222+00:00",
+        "verification_method": "OFFICIAL_PDF_DATE_TITLE_AND_MARKET_CLOSURE_REVIEW",
+        "binding": {
+          "kind": "CALENDAR_EXCEPTION",
+          "market": "TWSE",
+          "date": "2024-10-31",
+          "status": "CLOSED"
+        },
+        "published_at": "2024-10-30",
+        "publication_precision": "DATE",
+        "extraction_reviewed": true,
+        "quotes": [
+          "中華民國 113 年 10 月 30 日",
+          "臺灣證券交易所集中交易市場113年10月31日休市一天"
+        ],
+        "document": {
+          "url": "https://investoredu.twse.com.tw/Mobile_pages/..%2FFileSystem%2FFileUpload%2F7b8ec123-b269-45f2-898f-667c7025a970.pdf",
+          "sha256": "c89859307ae8e3794f7554a878587c9fed3eaf664ff3730d4fcdc461621f5021",
+          "retrieved_at": "2026-10-10T06:42:15.503491+00:00",
+          "extracted_text": "中華民國 113 年 10 月 30 日\n交易部\n\n\n臺灣證券交易所集中交易市場113年10月31日休市一天\n\n   臺灣證券交易所表示，由於康芮颱風來襲，臺北市政府宣布公教機關停止上班，113 年 10\n月 31 日集中交易市場全日休市，當日應屆交割款券順延辦理。\n\n\n\n\n                                            頁 1\n\f",
+          "body_ref": {
+            "schema": "research-document-ref/v1",
+            "sha256": "c89859307ae8e3794f7554a878587c9fed3eaf664ff3730d4fcdc461621f5021",
+            "size_bytes": 153171
+          }
+        }
+      }
+    }
+  ]
+}

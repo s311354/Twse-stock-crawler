@@ -232,8 +232,9 @@ class SnapshotAssembler:
         snapshot["base_quality_evidence_mode"] = source
         # Preserve raw period values and their observation time, not annual
         # approximations or a v5 score. v6 performs its own PIT/YTD normalization.
-        # Keep TWSE core precedence; separately dated MOPS quarter EPS is usable
-        # only after v6 ties the entire period and checks its own PIT cutoff.
+        # An unverified batch scope must not replace the complete canonical
+        # MOPS original, including its CFO and bound comparisons. Explicitly
+        # scoped legacy batches retain full-core tie-out before enrichment.
         twse = [snapshot_record(item) for item in history]
         snapshot["les_v6_filings"] = combine_filing_sources(
             snapshot.get("les_v6_mops_filings", []), twse, as_of=signal_time,

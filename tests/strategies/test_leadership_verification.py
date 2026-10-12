@@ -121,9 +121,10 @@ def test_daily_overlay_preserves_v6_decision_with_annual_dataframe_metadata(has_
     pd.testing.assert_frame_equal(history, original)
     assert history.attrs[ANNUAL_FUNDAMENTALS_ATTR] is annual
     report = json.loads(actual.iloc[0]["LES v6 Report"])
-    assert report["decision"]["signal"] == ("BUY" if has_filings else "DATA_INSUFFICIENT")
+    assert report["decision"]["signal"] == ("BUY_SMALL" if has_filings else "WATCH")
     if not has_filings:
         assert report["sizing"]["indicative_shares"] == 0
+        assert report["decision"]["safety_cap"] == 61
 
 
 @pytest.mark.parametrize("change,reason", [
@@ -191,14 +192,20 @@ def test_diagnostics_separate_missing_quarters_fields_and_optional_evidence():
     assert malformed["local_review_required"] and not malformed["backfill_needed"]
 
 
-def test_ytd_predecessor_is_a_real_backfill_dependency():
+def test_ttm_ytd_predecessor_is_diagnostic_but_missing_reported_comparisons_need_review():
     records = financials()[-8:]
     for record in records:
         record["flow_basis"] = "YTD"
         record["basic_eps_quarter"] = record["basic_eps"]
     diagnostic = verification_diagnostics(records, symbol="2330", as_of=AS_OF)
-    assert diagnostic["missing_periods"] == ["2024Q2"]
-    assert not diagnostic["local_review_required"]
+    assert diagnostic["missing_periods"] == []
+    assert diagnostic["diagnostic_missing_periods"] == ["2024Q2"]
+    # Source/revision labels alone cannot attest that two YTD reports have the
+    # same accounting revision basis. Presence of the predecessor is not PASS.
+    assert diagnostic["local_review_required"]
+    assert any(c["reason"] == "REVISION_BASIS_UNVERIFIED" and c["status"] == "UNKNOWN" and not c["required_by_quality"]
+               for c in diagnostic["field_checks"])
+    assert "2026Q2:comparative:revenue" in diagnostic["unresolved_fields"]
 
 
 def test_watch_is_additive_never_turns_missing_data_into_a_buy():
@@ -212,7 +219,8 @@ def test_watch_is_additive_never_turns_missing_data_into_a_buy():
     report = json.loads(output.iloc[0]["LES v6 Report"])
     assert output.iloc[0]["LES v6 Watch Status"] == "LEADERSHIP_WATCH"
     assert report["research"]["verification"]["backfill_needed"]
-    assert report["decision"]["signal"] == "DATA_INSUFFICIENT"
+    assert report["decision"]["signal"] == "WATCH"
+    assert report["decision"]["safety_cap"] == 61
     assert output.iloc[0]["Position Fraction"] == output.iloc[0]["建議股數"] == 0
     assert execute_request(dict(report=report, quote={}, now=AS_OF,
                                 trading_sessions=[SESSION], portfolio=ACCOUNT, hard_risk=False))["action"] == "SKIP"
@@ -227,20 +235,24 @@ def test_reassessment_preserves_old_block_and_execution_rechecks_new_risk(tmp_pa
     history.attrs[FUNDAMENTAL_SNAPSHOT_ATTR] = complete
     history.attrs[SIGNAL_DATE_ATTR] = "2026-09-11T16:00:00+08:00"
     after = daily_report(history)
-    assert before["decision"]["signal"] == "DATA_INSUFFICIENT"
-    assert after["decision"]["signal"] == "BUY" and after["entry"]["is_fill"] is False
+    assert before["decision"]["signal"] == "WATCH"
+    assert before["quality"]["status"] == "DATA_INSUFFICIENT"
+    assert after["decision"]["signal"] == "BUY_SMALL" and after["entry"]["is_fill"] is False
     repository = LeadershipWatchRepository(tmp_path / "research.sqlite3")
     repository.record("ELEC", [before, after, after])
     events = repository.timeline("ELEC", "2330")
     assert len(events) == 2
-    assert [event["decision"]["signal"] for event in events] == ["DATA_INSUFFICIENT", "BUY"]
+    assert [event["decision"]["signal"] for event in events] == ["WATCH", "BUY_SMALL"]
     assert events[0]["research"]["verification"]["backfill_needed"]
     quote = dict(symbol="2330", timestamp="2026-09-14T09:10:00+08:00", price=140, bid=139.9, ask=140, restricted=False)
     result = execute_request(dict(report=after, quote=quote, now=quote["timestamp"],
                                   trading_sessions=[SESSION, "2026-09-14"], portfolio=ACCOUNT, hard_risk=False))
     assert result["action"] == "SKIP" and result["reason"] == "REPRICED_RISK_OR_LIQUIDITY_FAIL"
-    # Missing optional data alone was never a critical-data exemption.
-    assert after["quality"]["optional"]["cfo"] == "NOT_AVAILABLE"
+    # Cash flow now participates in native Quality; missing optional audit
+    # evidence does not fabricate it or waive any execution risk check.
+    assert after["quality"]["metrics"]["cfo_ttm"] > 0
+    assert after["quality"]["coverage"]["cash_flow"] == 100
+    assert after["quality"]["optional"]["auditor_opinion"] == "NOT_AVAILABLE"
 
 
 def research_market():

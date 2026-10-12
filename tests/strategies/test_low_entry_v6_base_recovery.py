@@ -1,5 +1,6 @@
 """Completed compact bases broaden eligibility without upgrading missing evidence."""
 from copy import deepcopy
+from dataclasses import replace
 import json
 
 import numpy as np
@@ -7,7 +8,7 @@ import pandas as pd
 import pytest
 
 from domain.strategies.low_entry_v6_features import _consolidation_features
-from domain.strategies.low_entry_v6_signals import decide, trade_plan, size_position
+from domain.strategies.low_entry_v6_signals import LowEntryV6Config, decide, trade_plan, size_position
 from domain.strategies.low_entry_score_v6 import assess_execution, attach_low_entry_v6_context, LowEntryScoreV6Strategy
 from domain.strategies.low_entry_v6_report import report_failure
 from tests.strategies.test_low_entry_score_v6 import ACCOUNT, CONFIG, execution_report, financials, quality, setup_features
@@ -126,7 +127,8 @@ def test_base_never_raises_targets_or_bypasses_small_quality_floor():
     assert result["signal"] == "ARMED" and result["plan"]["target_price"] == 101.
     assert "RR_BELOW_MINIMUM" in result["entry_checks"]["BUY_SMALL"]["blockers"]
     assert decide(quality(score=74.9), base_features(), config=CONFIG)["signal"] == "BUY_SMALL"
-    assert decide(quality(score=69.9), base_features(), config=CONFIG)["signal"] == "WATCH_ONLY"
+    assert decide(quality(score=65), base_features(), config=CONFIG)["signal"] == "BUY_SMALL"
+    assert decide(quality(score=64.9), base_features(), config=CONFIG)["signal"] == "WATCH_ONLY"
 
 
 @pytest.mark.parametrize("setup", ["REVERSAL", "TREND_PULLBACK"])
@@ -184,10 +186,10 @@ def recovery_bars():
     return data
 
 
-def raw_recovery_report(data):
+def raw_recovery_report(data, config=None):
     prepared = attach_low_entry_v6_context(data, symbol="2330", sector="ELEC",
                                            as_of="2026-09-11T15:00+08:00", filings=financials(), portfolio=ACCOUNT)
-    report = LowEntryScoreV6Strategy().run_latest(prepared).iloc[0]["LES v6 Report"]
+    report = LowEntryScoreV6Strategy(config=config).run_latest(prepared).iloc[0]["LES v6 Report"]
     return json.loads(json.dumps(report, allow_nan=False))
 
 
@@ -197,8 +199,10 @@ def test_raw_bars_to_quality_to_serialized_base_signal_to_next_session_execution
     f, d, entry = (report[key] for key in ("technical", "decision", "entry"))
     assert f["consolidation_confirmed"] is True and f["no_new_low2"] is True
     assert f["rs_improving"] is False and f["rs_slope5"] < 0
-    assert d["signal"] == "BUY_SMALL" and d["setup"] == "REVERSAL" and d["score"] >= 75
-    assert d["entry_tier"] == "STARTER_ONLY" and report_failure(report) is None
+    assert d["signal"] == "AVOID" and d["setup"] == "REVERSAL"
+    assert d["raw_score"] == 75 and d["penalty"] == 23 and d["score"] == 52
+    assert d["safety_cap"] == 74
+    assert d["entry_tier"] == "STARTER_ONLY" and report_failure(report) == "INELIGIBLE_PUBLISHED_SIGNAL"
     assert entry["stop_source"] == "CONFIRMED_CONSOLIDATION_LOW"
     assert entry["stop_support"] == 96.3 and entry["trigger_price"] == 98.8
     assert entry["target_price"] == 120.5 and entry["is_fill"] is False
@@ -206,8 +210,17 @@ def test_raw_bars_to_quality_to_serialized_base_signal_to_next_session_execution
                  price=98.85, bid=98.8, ask=98.85, restricted=False)
     result = assess_execution(report, quote, now=quote["timestamp"],
                               trading_sessions=["2026-09-11", "2026-09-14"], portfolio=ACCOUNT)
-    assert result["action"] == "ELIGIBLE" and result["stop_price"] == entry["stop_price"]
-    assert result["shares"] > 0 and result["is_fill"] is False
+    assert result["action"] == "SKIP" and report["sizing"]["indicative_shares"] == 0
+    # The versioned additive policy still reproduces the former entry without
+    # changing the causal stop, target, gate contract, or raw evidence.
+    additive = raw_recovery_report(recovery_bars(), replace(LowEntryV6Config(), correlation_policy_version=1))
+    assert additive["decision"]["signal"] == "BUY_SMALL" and additive["decision"]["score"] == 74
+    assert additive["technical"] == f and additive["entry"] == entry
+    assert report_failure(additive) is None
+    eligible = assess_execution(additive, quote, now=quote["timestamp"],
+                                trading_sessions=["2026-09-11", "2026-09-14"], portfolio=ACCOUNT)
+    assert eligible["action"] == "ELIGIBLE" and eligible["stop_price"] == entry["stop_price"]
+    assert eligible["shares"] > 0 and eligible["is_fill"] is False
 
 
 @pytest.mark.parametrize("column,value", [("Low", 95.), ("Volume", 0.), ("TAIEX Close", np.nan)])

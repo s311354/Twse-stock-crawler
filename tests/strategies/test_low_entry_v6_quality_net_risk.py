@@ -12,7 +12,7 @@ from tests.strategies.test_low_entry_score_v6 import (
 
 
 @pytest.mark.parametrize("setup", signals.SETUPS)
-@pytest.mark.parametrize("qs", [70., 74.999])
+@pytest.mark.parametrize("qs", [65., 69.999, 70., 74.999])
 def test_quality_pass_is_sufficient_for_small_in_model_report_and_execution(setup, qs):
     f = setup_features(setup, break_previous_high=False, reclaim10=False, reclaim20=False)
     if setup == "LEADERSHIP_CONTINUATION":
@@ -31,7 +31,7 @@ def test_quality_pass_is_sufficient_for_small_in_model_report_and_execution(setu
                             trading_sessions=["2026-09-11", "2026-09-14"], portfolio=ACCOUNT)["action"] == "ELIGIBLE"
 
 
-@pytest.mark.parametrize("field,value", [("confidence", None), ("confidence", 69.999),
+@pytest.mark.parametrize("field,value", [("confidence", None), ("confidence", 64.999),
                                         ("coverage", {}), ("status", "WATCH_QUALITY")])
 def test_lower_starter_qs_does_not_waive_data_confidence_coverage_or_classification(field, value):
     report = execution_report()
@@ -118,7 +118,8 @@ def test_pre_cost_only_raw_fixture_is_not_silently_grandfathered():
     report = raw_execution_report(cost_headroom=False)
     assert report["entry"]["reward_risk"] > 2
     assert report["entry"]["net_reward_risk"] < 1.7
-    assert report["decision"]["signal"] == "ARMED"
+    assert report["decision"]["signal"] == "WATCH"
+    assert report["decision"]["safety_cap"] <= 64
     assert "RR_BELOW_MINIMUM" in report["decision"]["entry_checks"]["BUY_SMALL"]["blockers"]
 
 

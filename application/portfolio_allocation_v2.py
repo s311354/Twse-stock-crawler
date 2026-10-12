@@ -90,11 +90,15 @@ class PortfolioAllocationV2Pipeline:
         self,
         decisions: Sequence[StrategyDecision],
         context: PortfolioRuntimeContext,
+        *,
+        blocked_reason: str | None = None,
     ) -> tuple[StrategyDecision, ...]:
         base_decisions = tuple(decisions)
         if not base_decisions:
             return ()
         portfolio_at = max(item.evaluated_at for item in base_decisions)
+        if blocked_reason is not None:
+            return self._append_unavailable(base_decisions, context, portfolio_at, blocked_reason)
         try:
             request, trade_date, input_mode = self._build_request(
                 base_decisions,

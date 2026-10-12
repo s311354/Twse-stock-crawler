@@ -11,7 +11,7 @@ from domain.strategies.low_entry_score_v6 import (
 )
 from domain.strategies.low_entry_v6_features import build_features
 from domain.strategies.low_entry_v6_report import report_failure
-from domain.strategies.low_entry_v6_signals import trade_plan
+from domain.strategies.low_entry_v6_signals import LowEntryV6Config, trade_plan
 from tests.strategies.test_low_entry_score_v6 import ACCOUNT, CONFIG, financials
 
 
@@ -43,7 +43,8 @@ def raw_report(data):
         data, symbol="2330", name="合成回測案例", sector="ELEC",
         as_of="2026-09-11T15:00:00+08:00", filings=financials(), portfolio=ACCOUNT,
     )
-    result = LowEntryScoreV6Strategy().run_latest(prepared)
+    # Freeze the earlier leadership slots to isolate causal retest/execution parity.
+    result = LowEntryScoreV6Strategy(config=LowEntryV6Config(leadership_policy_version=1)).run_latest(prepared)
     assert len(result) == 1
     # Exercise the same JSON-safe frozen evidence consumed by execution adapters.
     return json.loads(json.dumps(result.iloc[0]["LES v6 Report"], allow_nan=False))
@@ -87,7 +88,7 @@ def test_raw_bars_establish_starter_retest_and_preserve_stop_through_execution(p
     assert report["downtrend_gate"]["hard_veto"] is False
     assert decision["setup"] == "LEADERSHIP_CONTINUATION"
     assert decision["signal"] == "BUY_SMALL" and decision["entry_tier"] == "STARTER_ONLY"
-    assert "STARTER_ONLY_SETUP" in decision["entry_checks"]["BUY"]["blockers"]
+    assert "STRUCTURAL_ANCHOR_STARTER_ONLY" in decision["entry_checks"]["BUY"]["blockers"]
     assert decision["risk_gate"] == "PASS" and decision["risk_fraction"] == CONFIG.small_risk_fraction
     assert decision["score"] >= decision["required_score"]
     old_plan = trade_plan(retest.to_dict(), config=CONFIG)
@@ -97,6 +98,8 @@ def test_raw_bars_establish_starter_retest_and_preserve_stop_through_execution(p
     assert entry["stop_price"] == pytest.approx(99.8 - CONFIG.stop_buffer_atr * retest["atr14"])
     assert 0 < entry["stop_distance_atr"] <= CONFIG.starter_maximum_stop_atr
     assert entry["target_price"] is None and entry["reward_risk"] is None
+    assert decision["rr_policy"] == "PRICE_DISCOVERY_EXTENSION_SUPPORT"
+    assert entry["net_reward_risk"] is None
     assert entry["trigger_price"] == data.iloc[-1]["High"]
     assert entry["is_fill"] is False and report_failure(report) is None
 

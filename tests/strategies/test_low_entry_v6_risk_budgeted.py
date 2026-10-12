@@ -19,7 +19,10 @@ def test_wider_structural_stop_allows_only_small_not_full_buy(setup):
     assert result["signal"] == "BUY_SMALL"
     assert result["plan"]["stop_distance_atr"] == pytest.approx(1.9)
     assert result["risk_fraction"] == .0025
-    assert result["entry_checks"]["BUY"]["blockers"] == ["STOP_DISTANCE_EXCEEDS_LIMIT"]
+    # Inspect the requested setup independently: the common risk ranking may
+    # select another eligible starter, whose BUY also lacks a confirmed shape.
+    assert result["setup_decisions"][setup]["entry_checks"]["BUY"]["blockers"] == ["STOP_DISTANCE_EXCEEDS_LIMIT"]
+    assert "STOP_DISTANCE_EXCEEDS_LIMIT" in result["entry_checks"]["BUY"]["blockers"]
     assert result["entry_checks"]["BUY_SMALL"]["blockers"] == []
 
 

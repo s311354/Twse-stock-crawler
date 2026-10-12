@@ -7,6 +7,7 @@ import pandas as pd
 
 from domain.features import FeatureFrame
 from domain.strategies.low_entry_v6_score_evidence import DEPENDENCIES
+from domain.strategies.low_entry_v6_leadership import leadership_features
 
 
 # Fixed, deliberately short causal window. ATR tolerances are frozen at the
@@ -14,10 +15,11 @@ from domain.strategies.low_entry_v6_score_evidence import DEPENDENCIES
 BREAKOUT_RETEST_MAX_AGE = 5
 BREAKOUT_RETEST_LOWER_ATR = .30
 BREAKOUT_RETEST_UPPER_ATR = .50
+CONSOLIDATION_MAX_SESSIONS = 5
 
 
 def _consolidation_features(f: pd.DataFrame) -> pd.DataFrame:
-    """A compact three-session shelf, known only after two held right bars.
+    """A compact 3--5 session shelf, known only after at least two held right bars.
 
     Daily lows may oscillate. The first low must remain the floor, above an
     already confirmed higher swing low. Freeze ATR at that first bar; neither
@@ -30,16 +32,29 @@ def _consolidation_features(f: pd.DataFrame) -> pd.DataFrame:
              & (h >= pd.concat([o, c], axis=1).max(axis=1))
              & (l <= pd.concat([o, c], axis=1).min(axis=1)))
     ready = f.reindex(columns=("history_ready", "market_ready", "support_intact")).eq(True).all(axis=1)
-    floor = l.shift(2)
-    ceiling = h.rolling(3, min_periods=3).max()
-    confirmed = ((valid & ready).rolling(3, min_periods=3).sum().eq(3)
-                 & f.get("higher_low", pd.Series(False, index=f.index)).shift(2).eq(True)
-                 & (floor > support.shift(2)) & (floor > support)
-                 & (l.rolling(3, min_periods=3).min() >= floor)
-                 & (ceiling - floor <= 1.5 * atr.shift(2))
-                 & (c >= (ceiling + floor) / 2) & (c >= c.shift(2)))
+    confirmed = pd.Series(False, index=f.index)
+    floors = pd.Series(np.nan, index=f.index)
+    sessions = pd.Series(np.nan, index=f.index)
+    higher = f.get("higher_low", pd.Series(False, index=f.index))
+    # Prefer the highest independently held floor, then the shortest window.
+    # Never choose a floor because it happens to make an entry pass RR/ATR.
+    for size in range(3, CONSOLIDATION_MAX_SESSIONS + 1):
+        lag = size - 1
+        floor = l.shift(lag)
+        ceiling = h.rolling(size, min_periods=size).max()
+        held = ((valid & ready).rolling(size, min_periods=size).sum().eq(size)
+                & higher.shift(lag).eq(True)
+                & (floor > support.shift(lag)) & (floor > support)
+                & (l.rolling(size, min_periods=size).min() >= floor)
+                & (ceiling - floor <= 1.5 * atr.shift(lag))
+                & (c >= (ceiling + floor) / 2) & (c >= c.shift(lag)))
+        replace = held & (floors.isna() | (floor > floors))
+        floors = floors.where(~replace, floor)
+        sessions = sessions.where(~replace, size)
+        confirmed |= held
     return pd.DataFrame({"consolidation_confirmed": confirmed,
-                         "consolidation_support": floor.where(confirmed)}, index=f.index)
+                         "consolidation_support": floors,
+                         "consolidation_sessions": sessions}, index=f.index)
 
 
 def _breakout_retest_features(f: pd.DataFrame) -> pd.DataFrame:
@@ -191,6 +206,8 @@ def build_features(data: pd.DataFrame, shared: FeatureFrame) -> pd.DataFrame:
             distinct = events.dropna()
             events = distinct[distinct.ne(distinct.shift(1))].reindex(events.index)
         f[label] = events.ffill()
+        event_position = pd.Series(np.arange(len(f)), index=f.index).where(events.notna()).ffill()
+        f[f"{label}_confirmation_age"] = np.arange(len(f)) - event_position
         previous_events = events.dropna().shift(1).reindex(events.index).ffill()
         f[f"previous_{label}"] = previous_events
     f["higher_low"] = f["swing_low"] > f["previous_swing_low"]
@@ -221,7 +238,7 @@ def build_features(data: pd.DataFrame, shared: FeatureFrame) -> pd.DataFrame:
     f["breakout_extension"] = (c - f["hh20"]) / atr
     f["break_previous_high"] = c > f["previous_high"]
     f["restricted"] = data["Restricted"] if "Restricted" in data else None
-    f = f.join(_breakout_retest_features(f)).join(_consolidation_features(f))
+    f = f.join(_breakout_retest_features(f)).join(_consolidation_features(f)).join(leadership_features(f))
     # Comparisons with NaN above intentionally fail closed for admission. Keep
     # their observability separately: False during warm-up is not evidence of
     # an actually failed condition in a partial-data score estimate.
@@ -250,6 +267,9 @@ def build_features(data: pd.DataFrame, shared: FeatureFrame) -> pd.DataFrame:
         "restricted": f["restricted"].map(lambda value: str(value) in {"True", "False"}),
         # A down/flat day is a known failed up-volume test, not missing data.
         "up_volume_ratio": window(valid_bar, 2) & (f["up_volume_ratio"].notna() | c.le(c.shift(1))),
+        "base_compression": f["base_compression"].notna(),
+        "downside_resilience": f["downside_resilience"].notna(),
+        "breakout_quality": f["breakout_quality"].notna(),
     })
     # Some shared indicators tolerate holes/fill volume internally. Partial
     # estimates must not interpret those synthetic observations as evidence.
@@ -261,6 +281,8 @@ def build_features(data: pd.DataFrame, shared: FeatureFrame) -> pd.DataFrame:
         known[key] &= window(valid_bar, periods)
     scored_fields = {key for groups in DEPENDENCIES.values() for fields in groups.values()
                      for condition in fields for key in condition if not key.startswith("@")}
+    scored_fields.update(("base_compression", "downside_resilience", "clv_breakout_quality",
+                          "breakout_volume_ratio", "breakout_amount_ratio"))
     scored_masks = {key: value for key, value in known.items() if key in scored_fields}
     f["score_availability"] = pd.Series(pd.DataFrame(scored_masks, index=f.index).to_dict("records"), index=f.index)
     f["stock_history_observations"] = valid_bar.rolling(60, min_periods=1).sum()

@@ -5,6 +5,7 @@ import datetime as dt
 from email import message_from_string
 from email.header import decode_header, make_header
 import json
+from math import fsum
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -15,6 +16,7 @@ import pytest
 
 from application.analysis_dataset import AnalysisDatasetBuilder
 from application.market_history import MarketHistoryInput
+from application.low_entry_v6_daily import DAILY_V6_CONFIG, DAILY_V6_PARAMETER_VERSION, DAILY_V6_STRATEGY, unavailable_report
 from application.strategy_contracts import StrategyContractError, StrategyDecisionAssembler
 from application.portfolio_allocation_v2 import PortfolioAllocationV2Pipeline
 from application.portfolio_contracts import PortfolioRuntimeContext
@@ -22,9 +24,13 @@ from domain.model_contracts import FieldSource, FieldUnit
 from domain.trading_restrictions import RESTRICTION_ENDPOINTS
 from domain.strategies.low_entry_score_v6 import LowEntryScoreV6Strategy, attach_low_entry_v6_context
 from domain.strategies.low_entry_v6_report import report_failure
+from domain.strategies.low_entry_v6_quality import QualityResult
+from domain.strategies.low_entry_v6_signals import LowEntryV6Config, decide
+from domain.strategies.low_entry_v6_hybrid import factor_budgets, model_spec
 from infrastructure.crawler.trading_restrictions import TradingRestrictionClient
 from infrastructure.report.html_renderer import RendererFactory
 from infrastructure.storage.csv_repository import CsvRepository
+from infrastructure.storage.report_evidence import resolve_csv_report
 from aistock_twse_integration.les_v6_execution import load_reports, execute_request
 from tests.strategies.test_low_entry_score_v6 import financials, ACCOUNT
 
@@ -65,10 +71,36 @@ def test_raw_daily_generation_is_real_v6_not_relabelled_v5(tmp_path):
     builder, decisions = build()
     decision = decisions[0]
     report = json.loads(decision.value("LES v6 Report"))
-    assert report["decision"]["signal"] == decision.value("低點決策") == "BUY"
-    assert report["decision"]["score"] >= 80
+    assert report["decision"]["signal"] == decision.value("低點決策") == "BUY_SMALL"
+    # This same synthetic bar series now uses continuous Hybrid slots, not
+    # the old 89 - 18 three-setup ledger. Only score policy is revised;
+    # evidence, costs, stop/RR and allocation limits remain native.
+    assert report["parameters"] == vars(DAILY_V6_CONFIG)
+    assert report["parameter_version"] == DAILY_V6_PARAMETER_VERSION
+    assert report["decision"]["policy_version"] == model_spec(DAILY_V6_CONFIG)["policy_version"]
+    # Independently recombine the pre-change factor attainments under 30/10/20/25/5/10.
+    q = report["quality"]
+    baseline = decide(QualityResult(q["status"], q["score"], report["data"]["confidence"],
+        report["data"]["integrity"], q["components"], q["coverage"], q["metrics"]),
+        report["technical"], valuation=report["valuation"]["interpretation"],
+        config=LowEntryV6Config(decision_policy_version=3))
+    assert baseline["raw_score"] == pytest.approx(68.66215714555538)
+    assert report["decision"]["raw_score"] == pytest.approx(fsum(
+        group["earned"] / group["budget"] * dict(factor_budgets(DAILY_V6_CONFIG))[factor]
+        for factor, group in baseline["budget_groups"].items()))
+    assert baseline["plan"] == {
+        key: report["entry"][key] for key in baseline["plan"]}
+    assert report["decision"]["penalty"] == 0
+    assert report["decision"]["score"] == report["decision"]["raw_score"]
+    assert report["decision"]["selection"]["mode"] == "STRUCTURE_BEFORE_SCORING"
+    assert "setup_decisions" not in report["decision"]
+    assert report["decision"]["score_model"] == model_spec(DAILY_V6_CONFIG)
+    assert {key: group["budget"] for key, group in report["decision"]["budget_groups"].items()} == dict(factor_budgets(DAILY_V6_CONFIG))
+    assert report["decision"]["raw_score"] == pytest.approx(sum(
+        group["earned"] for group in report["decision"]["budget_groups"].values()))
+    assert report["technical"]["score_availability"]["restricted"] is True
     assert report["quality"]["status"] == decision.value("Quality Status") == "PASS"
-    # Intentionally absent legacy annual snapshot: v5 would NOT issue this BUY.
+    # Intentionally absent legacy annual snapshot: v5 cannot issue this entry.
     assert decision.value("LES v5 Final Quality Status") == "DATA_INSUFFICIENT"
     assert decision.field("LES v5 Final Quality Status").source == FieldSource.LES_V5
     assert decision.field("低點決策").source == FieldSource.LES_V6
@@ -86,16 +118,96 @@ def test_raw_daily_generation_is_real_v6_not_relabelled_v5(tmp_path):
     CsvRepository(tmp_path).write_analysis_dataset("elec", dataset)
     restored = pd.read_csv(tmp_path / "elec_analysis_dataset.csv", dtype={"證券代號": str})
     artifact = load_reports(str(tmp_path / "elec_les_v6_reports.json"), "2026-09-11")
-    assert artifact["2330"] == report == json.loads(restored.iloc[0]["LES v6 Report"])
+    envelope = json.loads((tmp_path / "elec_les_v6_reports.json").read_text())
+    assert envelope["score_policy"] == "hybrid-v2"
+    assert envelope["parameter_versions"] == [DAILY_V6_PARAMETER_VERSION]
+    assert artifact["2330"] == report == resolve_csv_report(restored.iloc[0]["LES v6 Report"], tmp_path)
     rendered = RendererFactory.get_renderer("daily_strategy_email").render(decisions)
     assert "Low-Entry Model v6" in rendered and "Low-Entry Model v5" not in rendered
+    assert "Hybrid：先選型態" in rendered and "唯一 Final" in rendered
     assert "REVERSAL" in rendered and "EREM v3" in rendered and "下一交易日" in rendered
     assert "responsive-decision-table" in rendered and 'data-les-version="6.0.0"' in rendered
     assert "96.80" in rendered and "96,800" not in rendered
 
 
+def test_daily_hybrid_never_calls_competing_setup_scores(monkeypatch):
+    from domain.strategies import low_entry_v6_signals
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Daily Hybrid must not select from three scored setups")
+    monkeypatch.setattr(low_entry_v6_signals, "score_setups", forbidden)
+    _, decisions = build()
+    report = json.loads(decisions[0].value("LES v6 Report"))
+    assert report["decision"]["policy_version"] == model_spec(DAILY_V6_CONFIG)["policy_version"]
+    assert report_failure(report) is None
+
+
+def test_replay_manifest_pins_the_actual_daily_hybrid_policy():
+    from domain.strategy import get_strategy
+    from infrastructure.replay_runtime import parameter_manifest
+    manifest = parameter_manifest()
+    assert manifest["les"] == vars(DAILY_V6_CONFIG)
+    assert manifest["les"]["decision_policy_version"] == 4
+    assert manifest["les_version"] == DAILY_V6_PARAMETER_VERSION
+    assert manifest["les_strategy"] == DAILY_V6_STRATEGY
+    assert manifest["les_score_model"] == model_spec(DAILY_V6_CONFIG)
+    assert get_strategy(DAILY_V6_STRATEGY).config == DAILY_V6_CONFIG
+
+
+def test_unavailable_daily_report_keeps_hybrid_identity_and_null_score():
+    from infrastructure.report.low_entry_v6_renderer import setup_score_summary
+    report = unavailable_report("2330", "SYNTHETIC", "2026-09-11", "2026-09-11T15:00:00+08:00", "MISSING_DAILY_DATES")
+    assert report["parameters"]["decision_policy_version"] == 4
+    assert report["parameter_version"] == DAILY_V6_PARAMETER_VERSION
+    assert report["decision"]["score"] is None
+    assert report["decision"]["selection"]["selected_setup"] == "NO_CLEAR_CONTEXT"
+    assert "Hybrid" in setup_score_summary(report)
+    assert report["sizing"]["indicative_shares"] == 0
+
+
+def test_published_score_policy_cannot_disagree_with_daily_reports(tmp_path):
+    builder, decisions = build()
+    CsvRepository(tmp_path).write_analysis_dataset("elec", builder.project_decisions(decisions))
+    path = tmp_path / "elec_les_v6_reports.json"
+    payload = json.loads(path.read_text())
+    payload["score_policy"] = "unified"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="V6_REPORT_SCORE_POLICY_MISMATCH"):
+        load_reports(str(path), "2026-09-11")
+
+
+@pytest.mark.usefixtures("active_industry_profiles")
+def test_legacy_unified_artifact_without_policy_metadata_remains_valid(tmp_path, monkeypatch):
+    # Recreate the previous explicit plugin path, without relabelling its report.
+    monkeypatch.setattr("application.low_entry_v6_daily.DAILY_V6_STRATEGY", "low_entry_score_v6")
+    builder, decisions = build()
+    report = json.loads(decisions[0].value("LES v6 Report"))
+    assert report["parameters"]["decision_policy_version"] == 2
+    assert report["parameter_version"] != DAILY_V6_PARAMETER_VERSION
+    assert report_failure(report) is None
+    CsvRepository(tmp_path).write_analysis_dataset("legacy", builder.project_decisions(decisions))
+    path = tmp_path / "legacy_les_v6_reports.json"
+    payload = json.loads(path.read_text())
+    assert payload.pop("score_policy") == "unified"
+    payload.pop("parameter_versions")
+    path.write_text(json.dumps(payload))
+    assert load_reports(str(path), report["signal_date"]) == {"2330": report}
+
+
+def test_verified_restricted_security_is_not_hidden_by_hybrid_availability_mask():
+    market = daily_market()
+    evidence = deepcopy(market.trading_restrictions)
+    evidence["2330"]["restricted"] = True
+    _, decisions = build(replace(market, trading_restrictions=evidence))
+    report = json.loads(decisions[0].value("LES v6 Report"))
+    assert report["technical"]["restricted"] is True
+    assert report["technical"]["score_availability"]["restricted"] is True
+    assert report["decision"]["safety_cap"] == 0
+    assert report["decision"]["signal"] == "AVOID"
+    assert report["sizing"]["indicative_shares"] == 0
+
+
 @pytest.mark.parametrize("change,reason", [
-    ("filings", "QUALITY_DATA_INSUFFICIENT"),
+    ("filings", "QUALITY_NOT_VERIFIED_FOR_ENTRY"),
     ("restriction", "TRADING_RESTRICTION_UNKNOWN"),
     ("future_restriction", "TRADING_RESTRICTION_UNKNOWN"),
     ("prices", "V6_INPUT_INVALID"),
@@ -120,6 +232,10 @@ def test_missing_or_future_data_never_falls_back_to_v5_buy(change, reason):
     assert decisions[0].value("低點決策") not in {"BUY", "BUY_SMALL"}
     assert reason in decisions[0].value("低點理由")
     assert decisions[0].value("建議股數") == 0
+    if change in {"restriction", "future_restriction"}:
+        report = json.loads(decisions[0].value("LES v6 Report"))
+        assert report["technical"]["restricted"] is None
+        assert report["technical"]["score_availability"]["restricted"] is False
 
 
 def test_daily_veto_and_known_fundamental_hard_risk_are_not_score_overrides():
@@ -128,13 +244,15 @@ def test_daily_veto_and_known_fundamental_hard_risk_are_not_score_overrides():
     snapshot["2330"].update(going_concern=True, available_at="2026-09-11T14:00:00+08:00")
     _, decisions = build(replace(market, fundamental_snapshots=snapshot))
     assert decisions[0].value("Quality Status") == "REJECT"
-    assert decisions[0].value("低點決策") == "NO_BUY"
+    assert decisions[0].value("低點決策") == "AVOID"
+    assert decisions[0].value("LES v6 Safety Cap") == 0
     market = replace(market, opens=deepcopy(market.opens), highs=deepcopy(market.highs), lows=deepcopy(market.lows), closes=deepcopy(market.closes))
     for field, value in ((market.opens, 95_000.), (market.highs, 96_000.), (market.lows, 69_000.), (market.closes, 70_000.)):
         field[0][-1] = value
     _, decisions = build(market)
     assert decisions[0].value("Falling Knife Veto") is True
-    assert decisions[0].value("低點決策") == "NO_BUY"
+    assert decisions[0].value("低點決策") == "AVOID"
+    assert decisions[0].value("LES v6 Safety Cap") == 0
 
 
 @pytest.mark.parametrize("evidence", [
@@ -152,7 +270,8 @@ def test_unresolved_known_audit_evidence_cannot_be_optional_missing_data(evidenc
     assert report["quality"]["score"] >= 75
     assert report["quality"]["status"] == "DATA_INSUFFICIENT"
     assert report["quality"]["reasons"] == ["AUDIT_REVIEW_REQUIRED"]
-    assert report["decision"]["signal"] == "DATA_INSUFFICIENT"
+    assert report["decision"]["signal"] == "WATCH"
+    assert report["decision"]["safety_cap"] == 61
     assert report["sizing"]["indicative_shares"] == 0
 
 
@@ -163,7 +282,8 @@ def test_undated_audit_evidence_blocks_entry_instead_of_being_ignored(evidence):
     snapshot["2330"].update(evidence)
     _, decisions = build(replace(market, fundamental_snapshots=snapshot))
     report = json.loads(decisions[0].value("LES v6 Report"))
-    assert report["decision"]["signal"] == "DATA_INSUFFICIENT"
+    assert report["decision"]["signal"] == "WATCH"
+    assert report["decision"]["safety_cap"] == 61
     assert report["quality"]["reasons"] == ["AUDIT_EVIDENCE_DATE_UNKNOWN"]
 
 
@@ -176,7 +296,8 @@ def test_future_snapshot_is_rejected_and_known_hard_risk_has_priority():
     snapshot["2330"].update(material_accounting_issue=True, available_at="2026-09-11T14:00:00+08:00")
     _, decisions = build(replace(market, fundamental_snapshots=snapshot))
     assert decisions[0].value("Quality Status") == "REJECT"
-    assert decisions[0].value("低點決策") == "NO_BUY"
+    assert decisions[0].value("低點決策") == "AVOID"
+    assert decisions[0].value("LES v6 Safety Cap") == 0
 
 
 @pytest.mark.usefixtures("active_industry_profiles")
@@ -186,16 +307,16 @@ def test_pae_consumes_v6_quality_but_keeps_independent_valuation_gate():
     context = PortfolioRuntimeContext(account_equity=1_000_000., current_cash=500_000.)
     security = pipeline._security(decisions[0], context, position=None)
     assert security.quality_status == "PASS" and security.quality_score == decisions[0].value("Quality Score")
-    assert security.les_decision == "BUY"
+    assert security.les_decision == "BUY_SMALL"
     enriched = pipeline.enrich(decisions, context)
-    assert enriched[0].value("低點決策") == "BUY"
+    assert enriched[0].value("低點決策") == "BUY_SMALL"
     assert enriched[0].value("PAE Executable Candidate") is not True  # No manufactured DCF/CER.
 
 
 @pytest.mark.usefixtures("active_industry_profiles")
 def test_no_cash_means_no_executable_shares_not_no_signal():
     _, decisions = build(replace(daily_market(), les_v6_portfolio={}))
-    assert decisions[0].value("低點決策") == "BUY"
+    assert decisions[0].value("低點決策") == "BUY_SMALL"
     assert decisions[0].value("建議股數") == 0
 
 

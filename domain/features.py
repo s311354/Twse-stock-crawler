@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import json
 
 import numpy as np
 import pandas as pd
+from domain.numeric_history import metadata_free_frame
 
 
 FEATURE_PIPELINE_VERSION = "1.0.0"
+
+
+def feature_cache_identity(data, config):
+    """Account-free key including numerical units, index and exact date window."""
+    frame = metadata_free_frame(data)
+    payload = dict(pipeline=FEATURE_PIPELINE_VERSION, config=asdict(config),
+                   source=_source_fingerprint(frame), index_dtype=str(frame.index.dtype),
+                   dates=[str(value) for value in frame.get("Date", ())])
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,13 +145,42 @@ class SharedFeaturePipeline:
             source_data=data,
         )
 
+    def build_price_pair(self, data: pd.DataFrame, divisor: float = 1000.0) -> tuple[FeatureFrame, FeatureFrame]:
+        """Batch native/scaled prices without rescaling computed indicators.
+
+        Each price column retains its original arithmetic and epsilon policy.
+        Volume, P/E and benchmark rolling calculations are shared. Returned
+        frames have separate source fingerprints and copy-on-read values.
+        """
+        if not np.isfinite(divisor) or divisor <= 0:
+            raise ValueError("Price divisor must be positive and finite")
+        data = metadata_free_frame(data)
+        normalized = metadata_free_frame(data)
+        for name in ("Open", "High", "Low", "Close", "Bid", "Ask"):
+            if name not in data:
+                raise ValueError("Price pair requires canonical price columns")
+            normalized[name] = pd.to_numeric(data[name], errors="coerce") / divisor
+        frames = self._calculate_units(data, (1.0, divisor))
+        return tuple(FeatureFrame.from_pandas(frame, config=self.config, source_data=source)
+                     for frame, source in zip(frames, (data, normalized), strict=True))
+
     def _calculate(self, data: pd.DataFrame) -> pd.DataFrame:
+        return self._calculate_units(data, (1.0,))[0]
+
+    def _calculate_units(self, data: pd.DataFrame, divisors: tuple[float, ...]) -> tuple[pd.DataFrame, ...]:
+        data = metadata_free_frame(data)
         config = self.config
         index = data.index
-        open_price = _numeric_column(data, ("Open", "開盤"))
-        high = _numeric_column(data, ("High", "最高"))
-        low = _numeric_column(data, ("Low", "最低"))
-        close = _numeric_column(data, ("Close", "收盤"))
+        def prices(names):
+            series = _numeric_column(data, names)
+            if len(divisors) == 1:
+                return series
+            return pd.DataFrame({i: series if divisor == 1 else series / divisor
+                                 for i, divisor in enumerate(divisors)}, index=index)
+        open_price = prices(("Open", "開盤"))
+        high = prices(("High", "最高"))
+        low = prices(("Low", "最低"))
+        close = prices(("Close", "收盤"))
         volume = _numeric_column(data, ("Volume", "成交量")).where(
             lambda values: values >= 0
         )
@@ -151,10 +191,10 @@ class SharedFeaturePipeline:
         trades = _numeric_column(data, ("Trades", "成交筆數")).where(
             lambda values: values > 0
         )
-        bid = _numeric_column(data, ("Bid", "最後揭示買價")).where(
+        bid = prices(("Bid", "最後揭示買價")).where(
             lambda values: values > 0
         )
-        ask = _numeric_column(data, ("Ask", "最後揭示賣價")).where(
+        ask = prices(("Ask", "最後揭示賣價")).where(
             lambda values: values > 0
         )
         pe = _numeric_column(data, ("PE", "本益比"))
@@ -229,7 +269,11 @@ class SharedFeaturePipeline:
                 (low - previous_close).abs(),
             ],
             axis=1,
-        ).max(axis=1)
+        ).max(axis=1) if len(divisors) == 1 else pd.DataFrame({
+            i: pd.concat([high[i] - low[i], (high[i] - previous_close[i]).abs(),
+                          (low[i] - previous_close[i]).abs()], axis=1).max(axis=1)
+            for i in range(len(divisors))
+        }, index=index)
         atr14_sma = true_range.rolling(
             config.atr_window,
             min_periods=1,
@@ -282,11 +326,11 @@ class SharedFeaturePipeline:
             direction * volume_filled,
             index=index,
             dtype="float64",
-        ).cumsum()
+        ).cumsum() if len(divisors) == 1 else pd.DataFrame(direction, index=index).mul(volume_filled, axis=0).cumsum()
 
         typical_price = (high + low + close) / 3
         vwap20_typical = _safe_divide(
-            (typical_price * volume).rolling(
+            _multiply(typical_price, volume).rolling(
                 config.vwap_short_window,
                 min_periods=config.vwap_short_window,
             ).sum(),
@@ -297,7 +341,7 @@ class SharedFeaturePipeline:
             epsilon=config.epsilon,
         )
         vwap60_close = _safe_divide(
-            (close * volume_filled).rolling(
+            _multiply(close, volume_filled).rolling(
                 config.vwap_long_window,
                 min_periods=1,
             ).sum(),
@@ -308,8 +352,7 @@ class SharedFeaturePipeline:
             epsilon=config.epsilon,
         )
 
-        return pd.DataFrame(
-            {
+        values = {
                 "open": open_price,
                 "high": high,
                 "low": low,
@@ -366,9 +409,10 @@ class SharedFeaturePipeline:
                 "obv": obv,
                 "vwap20_typical": vwap20_typical,
                 "vwap60_close": vwap60_close,
-            },
-            index=index,
-        )
+            }
+        return tuple(pd.DataFrame({name: value[i] if isinstance(value, pd.DataFrame) else value
+                                   for name, value in values.items()}, index=index)
+                     for i in range(len(divisors)))
 
 
 def _numeric_column(
@@ -382,6 +426,7 @@ def _numeric_column(
 
 
 def _source_fingerprint(data: pd.DataFrame) -> str:
+    data = metadata_free_frame(data)
     source = pd.DataFrame(
         {
             "open": _numeric_column(data, ("Open", "開盤")),
@@ -432,7 +477,14 @@ def _safe_divide(
     *,
     epsilon: float,
 ) -> pd.Series:
-    return (numerator / denominator).where(denominator.abs() > epsilon)
+    quotient = (numerator.div(denominator, axis=0)
+                if isinstance(numerator, pd.DataFrame) and isinstance(denominator, pd.Series)
+                else numerator / denominator)
+    return quotient.where(denominator.abs() > epsilon)
+
+
+def _multiply(values, weights):
+    return values.mul(weights, axis=0) if isinstance(values, pd.DataFrame) else values * weights
 
 
 def _ready(index: pd.Index, window: int) -> pd.Series:

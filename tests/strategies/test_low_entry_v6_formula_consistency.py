@@ -37,13 +37,17 @@ def test_margin_drawdown_is_chronological_and_missing_is_not_stable(values, expe
 
 def test_improving_margins_earn_stability_without_removing_other_quality_checks():
     improving, falling = financials(), financials()
-    for records, margins in ((improving, [.05, .10, .15, .20]),
-                             (falling, [.05, .30, .15, .20])):
-        for row, margin in zip(records[-4:], margins):
+    # Explicit legacy QUARTER contract: same-quarter-last-year and current.
+    # Rolling TTM remains a different diagnostic, not the scoring input.
+    for records, margins in ((improving, [.05, .20]), (falling, [.25, .18])):
+        for row, margin in zip((records[-5], records[-1]), margins):
+            row["revenue"] = 100.
             row["cost_of_revenue"] = row["revenue"] * (1 - margin)
     good, bad = evaluate(improving), evaluate(falling)
-    assert good.metrics["gross_margin_drawdown_4q"] == 0
-    assert bad.metrics["gross_margin_drawdown_4q"] == pytest.approx(.15)
+    assert good.metrics["gross_margin_reported_history"] == pytest.approx([.05, .20])
+    assert bad.metrics["gross_margin_reported_history"] == pytest.approx([.25, .18])
+    assert good.metrics["gross_margin_reported_drawdown"] == pytest.approx(0.)
+    assert bad.metrics["gross_margin_reported_drawdown"] == pytest.approx(.07)
     assert good.components["profitability"] > bad.components["profitability"]
     improving[-1]["auditor_opinion"] = "ADVERSE"
     assert evaluate(improving).status == "REJECT"
@@ -52,9 +56,9 @@ def test_improving_margins_earn_stability_without_removing_other_quality_checks(
 def test_missing_margin_reduces_coverage_not_zero_drawdown():
     records = financials()
     before = evaluate(records)
-    records[-2]["cost_of_revenue"] = None
+    records[-5]["cost_of_revenue"] = None
     after = evaluate(records)
-    assert after.metrics["gross_margin_drawdown_4q"] is None
+    assert after.metrics["gross_margin_reported_drawdown"] is None
     assert after.coverage["profitability"] < before.coverage["profitability"]
 
 
@@ -80,7 +84,10 @@ def test_eps_missing_never_invents_positive_quarters_or_ttm():
     assert result.metrics["positive_eps_quarters"] is None
     assert result.metrics["basic_eps_ttm"] is None
     assert result.metrics["basic_eps_ttm_basis"] == "UNAVAILABLE"
-    assert "QUARTER_EPS_EVIDENCE_INCOMPLETE" in result.warnings
+    assert "QUARTER_EPS_EVIDENCE_INCOMPLETE" not in result.warnings
+    diagnostic = result.metrics["quality_diagnostic_checks"]["positive_eps_quarters"]
+    assert diagnostic["value"] is None and diagnostic["scored"] is False
+    assert diagnostic["affects_gate"] is False
 
 
 def test_reported_full_year_eps_is_used_without_reconstructing_q4():

@@ -219,7 +219,7 @@ def test_daily_elec_active_evidence_is_rendered_without_overwriting_v6_quality()
     assert industry["score"] == 100 and industry["available_weight"] == 100
     assert industry["metrics"]["elec_roic_5y_median"]["value"] == .12
     assert report["quality"]["score"] == decision.value("Quality Score")
-    assert report["decision"]["signal"] == "BUY" and report["sizing"]["indicative_shares"] > 0
+    assert report["decision"]["signal"] == "BUY_SMALL" and report["sizing"]["indicative_shares"] > 0
     html = RendererFactory.get_renderer("daily_strategy_email").render(decisions)
     assert "產業 QS 100.00" in html and ELEC_QUALITY_PROFILE_VERSION in html
     assert "ACTIVE" in html and "進場已啟用" in html and "SHADOW" not in html

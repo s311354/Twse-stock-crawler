@@ -10,6 +10,7 @@ from domain.security_identity import resolve_security_identity
 from domain.trading_restrictions import restriction_check
 from domain.strategies.low_entry_score_v4 import PRICE_SCALE_ATTR
 from domain.strategies.low_entry_v6_quality import number
+from domain.numeric_history import metadata_free_frame
 
 
 @dataclass(frozen=True)
@@ -49,7 +50,7 @@ def _observation(history, session, cutoff, config):
     required = {"Date", "Open", "High", "Low", "Close", "Volume", "Amount", "TAIEX Close"}
     if len(history) < 61 or not required.issubset(history):
         return fail("INCOMPLETE_WATCH_HISTORY")
-    data = history.tail(61).copy()
+    data = metadata_free_frame(history).tail(61)
     dates = pd.to_datetime(data["Date"], errors="coerce")
     if dates.isna().any() or dates.dt.tz is not None or dates.duplicated().any() or not dates.is_monotonic_increasing or not dates.eq(dates.dt.normalize()).all():
         return fail("INVALID_WATCH_DATES")

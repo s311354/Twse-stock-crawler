@@ -142,6 +142,11 @@ def create_parser() -> argparse.ArgumentParser:
         "--replay-restrictions-file", type=Path, default=None,
         help="Archived per-symbol restriction JSON or restriction-announcements/v1 source bundle. Requires a date -b/-e pair; incomplete coverage remains UNKNOWN.",
     )
+    parser.add_argument("--replay-id", help="Isolated strict-replay job ID (date mode).")
+    parser.add_argument("--replay-evidence-file", type=Path, help="Pinned replay-evidence/v1 package; no runtime downloads.")
+    parser.add_argument("--replay-state-path", type=Path, help="Research-only SQLite state; never use the live PAE database.")
+    parser.add_argument("--replay-output-dir", type=Path, help="Research JSON/CSV directory; defaults to data/replays/<id>.")
+    parser.add_argument("--replay-parse-cache", type=Path, help="Optional derived SQLite parse/cutoff index for historical replay only; never a live MOPS/PAE database.")
     parser.add_argument(
         "-s",
         "--subject",
@@ -361,6 +366,8 @@ def build_run_configuration(
         args.endbacktrack = max(1, (history_end - history_start).days)
     else:
         validate_backtrack_order(args.beginbacktrack, args.endbacktrack, parser)
+        if args.beginbacktrack > 0:
+            parser.error("HISTORICAL_RANGE_REQUIRES_DATE_REPLAY: integer -b > 0 excludes recent prices; use -b START_DATE -e END_DATE with --replay-evidence-file, --replay-id and an explicit historical account instead of today's evidence")
     if replay_cutoff is not None:
         if replay_cutoff > dt.datetime.now(dt.timezone.utc):
             parser.error("Replay end-date close cannot be in the future")
@@ -499,6 +506,7 @@ def build_preflight_summary(
         "market_history_cache": str(settings.market_history_cache_path),
         "mops_cache": str(settings.mops_cache_dir),
         "mops_enabled": request.mops_enabled,
+        "daily_strategy_workers": settings.daily_strategy_workers,
         "output": request.output_file_names,
         "report_output": request.report_file_prefix,
         "as_of": request.as_of.isoformat() if request.as_of else None,
@@ -532,6 +540,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_strategies:
         list_strategies()
         return 0
+
+    if isinstance(args.beginbacktrack, dt.date) or isinstance(args.endbacktrack, dt.date):
+        from interface.replay import run_from_args
+        try:
+            result = run_from_args(args)
+        except (ValueError, OSError) as error:
+            parser.error(str(error))
+        print(json.dumps(result if args.check_config else {
+            "status": result["status"], "replay_id": result["replay_id"],
+            "as_of": result["as_of"], "signal_date": result["signal_date"],
+            "symbols": result["symbols"], "live_order_authorized": False,
+        }, ensure_ascii=False, sort_keys=True))
+        return 0
+    if any((args.replay_id, args.replay_evidence_file, args.replay_state_path, args.replay_output_dir)):
+        parser.error("--replay-* options require a date -b/-e pair")
     
     # Validate stocklist is provided for normal operation
     if not args.stocklist and args.type != Stocktype.SEMI:

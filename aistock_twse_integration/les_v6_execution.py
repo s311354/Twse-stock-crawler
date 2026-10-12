@@ -9,6 +9,7 @@ from pathlib import Path
 
 from domain.strategies.low_entry_score_v6 import assess_execution
 from domain.strategies.low_entry_v6_report import report_failure
+from infrastructure.storage.report_evidence import load_report_bundle
 
 MAX_BYTES = 8 * 1024 * 1024
 
@@ -41,12 +42,18 @@ def load_reports(path: str, data_date: str) -> dict[str, dict]:
     source = Path(path)
     if source.stat().st_size > MAX_BYTES:
         raise ValueError("V6_REPORTS_TOO_LARGE")
-    payload = json.loads(source.read_text(encoding="utf-8"))
+    payload = load_report_bundle(source)
     reports = payload.get("reports")
     if payload.get("model") != "low_entry_score_v6" or not isinstance(reports, list) or not 1 <= len(reports) <= 2000:
         raise ValueError("INVALID_V6_REPORTS")
+    policy = payload.get("score_policy")
+    if policy is not None and policy not in {"legacy", "unified", "hybrid", "hybrid-v2"}:
+        raise ValueError("INVALID_V6_SCORE_POLICY")
     output = {}
     for report in reports:
+        if policy is not None and report.get("parameters", {}).get("decision_policy_version", 2) != {
+                "legacy": 1, "unified": 2, "hybrid": 3, "hybrid-v2": 4}[policy]:
+            raise ValueError("V6_REPORT_SCORE_POLICY_MISMATCH")
         if report.get("evaluation_mode") == "HISTORICAL_REPLAY":
             raise ValueError("HISTORICAL_REPLAY_NOT_EXECUTABLE")
         code = report.get("symbol")

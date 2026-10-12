@@ -41,6 +41,8 @@ from infrastructure.runtime.output_adapters import CrawlerLineChartAdapter
 from infrastructure.runtime.output_adapters import CrawlerNotificationAdapter
 from infrastructure.runtime.output_adapters import CrawlerReportAdapter
 from infrastructure.runtime.strategy_adapter import CrawlerStrategyAdapter
+from infrastructure.daily_work import native_work_scope
+from infrastructure.daily_performance import retain_daily_performance
 
 
 TAIPEI_TIMEZONE = ZoneInfo("Asia/Taipei")
@@ -67,6 +69,9 @@ def build_stock_analysis_runtime(
     fundamental_service: Any | None = None,
     settings: AppSettings | None = None,
     run_id_provider: Callable[[], str] | None = None,
+    work_scope=None,
+    performance_sink=None,
+    performance_stage_callback=None,
 ) -> StockAnalysisRuntime:
     effective_settings = settings or AppSettings.from_env()
     shared_http_client = http_client or TwseHttpClient(
@@ -96,6 +101,7 @@ def build_stock_analysis_runtime(
             effective_settings.allow_insecure_ssl_fallback
         ),
         mops_cache_configured=bool(effective_settings.mops_cache_dir),
+        daily_strategy_workers=effective_settings.daily_strategy_workers,
         smtp_configured=bool(
             effective_settings.smtp_email
             and effective_settings.smtp_password
@@ -253,6 +259,12 @@ def build_stock_analysis_runtime(
             tpex_crawler_factory=tpex_crawler_factory,
         ),
         observer=observer,
+        work_scope=work_scope or (lambda: native_work_scope(
+            effective_settings.mops_cache_dir / "daily_preprocessing.sqlite3"
+            if effective_settings.mops_cache_dir else None)),
+        performance_sink=performance_sink or (lambda request, context, metrics: retain_daily_performance(
+            request, context, metrics, run_id=observer.run_id)),
+        performance_stage_callback=performance_stage_callback,
     )
     return StockAnalysisRuntime(
         service=service,

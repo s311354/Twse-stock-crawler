@@ -38,6 +38,10 @@ class FetchMarketData:
         self._now_provider = now_provider
 
     def execute(self, request: StockAnalysisRequest) -> AnalysisContext:
+        if request.as_of is None and request.beginbacktrack > 0:
+            # Offsets describe a price window, not a historical account or
+            # evidence cutoff. Never refresh today's evidence for an old end.
+            raise ValueError("HISTORICAL_RANGE_REQUIRES_DATE_REPLAY: use -b START_DATE -e END_DATE with pinned evidence and an explicit historical account")
         if request.replay_mail and request.as_of is None:
             raise ValueError("Replay email requires a historical cutoff")
         if request.as_of is not None and (request.as_of.utcoffset() is None or (request.mail and not request.replay_mail) or request.linechart):

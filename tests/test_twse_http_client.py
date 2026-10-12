@@ -69,6 +69,18 @@ def config(**overrides: object) -> TwseHttpConfig:
     return TwseHttpConfig(**values)
 
 
+def test_http_200_maintenance_page_retains_actionable_reason_and_stops_bounded_retries():
+    content = '<!DOCTYPE html><html><title>網站維護中 - 臺灣證券交易所</title></html>'.encode()
+    response = FakeResponse(status_code=200, json_error=ValueError("not JSON"),
+                            content=content, headers={"Content-Type": "text/html"})
+    session = FakeSession([response, response])
+    sleeps = []
+    client = TwseHttpClient(config=config(), session=session, sleeper=sleeps.append)
+    with pytest.raises(TwseNetworkError, match="reason=UPSTREAM_MAINTENANCE"):
+        client.get_json("https://www.twse.com.tw/holidaySchedule/holidaySchedule", context="TWSE calendar 2026")
+    assert len(session.calls) == 2 and sleeps == [0.5]
+
+
 def test_http_client_reuses_session_and_retries_network_error() -> None:
     session = FakeSession(
         [

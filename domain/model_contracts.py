@@ -28,6 +28,7 @@ class FieldSource(str, enum.Enum):
     EREM_V3 = "EREM_V3"
     PAE_V1 = "PAE_V1"
     PAE_V2 = "PAE_V2"
+    KELLY_CALIBRATION = "KELLY_CALIBRATION"
     UNKNOWN = "UNKNOWN"
 
 

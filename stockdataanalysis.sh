@@ -9,7 +9,7 @@ usage() {
 Usage: ./stockdataanalysis.sh [--profile PROFILE] [-b DAYS] [-e DAYS] [--check]
        ./stockdataanalysis.sh --profile PROFILE -b START_DATE -e END_DATE
          --pae-holdings-file HISTORICAL_FILE --pae-current-cash CASH
-         --account-equity EQUITY [--replay-restrictions-file JSON] [--replay-mail] [--check]
+         --account-equity EQUITY --replay-id ID --replay-evidence-file JSON [--check]
 
 Profiles: elec, semi, chemi, bio, comp, air, veh, eleccomp
 
@@ -26,10 +26,10 @@ Integer -b/-e retain calendar-day offsets relative to the execution date.
 Date pairs (-b YYYY-MM-DD -e YYYY-MM-DD) select an inclusive history range and
 automatically replay at END_DATE 13:30 Taipei. Timestamps and premarket/intraday
 replay are not supported. Do not mix dates and days.
-Date replay reads only PIT fundamental cache, writes isolated
-research outputs, and does not email unless --replay-mail is explicitly set.
---replay-mail uses existing SMTP settings and labels the report historical / not
-for trading. --check still sends nothing. An explicit historical portfolio is
+Historical date replay reads pinned evidence, writes isolated resumable
+research outputs, and never emails. Prepare restrictions in the evidence package.
+The evidence package, not today's stocklist, supplies the replay universe.
+--check still sends nothing. An explicit historical portfolio is
 required; an empty holdings file declares no holdings. Normal runs still email.
 EOF
 }
@@ -51,13 +51,17 @@ fi
 
 ANALYSIS_PROFILE="${TWSE_ANALYSIS_PROFILE:-elec}"
 CHECK_CONFIG=0
-BACKTRACK_END=792
-BACKTRACK_BEGIN=9
+BACKTRACK_END=700
+BACKTRACK_BEGIN=0
 EXPLICIT_HOLDINGS=""
 EXPLICIT_CASH=""
 EXPLICIT_EQUITY=""
 REPLAY_RESTRICTIONS=""
 REPLAY_MAIL=0
+REPLAY_ID=""
+REPLAY_EVIDENCE=""
+REPLAY_STATE=""
+REPLAY_OUTPUT=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -h|--help)
@@ -85,7 +89,7 @@ while [ "$#" -gt 0 ]; do
       ANALYSIS_PROFILE=${1#--profile=}
       shift
       ;;
-    -b|-e|--pae-holdings-file|--pae-current-cash|--account-equity|--replay-restrictions-file)
+    -b|-e|--pae-holdings-file|--pae-current-cash|--account-equity|--replay-restrictions-file|--replay-id|--replay-evidence-file|--replay-state-path|--replay-output-dir)
       if [ "$#" -lt 2 ]; then
         echo "$1 requires a value" >&2
         exit 2
@@ -97,6 +101,10 @@ while [ "$#" -gt 0 ]; do
         --pae-current-cash) EXPLICIT_CASH=$2 ;;
         --account-equity) EXPLICIT_EQUITY=$2 ;;
         --replay-restrictions-file) REPLAY_RESTRICTIONS=$2 ;;
+        --replay-id) REPLAY_ID=$2 ;;
+        --replay-evidence-file) REPLAY_EVIDENCE=$2 ;;
+        --replay-state-path) REPLAY_STATE=$2 ;;
+        --replay-output-dir) REPLAY_OUTPUT=$2 ;;
       esac
       shift 2
       ;;
@@ -182,7 +190,7 @@ if ! "$PYTHON_BIN" -c "import requests, pandas, tabulate, xlsxwriter, matplotlib
 fi
 
 STOCKLIST="$SCRIPT_DIR/stocklist_$ANALYSIS_PROFILE"
-if [ "$ANALYSIS_PROFILE" != "semi" ] && [ ! -r "$STOCKLIST" ]; then
+if [ "$REPLAY_MODE" -ne 1 ] && [ "$ANALYSIS_PROFILE" != "semi" ] && [ ! -r "$STOCKLIST" ]; then
   echo "Stock list is not readable: $STOCKLIST" >&2
   exit 1
 fi
@@ -220,7 +228,10 @@ if [ -n "$EXPLICIT_HOLDINGS" ]; then
   PAE_HOLDINGS_ENABLED=1
 fi
 
-if [ "$ANALYSIS_PROFILE" = "semi" ]; then
+if [ "$REPLAY_MODE" -eq 1 ]; then
+  STOCKLIST=ALL
+  echo "Historical replay: market and universe from pinned evidence (no email)"
+elif [ "$ANALYSIS_PROFILE" = "semi" ]; then
   STOCKLIST=ALL
   echo "TPEx analysis profile: SEMI (historical sector universe by stock number)"
 else
@@ -251,6 +262,19 @@ else
 fi
 if [ -n "$REPLAY_RESTRICTIONS" ]; then
   set -- "$@" --replay-restrictions-file "$REPLAY_RESTRICTIONS"
+fi
+if [ -n "$REPLAY_ID" ]; then
+  set -- "$@" --replay-id "$REPLAY_ID"
+fi
+if [ -n "$REPLAY_EVIDENCE" ]; then
+  set -- "$@" --replay-evidence-file "$REPLAY_EVIDENCE"
+  if [ "$REPLAY_MODE" -eq 1 ]; then STOCKLIST=ALL; fi
+fi
+if [ -n "$REPLAY_STATE" ]; then
+  set -- "$@" --replay-state-path "$REPLAY_STATE"
+fi
+if [ -n "$REPLAY_OUTPUT" ]; then
+  set -- "$@" --replay-output-dir "$REPLAY_OUTPUT"
 fi
 if [ "$CHECK_CONFIG" -eq 1 ]; then
   set -- "$@" --check-config

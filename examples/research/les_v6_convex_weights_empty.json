@@ -1,0 +1,31 @@
+{
+  "schema": "les-v6-closed-outcomes/v1",
+  "source_kind": "SYNTHETIC_TEST_ONLY",
+  "inclusion_policy": "ALL_CLOSED_EPISODES_NO_WINNER_FILTER",
+  "versions": {
+    "model": "6.0.0",
+    "parameters": "2026-10-02-v6-hybrid-context-score-v1",
+    "code": "EMPTY_TEMPLATE_NOT_A_CALIBRATION",
+    "execution_policy": "ONE_ENTRY_FULL_EXIT_EXPLICIT_POLICY_REQUIRED"
+  },
+  "as_of": "2026-10-03T13:30:00+08:00",
+  "validation_start": "2026-09-01T13:30:00+08:00",
+  "definition": {
+    "success": "POSITIVE_NET_CASH_RETURN",
+    "position_policy": "ONE_ENTRY_FULL_EXIT_NO_ADDS",
+    "max_holding_sessions": 20,
+    "max_adverse_fraction": 0.04
+  },
+  "weight_estimation": {
+    "frozen_at": "2026-10-03T13:30:00+08:00",
+    "lower_clip": 1.0,
+    "upper_clip": 2.0,
+    "delta": 0.1,
+    "lambda_pool": 1.0,
+    "lambda_prior": 1.0,
+    "tolerance": 1e-8,
+    "max_iterations": 20000
+  },
+  "outcomes": [],
+  "signal_reports": {}
+}

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from math import pow
+from math import isfinite, pow
 
 from domain.fundamental_models import FilingDocument
 from domain.fundamental_models import NormalizedFact
 from domain.fundamental_models import XbrlContext
+from domain.financial_taxonomy import ixbrl_schema_refs
 from infrastructure.crawler.twse_http_client import TwseSchemaChangedError
 from infrastructure.fundamentals.ixbrl_units import UnitParser
 
@@ -22,10 +23,11 @@ class _RawFact:
     concept: str
     context_id: str
     unit: str | None
-    scale: int
+    scale: int | None
     sign: str
     is_numeric: bool
     is_nil: bool
+    format: str | None = None
     text: str = ""
 
 
@@ -65,7 +67,7 @@ class _InlineXbrlParser(UnitParser):
             self._context_field = context_fields[normalized_tag]
             self._context_text = []
             return
-        if self._context_id is not None and normalized_tag == "xbrldi:explicitmember":
+        if self._context_id is not None and normalized_tag in {"xbrldi:explicitmember", "xbrldi:typedmember"}:
             self._context_field = "dimension"
             self._dimension_name = attributes.get("dimension")
             self._context_text = []
@@ -77,7 +79,7 @@ class _InlineXbrlParser(UnitParser):
         try:
             scale = int(scale_text)
         except ValueError:
-            scale = 0
+            scale = None
         self._fact = _RawFact(
             concept=attributes.get("name", ""),
             context_id=attributes.get("contextref", ""),
@@ -86,6 +88,7 @@ class _InlineXbrlParser(UnitParser):
             sign=attributes.get("sign", ""),
             is_numeric=normalized_tag == "ix:nonfraction",
             is_nil=attributes.get("xsi:nil", "").lower() == "true",
+            format=attributes.get("format") or None,
         )
 
     def handle_data(self, data: str) -> None:
@@ -104,14 +107,17 @@ class _InlineXbrlParser(UnitParser):
             "xbrli:enddate": "end_date",
             "xbrli:instant": "instant",
             "xbrldi:explicitmember": "dimension",
+            "xbrldi:typedmember": "dimension",
         }
         if self._context_id is not None and normalized_tag in context_end_tags:
             field = context_end_tags[normalized_tag]
             value = _normalize_text("".join(self._context_text))
             if field == "dimension":
                 dimensions = self._context_values["dimensions"]
-                if isinstance(dimensions, list) and self._dimension_name and value:
-                    dimensions.append((self._dimension_name, value))
+                if isinstance(dimensions, list):
+                    # A typed/empty/unresolved member must not masquerade as
+                    # the company's undimensioned aggregate.
+                    dimensions.append((self._dimension_name or "UNKNOWN_DIMENSION", value or "UNRESOLVED_MEMBER"))
                 self._dimension_name = None
             else:
                 self._context_values[field] = value or None
@@ -177,7 +183,8 @@ def parse_ixbrl(content: bytes | str) -> list[NormalizedFact]:
             continue
         context = parser.contexts.get(raw.context_id, XbrlContext(raw.context_id))
         text = _normalize_text(raw.text)
-        numeric_value = _parse_number(text, raw.scale, raw.sign) if raw.is_numeric and not raw.is_nil else None
+        numeric_value = (_parse_number(text, raw.scale, raw.sign, raw.format)
+                         if raw.is_numeric and not raw.is_nil else None)
         facts.append(
             NormalizedFact(
                 concept=raw.concept,
@@ -185,7 +192,8 @@ def parse_ixbrl(content: bytes | str) -> list[NormalizedFact]:
                 unit=parser.units.get(raw.unit),
                 numeric_value=numeric_value,
                 text_value=(
-                    raw.text if not raw.is_numeric and text else None
+                    raw.text if text and (not raw.is_numeric or
+                                         (numeric_value is None and not raw.is_nil)) else None
                 ),
                 start_date=context.start_date,
                 end_date=context.end_date,
@@ -213,19 +221,21 @@ class IxbrlFilingParser:
         )
 
 
-def _parse_number(text: str, scale: int, sign: str) -> float | None:
-    normalized = text.replace(",", "").replace(" ", "")
+def _parse_number(text: str, scale: int | None, sign: str, format: str | None = None) -> float | None:
+    if scale is None or (format and format.split(":")[-1].lower() not in {"numdotdecimal", "num-dot-decimal"}):
+        return None  # Unsupported transformations need review, not a guessed amount.
+    normalized = text.replace(",", "").replace(" ", "").replace("\u2212", "-")
     if not normalized or normalized in {"-", "--", "N/A"}:
         return None
     negative_parentheses = normalized.startswith("(") and normalized.endswith(")")
     normalized = normalized.strip("()")
     try:
         value = float(normalized) * pow(10, scale)
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
     if sign == "-" or negative_parentheses:
         value = -abs(value)
-    return value
+    return value if isfinite(value) else None
 
 
 def _normalize_text(value: str) -> str:
@@ -241,5 +251,6 @@ __all__ = [
     "NormalizedFact",
     "XbrlContext",
     "decode_mops_content",
+    "ixbrl_schema_refs",
     "parse_ixbrl",
 ]

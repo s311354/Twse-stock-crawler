@@ -90,7 +90,9 @@ def test_enrichment_can_restore_evidence_but_does_not_guarantee_higher_quality()
     after = evaluate_quality(filled, symbol="2330", market="TWSE", as_of=CUTOFF)
     assert before.metrics["positive_eps_quarters"] is None
     assert after.metrics["positive_eps_quarters"] == 8
-    assert after.coverage["growth"] > before.coverage["growth"]
+    assert after.coverage["growth"] == before.coverage["growth"]
+    assert after.components["growth"] == before.components["growth"]
+    assert after.metrics["quality_diagnostic_checks"]["positive_eps_quarters"]["scored"] is False
     negative = combine_filing_sources([dict(mops, basic_eps_quarter=-.8)], rows, as_of=CUTOFF)
     assert evaluate_quality(negative, symbol="2330", market="TWSE", as_of=CUTOFF).metrics["positive_eps_quarters"] == 7
     filled[-1]["total_equity"] = 0

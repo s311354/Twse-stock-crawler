@@ -3,16 +3,26 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 
 import pandas as pd
 
 from application.market_history import MarketHistoryAssembler
 from application.market_history import MarketHistoryInput
-from application.low_entry_v6_daily import V6_DAILY_COLUMNS, overlay_daily_v6
+from application.low_entry_v6_daily import V6_DAILY_COLUMNS
+from application.daily_entry import DailyEntryService
+from application.daily_valuation import DailyValuationProvider
+from application.low_entry_v6_daily import build_daily_v6
+from application.daily_performance import measure_stage
+from application.evidence_context import EvidenceContext
+from application.leadership_screen import screen_once
+from domain.strategies.low_entry_score_v4 import SIGNAL_DATE_ATTR
 from application.strategy_execution import PreparedStrategyInputs
 from application.strategy_execution import StrategyExecutionService
 from application.strategy_contracts import StrategyDecisionAssembler
 from domain.features import FeatureFrame
+from domain.features import SharedFeaturePipeline
+from domain.strategy import get_strategy
 from domain.model_contracts import StrategyDecision
 from domain.models import ProfitRow
 from domain.models import SignalRow
@@ -24,7 +34,6 @@ from domain.strategies.expected_return_exit_v3 import (
     EXPECTED_RETURN_EXIT_STRATEGY_NAME,
 )
 from domain.strategies.low_entry_score_v5 import LOW_ENTRY_OUTPUT_COLUMNS
-from domain.strategies.low_entry_score_v5 import LOW_ENTRY_STRATEGY_NAME
 from domain.strategies.portfolio_allocation_v2 import (
     PAE_V2_OUTPUT_COLUMNS,
 )
@@ -77,6 +86,9 @@ class AnalysisDatasetBuilder:
         history_assembler: MarketHistoryAssembler | None = None,
         strategy_execution: StrategyExecutionService | None = None,
         decision_assembler: StrategyDecisionAssembler | None = None,
+        daily_entry: DailyEntryService | None = None,
+        optimized_daily: bool = True,
+        stock_executor=None,
     ) -> None:
         self.history_assembler = (
             history_assembler or MarketHistoryAssembler()
@@ -87,6 +99,11 @@ class AnalysisDatasetBuilder:
         self.decision_assembler = (
             decision_assembler or StrategyDecisionAssembler()
         )
+        self.daily_entry = daily_entry or DailyEntryService(reuse_watch=optimized_daily)
+        self.optimized_daily = optimized_daily
+        # Optional infrastructure port. Only stock-local, stateless native
+        # computation crosses it; portfolio allocation stays in the caller.
+        self.stock_executor = stock_executor
 
     def build_history(
         self,
@@ -113,6 +130,7 @@ class AnalysisDatasetBuilder:
         prepared = self.strategy_execution.prepare(
             effective_histories,
             feature_frames,
+            include_normalized=self.optimized_daily,
         )
         if len(prepared.feature_frames) != market.stock_count:
             raise ValueError(
@@ -146,22 +164,79 @@ class AnalysisDatasetBuilder:
         self,
         prepared: PreparedStrategyInputs,
     ) -> pd.DataFrame:
-        legacy = self.strategy_execution.evaluate(
-            LOW_ENTRY_STRATEGY_NAME,
-            LOW_ENTRY_OUTPUT_COLUMNS,
-            prepared,
-        )
-        return overlay_daily_v6(prepared.histories, legacy)
+        with measure_stage("les_and_valuation"):
+            result = self.daily_entry.evaluate(prepared)
+        # Keep the CSV column contract. Uncomputed legacy technical diagnostics
+        # remain missing, never fabricated as zero or borrowed from v6 factors.
+        return result.reindex(columns=list(dict.fromkeys(
+            list(LOW_ENTRY_OUTPUT_COLUMNS) + V6_DAILY_COLUMNS,
+        )))
 
     def evaluate_expected_return_exit(
         self,
         prepared: PreparedStrategyInputs,
     ) -> pd.DataFrame:
-        return self.strategy_execution.evaluate(
-            EXPECTED_RETURN_EXIT_STRATEGY_NAME,
-            EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS,
-            prepared,
-        )
+        with measure_stage("erem"):
+            return self.strategy_execution.evaluate(
+                EXPECTED_RETURN_EXIT_STRATEGY_NAME,
+                EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS,
+                prepared, latest_only=self.optimized_daily,
+            )
+
+    def _daily_components(self, market):
+        if self.stock_executor is not None and (
+                not self.optimized_daily or type(self) is not AnalysisDatasetBuilder
+                or type(self.history_assembler) is not MarketHistoryAssembler
+                or type(self.strategy_execution) is not StrategyExecutionService
+                or self.strategy_execution._strategy_resolver is not get_strategy
+                or self.strategy_execution._feature_pipeline_factory is not SharedFeaturePipeline
+                or type(self.daily_entry) is not DailyEntryService
+                or self.daily_entry.entry_evaluator is not build_daily_v6
+                or type(self.daily_entry.valuation_provider) is not DailyValuationProvider
+                or self.daily_entry.valuation_provider.config != DailyValuationProvider().config):
+            raise ValueError("PARALLEL_REQUIRES_NATIVE_DAILY_COMPONENTS")
+        if (not self.optimized_daily or type(self).evaluate_low_entry is not AnalysisDatasetBuilder.evaluate_low_entry
+                or type(self.history_assembler) is not MarketHistoryAssembler):
+            # Legacy subclass orchestration still receives its promised attrs.
+            prepared = self.prepare_strategy_inputs(market)
+            return self.evaluate_low_entry(prepared), self.evaluate_expected_return_exit(prepared)
+        with measure_stage("history_assembly"):
+            histories = [self.history_assembler.build_screen(market, item) for item in range(market.stock_count)]
+        sessions = [pd.to_datetime(h.attrs.get("les_v6_analysis_session") or
+                    (h["Date"].iloc[-1] if len(h) else None), errors="coerce") for h in histories]
+        cutoffs = [pd.to_datetime(h.attrs.get(SIGNAL_DATE_ATTR), utc=True, errors="coerce") for h in histories]
+        watches, _ = screen_once(histories,
+            session_date=max((s for s in sessions if pd.notna(s)), default=pd.NaT),
+            as_of=max((c for c in cutoffs if pd.notna(c)), default=pd.NaT))
+        del histories, sessions, cutoffs
+        entries, exits = [], []
+        if self.stock_executor is not None:
+            from application.daily_stock import isolate_stock_market
+            jobs = ((item, isolate_stock_market(market, item), watch) for item, watch in enumerate(watches))
+            with measure_stage("stock_parallel_wall"):
+                results = self.stock_executor.evaluate(jobs)
+            for item in range(market.stock_count):
+                entry, exit = results[item]
+                entries.append(entry)
+                exits.append(exit)
+        else:
+            with EvidenceContext(market) as evidence:
+                for item, watch in enumerate(watches):
+                    entry, exit = self.stock_components(market, item, watch, evidence)
+                    entries.append(entry)
+                    exits.append(exit)
+        entry_columns = list(dict.fromkeys(list(LOW_ENTRY_OUTPUT_COLUMNS) + V6_DAILY_COLUMNS))
+        return (pd.concat(entries, ignore_index=True) if entries else pd.DataFrame(columns=entry_columns),
+                pd.concat(exits, ignore_index=True) if exits else pd.DataFrame(columns=EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS))
+
+    def stock_components(self, market, item, watch, evidence):
+        """Shared serial/worker kernel; no persistence, network or allocation."""
+        with measure_stage("history_assembly"):
+            history = self.history_assembler.build(market, item, include_evidence=False)
+        with evidence.stock(item, history) as packet:
+            prepared = replace(self.strategy_execution.prepare([history], include_normalized=True),
+                               watches=(watch,), evidence=(packet,))
+            return self.evaluate_low_entry(prepared), self.evaluate_expected_return_exit(prepared)
 
     def build(
         self,
@@ -201,9 +276,7 @@ class AnalysisDatasetBuilder:
             self.build_signal_features(market),
             columns=SIGNAL_COLUMNS,
         )
-        prepared = self.prepare_strategy_inputs(market)
-        low_entry = self.evaluate_low_entry(prepared)
-        expected_return_exit = self.evaluate_expected_return_exit(prepared)
+        low_entry, expected_return_exit = self._daily_components(market)
         analysis = pd.concat(
             [
                 analysis,

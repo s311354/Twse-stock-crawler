@@ -17,75 +17,129 @@ Historical data is stored as CSV files in the [data](./data) directory and can b
 
 ### Python Architecture ###
 
-The crawler keeps the legacy scripts compatible while introducing a cleaner, lower-coupling architecture:
+The Python application uses ports and adapters: `interface` translates requests,
+`application` coordinates workflows, `domain` owns model rules and contracts,
+and `infrastructure` implements external services, storage and delivery.
+`infrastructure/bootstrap.py` is the composition root; legacy facades remain
+compatibility boundaries, not a second implementation of the models.
 
-```
+```text
 .
-|-- main.py                         # project entrypoint
+|-- main.py                         # delegates to interface.cli.main()
+|-- stockdataanalysis.sh            # profile/runtime validation and CLI wrapper
 |-- pyproject.toml                  # versioned Python package and CLI metadata
-|-- aistock_twse_integration/       # AIStock owner-research JSON contract/entry
+|-- aistock_twse_integration/        # owner-research and v6 execution JSON adapters
 |-- interface/
-|   `-- cli.py                      # CLI argument adapter
+|   |-- cli.py                      # daily analysis and date-range replay adapter
+|   |-- les_v6.py                   # offline unified/Hybrid/legacy comparison entry
+|   |-- replay.py                   # strict-replay request/result entry
+|   `-- research.py                 # evidence audit, jobs, archives and reproduction
 |-- application/
-|   |-- analysis_dataset.py         # one-pass analysis and decision assembly
+|   |-- stock_service.py            # market -> fundamentals -> strategies -> report -> notification
+|   |-- use_cases.py                # port-based workflow steps
+|   |-- analysis_dataset.py         # daily entry/EREM composition and typed decision assembly
+|   |-- strategy_execution.py       # prepare shared features and invoke plugins
+|   |-- daily_entry.py              # compose v6 entry with separately owned valuation fields
+|   |-- daily_valuation.py          # v5 fundamental/valuation sidecar, not v5 entry scoring
+|   |-- low_entry_v6_daily.py        # explicit deployed Hybrid config and report projection
+|   |-- evidence_context.py         # work-scoped read-only financial evidence packets
+|   |-- daily_work.py               # bounded, version-guarded preprocessing caches
 |   |-- fundamental_service.py      # MOPS discovery/cache/derivation orchestration
-|   |-- portfolio_allocation.py     # aggregate PAE runtime pipeline and port
+|   |-- filing_catalog_refresh.py   # cache-first filing refresh planner
+|   |-- portfolio_allocation_v2.py  # aggregate PAE v2 allocation pipeline
 |   |-- strategy_contracts.py       # schema validation and CSV projection
-|   `-- stock_service.py            # workflow orchestration
+|   |-- replay_contracts.py         # cutoff, account, identity and version contracts
+|   |-- replay_inputs.py            # select cutoff-valid inputs from pinned evidence
+|   |-- replay_service.py           # shared StrictReplayEngine, no fills or notifications
+|   `-- research_audit.py           # coverage and business-result comparison
 |-- domain/
-|   |-- fundamental_derivation.py   # point-in-time TTM/ROIC/FCF formulas
+|   |-- fundamental_derivation.py   # point-in-time financial derivation
 |   |-- model_contracts.py           # immutable versioned decision evidence
-|   |-- models.py                   # domain aliases/models
-|   |-- fundamentals.py             # point-in-time MOPS quality gate
-|   |-- quality_v5.py               # LES v5 Base/Extended quality and confidence
-|   |-- pipeline.py                 # pandas pipeline stages
-|   |-- repositories.py             # stock repository interface
-|   |-- services.py                 # pure profit/indicator services
+|   |-- features.py                 # shared immutable technical features and price-scale pairs
+|   |-- numeric_history.py          # metadata-free numeric history boundary
 |   |-- strategy.py                 # strategy abstraction/plugin registry
 |   `-- strategies/
-|       |-- expected_return_exit.py # Expected Return Exit Model v1 strategy
-|       |-- expected_return_exit_v2.py # Expected Return Exit Model v2 strategy
-|       |-- expected_return_exit_v3.py # Expected Return Exit Model v3 strategy
-|       |-- low_entry_score.py      # built-in Low Entry Score v1 strategy
-|       |-- low_entry_score_v2.py   # refined Low Entry Score v2 strategy
-|       |-- low_entry_score_v3.py   # advanced Low Entry Score v3 strategy
-|       |-- low_entry_score_v4.py   # backward-compatible LES v4 strategy
-|       |-- low_entry_score_v4_1.py # quality-first stabilized LES v4.1
-|       |-- low_entry_score_v5.py   # LES v5 public strategy/config facade
-|       |-- low_entry_v5_composition.py # LES v5 component composition root
-|       |-- low_entry_v5_pipeline.py # rule-neutral LES v5 orchestration
-|       |-- low_entry_v5_compat.py  # lazy legacy RuleEngine facade
-|       |-- portfolio_allocation_v1.py # backward-compatible portfolio allocator
-|       `-- portfolio_allocation_v2.py # PAE v2 opportunity-cost allocator
+|       |-- low_entry_score_v6.py   # v6 plugins and next-session execution validation
+|       |-- low_entry_v6_hybrid.py  # context selection and one six-factor 100-point ledger
+|       |-- low_entry_v6_decision.py # explicit penalties, safety caps and final-score decision
+|       |-- low_entry_v6_quality.py # unified QualityResult and five-dimension scoring
+|       |-- low_entry_v6_quality_evidence.py # field/source/version verification
+|       |-- low_entry_v6_report.py  # shared native report/gate validation
+|       |-- low_entry_score_v5.py   # retained v5 plugin and valuation compatibility
+|       |-- expected_return_exit_v3.py # EREM holding/exit model
+|       `-- portfolio_allocation_v2.py # PAE capital-allocation model
 |-- infrastructure/
-|   |-- crawler/twse_client.py      # TWSE HTTP boundary
+|   |-- bootstrap.py                # dependency wiring for the daily application
+|   |-- legacy_crawler_facade.py    # retained crawler API compatibility
+|   |-- crawler/                    # TWSE/TPEx market data and trading restrictions
+|   |-- calendar/                   # annual schedules, observed versions and emergency evidence
 |   |-- fundamentals/
 |   |   |-- mops_client.py          # filing/announcement/correction discovery
 |   |   |-- ixbrl_parser.py         # normalized Inline XBRL facts
 |   |   |-- mops_repository.py      # SQLite metadata + raw revision cache
-|   |   `-- twse_financial_batch.py # daily all-company financial snapshots
+|   |   `-- twse_financial_batch.py # official batch financial data boundary
 |   |-- runtime/
-|   |   |-- market_data_adapter.py  # TWSE market-data port adapter
+|   |   |-- market_data_adapter.py  # market-data port adapter
 |   |   |-- fundamental_adapter.py  # thin fundamental port adapter
 |   |   |-- fundamental_refresh.py  # cache-first refresh coordinator
 |   |   |-- strategy_adapter.py     # LES/EREM/PAE execution adapter
 |   |   `-- output_adapters.py      # report, SMTP, and chart adapters
-|   |-- stock_analysis_adapters.py  # backward-compatible runtime imports
-|   |-- report/html_renderer.py     # strategy HTML renderer factory
-|   |-- storage/csv_repository.py   # CSV output boundary
-|   |-- storage/stock_repository.py # CSV/SQLite/DuckDB stock repositories
-|   |-- storage/portfolio_persistence.py # PAE 2-of-3 session evidence
-|   |-- storage/chart_repository.py # chart output boundary
-|   `-- notification/mail.py        # SMTP boundary
+|   |-- daily_parallel.py           # optional spawn-based per-stock computation
+|   |-- daily_performance.py        # staged timings/counters and durable performance receipt
+|   |-- replay_runtime.py           # shared engine/version wiring
+|   |-- replay_evidence.py          # immutable evidence loading and integrity verification
+|   |-- research_job.py             # pinned work context, daily retention and recovery
+|   |-- research_objects.py         # content-addressed evidence/source/environment objects
+|   |-- research_archive.py         # immutable archive and reproduction support
+|   |-- report/                     # HTML renderer factory and v6 presentation
+|   |-- storage/                    # market/fundamental caches, report evidence, PAE/replay state
+|   `-- notification/mail.py        # SMTP boundary, separate from research execution
 |-- config/
 |   `-- settings.py                 # paths and runtime defaults
-`-- data/                           # generated CSV outputs
+|-- tests/                          # model, evidence, replay, compatibility and workflow tests
+`-- data/                           # market caches, report/evidence artifacts and runtime state
 ```
+
+The tree highlights active boundaries, not every file. Earlier LES, EREM and
+PAE plugins remain available through the registry for explicit compatibility use.
+
+**Daily workflow**
+
+```text
+stockdataanalysis.sh -> main.py -> interface.cli -> infrastructure.bootstrap
+  -> StockAnalysisService
+     -> market data + official calendar/restriction evidence
+     -> cache-first financial refresh + point-in-time source selection
+     -> EvidenceContext + shared unit-safe technical features
+     -> DailyEntryService: LES v6 Hybrid + separate valuation sidecar
+     -> EREM -> typed decisions -> PAE portfolio allocation
+     -> evidence-backed CSV/JSON + HTML -> optional notification
+```
+
+The deployed v6 Hybrid uses decision policy **4**: context is selected before
+scoring, six factor budgets are **30/10/20/25/5/10**, and unrounded Final maps
+to **BUY >=72** or **BUY_SMALL >=62**. Quality and non-compensable safety checks
+remain separate from technical points. Policy 3 (**75/65**) is explicitly
+retained as `low_entry_score_v6_hybrid_legacy`; the unified comparison plugin
+`low_entry_score_v6` is not silently upgraded.
+
+**Historical research and retention**
+
+`interface.replay` and `interface.research` reuse `StrictReplayEngine` and the
+native daily model builder. A `ResearchJob` pins and verifies one immutable
+dataset and model/code identity, selects cutoff-valid evidence for each day,
+and shares that selection with coverage auditing. Explicit account inputs and
+isolated PAE state are required; bounded preprocessing caches do not share
+account-dependent EREM/PAE results across accounts. Content-addressed objects,
+incremental research state and completion receipts support retention/recovery.
+These entries do not send mail or simulate fills. BankEmulator owns fills,
+fees and account-ledger evolution; the crawler owns evidence and research.
 
 ### Low-Entry Model v6 (daily entry pipeline) ###
 
-The `low_entry_score_v6` Strategy plugin adds quality-first reversal, trend-pullback,
-and leadership-continuation setups with `BUY` / `BUY_SMALL` signals. Daily analysis,
+Daily analysis explicitly uses the `low_entry_score_v6_hybrid` Strategy plugin for
+quality-first reversal, trend-pullback and leadership-continuation interpretation
+with `BUY` / `BUY_SMALL` signals. Daily analysis,
 typed entry fields, HTML and email subjects now use v6. The v5 valuation/CER
 sidecar and EREM/PAE policies remain separately identified, and old plugins are retained.
 

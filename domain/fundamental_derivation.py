@@ -13,7 +13,7 @@ from domain.text_normalization import normalize_cjk_text
 
 
 FUNDAMENTAL_DERIVATION_VERSION = (
-    "2026-09-25-qs-dc-v11-declared-xbrl-units"
+    "2026-10-05-qs-dc-v20-source-bound-cost-hierarchy"
 )
 
 
@@ -46,6 +46,8 @@ class FiledFinancials:
     period_end: str | None = None
     statement_scope: str = "consolidated"
     audit_status: str | None = None
+    # Read from the hash-verified original, never inferred from fiscal dates.
+    taxonomy_schema_refs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,23 @@ class FundamentalBundle:
     annual_fundamentals: pd.DataFrame
     snapshot: dict[str, Any]
     as_of: str | None = None
+
+
+@dataclass(frozen=True)
+class CachedFundamentalHeader:
+    """Lightweight active snapshot identity; never a Quality certification."""
+
+    symbol: str
+    sector: str
+    filing_set_sha256: str
+    derivation_version: str
+    available_at_epoch: int
+    latest_period: tuple[int, int]
+    annual_history_years: int
+    full_catalog_checked_at_epoch: int
+    snapshot_cache_key: str
+    filing_schema_version: str | None
+    has_mops_filings: bool | None
 
 
 @dataclass(frozen=True)
@@ -143,9 +162,24 @@ def derive_fundamentals(
     for filing in sorted(eligible, key=lambda item: (item.fiscal_year, item.quarter, item.available_at, item.revision_number)):
         latest_by_period[(filing.fiscal_year, filing.quarter)] = filing
     selected = list(latest_by_period.values())
+    # Keep one report scope through annual/TTM arithmetic. Scope fallback must
+    # not silently splice an individual annual report into consolidated YTD.
+    if selected:
+        scope = max(selected, key=lambda f: (f.fiscal_year, f.quarter)).statement_scope
+        selected = [f for f in selected if f.statement_scope == scope]
+        latest_by_period = {(f.fiscal_year, f.quarter): f for f in selected}
     annual_rows = _derive_annual_rows(latest_by_period)
     annual = pd.DataFrame(annual_rows)
     snapshot = _derive_snapshot(selected, latest_by_period, sector)
+    if selected:
+        # Prior-year revisions may arrive AFTER the latest fiscal period's
+        # release. Derived metrics cannot predate any source they consume.
+        available = max(selected, key=lambda f: pd.Timestamp(f.available_at)).available_at
+        snapshot["available_at"] = available
+        snapshot["source_available_at"] = [f.available_at for f in selected]
+        for index, row in annual.iterrows():
+            sources = [f for f in selected if f.quarter == 4 and f.fiscal_year <= row["fiscal_year"]]
+            annual.at[index, "available_at"] = max(sources, key=lambda f: pd.Timestamp(f.available_at)).available_at
     return FundamentalBundle(annual_fundamentals=annual, snapshot=snapshot)
 
 
@@ -1196,6 +1230,7 @@ def _is_material_correction(description: str | None) -> bool:
 
 __all__ = [
     "CachedFundamentalBundle",
+    "CachedFundamentalHeader",
     "FUNDAMENTAL_DERIVATION_VERSION",
     "FiledFact",
     "FiledFinancials",

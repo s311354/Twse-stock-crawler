@@ -7,6 +7,7 @@ from application.fundamental_ports import FilingDocumentPort
 from application.fundamental_ports import FilingParserPort
 from application.fundamental_ports import FundamentalRepositoryPort
 from application.fundamental_ports import FundamentalUnitOfWork
+from application.daily_performance import count_work, measure_stage
 from domain.data_provenance import FIRST_OBSERVED_DOWNLOAD
 from domain.data_provenance import LEGACY_UNVERIFIED
 from domain.data_provenance import OFFICIAL_FILING_TIMESTAMP
@@ -88,7 +89,9 @@ class FilingIngestionService:
                 available_at = document.fetched_at
                 availability_source = FIRST_OBSERVED_DOWNLOAD
 
-        facts = self.parser.parse(document)
+        with measure_stage("filing_parse"):
+            count_work("filing_parse_calls")
+            facts = self.parser.parse(document)
         return self.repository.save_revision(
             candidate,
             document.content,

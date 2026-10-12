@@ -179,6 +179,8 @@ class AppSettings:
     mops_refresh_cooldown_seconds: float = 86400.0
     mops_access_blocked_threshold: int = 2
 
+    daily_strategy_workers: int = 1
+
     account_equity: float = 1_000_000.0
     pae_positions: tuple[PortfolioPosition, ...] = ()
     pae_current_cash: float | None = None
@@ -302,6 +304,7 @@ class AppSettings:
             mops_refresh_max_filings_per_symbol=_parse_int(values, "MOPS_REFRESH_MAX_FILINGS_PER_SYMBOL", 4),
             mops_refresh_cooldown_seconds=_parse_float(values, "MOPS_REFRESH_COOLDOWN_SECONDS", 86400.0),
             mops_access_blocked_threshold=_parse_int(values, "MOPS_ACCESS_BLOCKED_THRESHOLD", 2),
+            daily_strategy_workers=_parse_int(values, "TWSE_DAILY_STRATEGY_WORKERS", 1),
             account_equity=configured_equity,
             pae_positions=_parse_pae_positions(values),
             pae_current_cash=_parse_optional_float(
@@ -378,6 +381,8 @@ class AppSettings:
             raise SettingsError("Invalid MOPS refresh cooldown or ACCESS_BLOCKED threshold")
         if self.account_equity <= 0:
             raise SettingsError("TWSE_ACCOUNT_EQUITY must be greater than zero")
+        if type(self.daily_strategy_workers) is not int or not 1 <= self.daily_strategy_workers <= 4:
+            raise SettingsError("TWSE_DAILY_STRATEGY_WORKERS must be between 1 and 4")
         if len(self.pae_positions) > 4:
             raise SettingsError("PAE holdings support at most 4 positions")
         symbols = [position.symbol for position in self.pae_positions]

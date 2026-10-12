@@ -97,7 +97,7 @@ def test_daily_pipeline_rechecks_current_status_without_changing_ohlc_date(cutof
                      trading_restrictions={"2330": evidence(cutoff)})
     _, decisions = build(market)
     report = json.loads(decisions[0].value("LES v6 Report"))
-    assert report["decision"]["signal"] == "BUY"
+    assert report["decision"]["signal"] == "BUY_SMALL"
     assert report["signal_date"] == report["data"]["market_data_date"] == SESSION
     assert pd.Timestamp(report["decision_time"]) == pd.Timestamp(cutoff)
     assert report["data"]["restriction_check"]["status"] == "CLEAR"
@@ -130,7 +130,9 @@ def test_current_evidence_cannot_authorize_a_stale_symbol_or_an_incomplete_bar()
     assert report["decision"]["reasons"] == ["STALE_MARKET_DATA"]
     incomplete_at = "2026-09-11T12:00:00+08:00"
     history.attrs.update({SIGNAL_DATE_ATTR: incomplete_at, "trading_restriction": evidence(incomplete_at)})
-    assert daily_report(history)["decision"]["signal"] == "DATA_INSUFFICIENT"
+    incomplete = daily_report(history)
+    assert incomplete["decision"]["signal"] == "WATCH"
+    assert incomplete["decision"]["final_score"] is None
 
 
 def test_weekend_restriction_context_never_leaks_into_historical_close_decisions():

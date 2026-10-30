@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import datetime
-import enum
 import copy
 from collections.abc import Callable
 from zoneinfo import ZoneInfo
+
+from domain.trading_calendar import (OfficialAnnualCalendar, TradingDayStatus,
+    TwseCalendarError, TwseCalendarUnavailableError, TwseCalendarSchemaError)
 
 from infrastructure.crawler.twse_http_client import TwseHttpClient
 from infrastructure.crawler.twse_http_client import TwseNetworkError
@@ -19,30 +21,10 @@ REGULAR_MARKET_OPEN = datetime.time(9, 0)
 REGULAR_MARKET_CLOSE = datetime.time(13, 30)
 
 
-class TradingDayStatus(str, enum.Enum):
-    """A tri-state result that never maps API failures to a closed market."""
-
-    OPEN = "open"
-    CLOSED = "closed"
-    UNKNOWN = "unknown"
-
-
-class TwseCalendarError(RuntimeError):
-    """Base error for calendar lookup failures."""
-
-
-class TwseCalendarUnavailableError(TwseCalendarError):
-    """Raised when the TWSE calendar cannot be fetched or lacks year coverage."""
-
-
-class TwseCalendarSchemaError(TwseCalendarError):
-    """Raised when the TWSE calendar payload cannot be interpreted safely."""
-
-
 JsonFetcher = Callable[[], object]
 
 
-class TwseCalendar:
+class TwseCalendar(OfficialAnnualCalendar):
     """Resolve TWSE trading days from the official open/close schedule.
 
     `is_trading_day()` returns a bool when the official schedule covers the
@@ -50,9 +32,6 @@ class TwseCalendar:
     `trading_day_status()` when a tri-state OPEN/CLOSED/UNKNOWN result is more
     convenient for rendering.
     """
-
-    _OPEN_MARKERS = ("開始交易", "最後交易", "補行交易")
-    _CLOSED_MARKERS = ("放假", "補假", "無交易", "休市", "停止交易")
 
     def __init__(
         self,
@@ -111,14 +90,6 @@ class TwseCalendar:
             return scheduled_state
 
         return target_date.weekday() < 5
-
-    def trading_day_status(self, target_date: datetime.date) -> TradingDayStatus:
-        """Return OPEN/CLOSED/UNKNOWN without collapsing errors into CLOSED."""
-
-        try:
-            return TradingDayStatus.OPEN if self.is_trading_day(target_date) else TradingDayStatus.CLOSED
-        except TwseCalendarError:
-            return TradingDayStatus.UNKNOWN
 
     def emergency_evidence(self) -> dict | None:
         """Public verified supplement for immutable current-analysis snapshots."""
@@ -236,157 +207,3 @@ class TwseCalendar:
             raise TwseCalendarSchemaError(
                 f"TWSE calendar API schema changed for {year}: {error}"
             ) from error
-
-    @classmethod
-    def _parse_schedule(
-        cls,
-        payload: object,
-    ) -> tuple[dict[datetime.date, bool], set[int]]:
-        if isinstance(payload, list):
-            return cls._parse_openapi_schedule(payload)
-        if isinstance(payload, dict):
-            return cls._parse_historical_schedule(payload)
-        raise TwseCalendarSchemaError(
-            "TWSE calendar payload must be a list or object"
-        )
-
-    @classmethod
-    def _parse_openapi_schedule(
-        cls,
-        payload: list[object],
-    ) -> tuple[dict[datetime.date, bool], set[int]]:
-        if not payload:
-            raise TwseCalendarSchemaError("TWSE calendar payload must be a non-empty list")
-
-        schedule: dict[datetime.date, bool] = {}
-        covered_years: set[int] = set()
-
-        for index, record in enumerate(payload):
-            if not isinstance(record, dict):
-                raise TwseCalendarSchemaError(
-                    f"TWSE calendar row {index} must be an object"
-                )
-
-            date_value = record.get("Date")
-            name = record.get("Name")
-            description = record.get("Description", "")
-            if not isinstance(date_value, str) or not isinstance(name, str):
-                raise TwseCalendarSchemaError(
-                    f"TWSE calendar row {index} is missing Date or Name"
-                )
-            if not isinstance(description, str):
-                raise TwseCalendarSchemaError(
-                    f"TWSE calendar row {index} has an invalid Description"
-                )
-
-            target_date = cls._parse_roc_date(date_value)
-            is_open = cls._parse_open_state(name, description)
-            previous = schedule.get(target_date)
-            if previous is not None and previous != is_open:
-                raise TwseCalendarSchemaError(
-                    f"TWSE calendar has conflicting states for {target_date.isoformat()}"
-                )
-
-            schedule[target_date] = is_open
-            covered_years.add(target_date.year)
-
-        return schedule, covered_years
-
-    @classmethod
-    def _parse_historical_schedule(
-        cls,
-        payload: dict[object, object],
-    ) -> tuple[dict[datetime.date, bool], set[int]]:
-        stat = payload.get("stat")
-        if not isinstance(stat, str) or stat.lower() != "ok":
-            raise TwseCalendarSchemaError(
-                f"TWSE historical calendar returned invalid status: {stat!r}"
-            )
-
-        fields = payload.get("fields")
-        rows = payload.get("data")
-        if not isinstance(fields, list) or not all(
-            isinstance(field, str) for field in fields
-        ):
-            raise TwseCalendarSchemaError(
-                "TWSE historical calendar fields must be a string list"
-            )
-        if not isinstance(rows, list) or not rows:
-            raise TwseCalendarSchemaError(
-                "TWSE historical calendar data must be a non-empty list"
-            )
-
-        required_fields = ("日期", "名稱", "說明")
-        missing_fields = [field for field in required_fields if field not in fields]
-        if missing_fields:
-            raise TwseCalendarSchemaError(
-                f"TWSE historical calendar is missing fields: {missing_fields}"
-            )
-        date_index, name_index, description_index = (
-            fields.index(field) for field in required_fields
-        )
-        minimum_width = max(date_index, name_index, description_index) + 1
-
-        schedule: dict[datetime.date, bool] = {}
-        covered_years: set[int] = set()
-        for index, row in enumerate(rows):
-            if not isinstance(row, list) or len(row) < minimum_width:
-                raise TwseCalendarSchemaError(
-                    f"TWSE historical calendar row {index} has invalid width"
-                )
-
-            date_value = row[date_index]
-            name = row[name_index]
-            description = row[description_index]
-            if not all(isinstance(value, str) for value in (date_value, name, description)):
-                raise TwseCalendarSchemaError(
-                    f"TWSE historical calendar row {index} has invalid values"
-                )
-
-            target_date = cls._parse_iso_date(date_value)
-            is_open = cls._parse_open_state(name, description)
-            previous = schedule.get(target_date)
-            if previous is not None and previous != is_open:
-                raise TwseCalendarSchemaError(
-                    f"TWSE calendar has conflicting states for {target_date.isoformat()}"
-                )
-            schedule[target_date] = is_open
-            covered_years.add(target_date.year)
-
-        return schedule, covered_years
-
-    @staticmethod
-    def _parse_roc_date(value: str) -> datetime.date:
-        normalized = value.strip()
-        if len(normalized) != 7 or not normalized.isdigit():
-            raise TwseCalendarSchemaError(f"Invalid TWSE ROC date: {value!r}")
-
-        try:
-            return datetime.date(
-                int(normalized[:3]) + 1911,
-                int(normalized[3:5]),
-                int(normalized[5:7]),
-            )
-        except ValueError as error:
-            raise TwseCalendarSchemaError(f"Invalid TWSE ROC date: {value!r}") from error
-
-    @staticmethod
-    def _parse_iso_date(value: str) -> datetime.date:
-        try:
-            return datetime.date.fromisoformat(value.strip())
-        except ValueError as error:
-            raise TwseCalendarSchemaError(
-                f"Invalid TWSE Gregorian date: {value!r}"
-            ) from error
-
-    @classmethod
-    def _parse_open_state(cls, name: str, description: str) -> bool:
-        text = f"{name} {description}"
-        if any(marker in text for marker in cls._OPEN_MARKERS):
-            return True
-        if any(marker in text for marker in cls._CLOSED_MARKERS):
-            return False
-
-        raise TwseCalendarSchemaError(
-            f"Unrecognized TWSE calendar event: {name!r}"
-        )

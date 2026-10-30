@@ -6,6 +6,7 @@ No market ranks, per-context score competition or missing-budget redistribution.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Mapping
 from math import fsum, isclose
 from types import MappingProxyType
 from typing import TYPE_CHECKING
@@ -82,6 +83,9 @@ class _Facts:
         if key.startswith(("rs", "resilience", "downside_")) and not key.startswith("rsi"):
             return str(self.features.get("market_ready")) == "True"
         if key.startswith("industry_rs"):
+            periods = self.features.get("industry_period_status")
+            if isinstance(periods, Mapping):
+                return periods.get(key.removeprefix("industry_rs")) == "PASS"
             return self.features.get("industry_status") == "PASS"
         return True
 
@@ -208,7 +212,8 @@ class _Ledger:
                                               if c["sources"] else c["dependencies"])}))
 
 
-def score_factors(features: dict, selection: ContextSelection, plan: dict, *, config: LowEntryV6Config) -> dict:
+def score_factors(features: dict, selection: ContextSelection, plan: dict, *, config: LowEntryV6Config,
+                  legacy_resilience: bool = False) -> dict:
     """Interpret ONLY the preselected context. Every slot retains its fixed budget."""
     from domain.strategies.low_entry_v6_signals import checked_stop_distances
     features = known_features(features)
@@ -251,13 +256,37 @@ def score_factors(features: dict, selection: ContextSelection, plan: dict, *, co
     for key, weight, curve in (("rs20", 6, "market_rs20"), ("rs60", 4, "market_rs60"),
                                ("industry_rs20", 4, "industry_rs20"), ("industry_rs60", 2, "industry_rs60")):
         ledger.add("relative_strength", key, weight, _ramp(f.n(key), curve), (key,), rule="ALIGNED_" + curve)
+    market_ready = f.b("market_ready")
     correction = f.n("market_correction20")
-    capture = f.n("downside_capture20") if correction is not None and correction <= -.03 else None
-    resilience = _ramp(capture, "downside_capture", inverse=True)
-    held = f.compare(("correction_support", "low"), lambda support, low: 0 < support <= low)
-    resilience = resilience if held is True else 0. if held is False and resilience is not None else None
+    resilience_dependencies = ("market_ready", "market_correction20")
+    if legacy_resilience:
+        # Archived R18 reports predate the observed-zero coverage correction.
+        # Reproduce their complete old arithmetic; never use for new reports.
+        capture = f.n("downside_capture20") if correction is not None and correction <= -.03 else None
+        resilience = _ramp(capture, "downside_capture", inverse=True)
+        held = f.compare(("correction_support", "low"), lambda support, low: 0 < support <= low)
+        resilience = resilience if held is True else 0. if held is False and resilience is not None else None
+        resilience_dependencies = ("market_correction20", "downside_capture20", "correction_support", "low")
+    elif market_ready is not True or correction is None:
+        # A market-resilience observation needs a complete aligned benchmark
+        # window. Missing market evidence stays UNKNOWN; it is never a zero.
+        resilience = None
+    elif correction > -.03:
+        # No qualifying market correction occurred, so resilience was not
+        # tested. This is an observed zero, not missing downside-capture data.
+        resilience = 0.
+    else:
+        resilience_dependencies += ("downside_capture20", "correction_support", "low")
+        held = f.compare(("correction_support", "low"), lambda support, low: 0 < support <= low)
+        if held is False:
+            resilience = 0.
+        elif held is True:
+            capture = f.n("downside_capture20")
+            resilience = _ramp(capture, "downside_capture", inverse=True)
+        else:
+            resilience = None
     ledger.add("relative_strength", "correction_resilience", 4, resilience,
-               ("market_correction20", "downside_capture20", "correction_support", "low"), rule="ACTUAL_CORRECTION_WITH_FROZEN_SUPPORT")
+               resilience_dependencies, rule="ACTUAL_CORRECTION_WITH_FROZEN_SUPPORT")
     ledger.pool("demand", "money_flow", 12, [("clv", _ramp(f.n("clv"), "clv")), ("cmf20", _ramp(f.n("cmf20"), "cmf"))])
     obv, volume = f.n("obv_slope5"), f.n("volume_ma20_strict")
     obv_ratio = number(obv / volume) if obv is not None and volume is not None and volume > 0 else None

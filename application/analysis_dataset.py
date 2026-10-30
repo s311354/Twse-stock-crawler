@@ -10,6 +10,7 @@ import pandas as pd
 from application.market_history import MarketHistoryAssembler
 from application.market_history import MarketHistoryInput
 from application.low_entry_v6_daily import V6_DAILY_COLUMNS
+from application.low_entry_v7_daily import V7_DAILY_COLUMNS
 from application.daily_entry import DailyEntryService
 from application.daily_valuation import DailyValuationProvider
 from application.low_entry_v6_daily import build_daily_v6
@@ -27,11 +28,9 @@ from domain.model_contracts import StrategyDecision
 from domain.models import ProfitRow
 from domain.models import SignalRow
 from domain.services import compute_signal_features
-from domain.strategies.expected_return_exit_v3 import (
-    EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS,
-)
-from domain.strategies.expected_return_exit_v3 import (
-    EXPECTED_RETURN_EXIT_STRATEGY_NAME,
+from domain.strategies.expected_return_exit_b import (
+    DAILY_EREM_OUTPUT_COLUMNS as EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS,
+    DAILY_EREM_STRATEGY_NAME as EXPECTED_RETURN_EXIT_STRATEGY_NAME,
 )
 from domain.strategies.low_entry_score_v5 import LOW_ENTRY_OUTPUT_COLUMNS
 from domain.strategies.portfolio_allocation_v2 import (
@@ -69,6 +68,7 @@ CORE_ANALYSIS_COLUMNS = list(dict.fromkeys(
     BASE_COLUMNS
     + LOW_ENTRY_OUTPUT_COLUMNS
     + V6_DAILY_COLUMNS
+    + V7_DAILY_COLUMNS
     + EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS
 ))
 ANALYSIS_COLUMNS = (
@@ -89,6 +89,7 @@ class AnalysisDatasetBuilder:
         daily_entry: DailyEntryService | None = None,
         optimized_daily: bool = True,
         stock_executor=None,
+        valuation_history_verifier_scope=None,
     ) -> None:
         self.history_assembler = (
             history_assembler or MarketHistoryAssembler()
@@ -104,6 +105,9 @@ class AnalysisDatasetBuilder:
         # Optional infrastructure port. Only stock-local, stateless native
         # computation crosses it; portfolio allocation stays in the caller.
         self.stock_executor = stock_executor
+        # Infrastructure supplies a bounded, work-local original-source reader.
+        # Only comparison capture uses it; no reader/connection enters workers.
+        self.valuation_history_verifier_scope = valuation_history_verifier_scope
 
     def build_history(
         self,
@@ -169,7 +173,7 @@ class AnalysisDatasetBuilder:
         # Keep the CSV column contract. Uncomputed legacy technical diagnostics
         # remain missing, never fabricated as zero or borrowed from v6 factors.
         return result.reindex(columns=list(dict.fromkeys(
-            list(LOW_ENTRY_OUTPUT_COLUMNS) + V6_DAILY_COLUMNS,
+            list(LOW_ENTRY_OUTPUT_COLUMNS) + V6_DAILY_COLUMNS + V7_DAILY_COLUMNS,
         )))
 
     def evaluate_expected_return_exit(
@@ -184,6 +188,13 @@ class AnalysisDatasetBuilder:
             )
 
     def _daily_components(self, market):
+        from application.valuation_peers_r10 import capture_comparison_contexts
+        from contextlib import nullcontext
+        with measure_stage("valuation_comparison_capture"):
+            scope = (self.valuation_history_verifier_scope() if self.valuation_history_verifier_scope
+                     else nullcontext(None))
+            with scope as verifier:
+                market = capture_comparison_contexts(market, verify_valuation_history=verifier)
         if self.stock_executor is not None and (
                 not self.optimized_daily or type(self) is not AnalysisDatasetBuilder
                 or type(self.history_assembler) is not MarketHistoryAssembler
@@ -225,7 +236,7 @@ class AnalysisDatasetBuilder:
                     entry, exit = self.stock_components(market, item, watch, evidence)
                     entries.append(entry)
                     exits.append(exit)
-        entry_columns = list(dict.fromkeys(list(LOW_ENTRY_OUTPUT_COLUMNS) + V6_DAILY_COLUMNS))
+        entry_columns = list(dict.fromkeys(list(LOW_ENTRY_OUTPUT_COLUMNS) + V6_DAILY_COLUMNS + V7_DAILY_COLUMNS))
         return (pd.concat(entries, ignore_index=True) if entries else pd.DataFrame(columns=entry_columns),
                 pd.concat(exits, ignore_index=True) if exits else pd.DataFrame(columns=EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS))
 
@@ -308,6 +319,9 @@ class AnalysisDatasetBuilder:
             values[-1] if values else None
             for values in market.closes
         ]
+        # Old injected/subclass paths do not publish the additive v7 fields.
+        for column in V7_DAILY_COLUMNS:
+            if column not in analysis: analysis[column] = None
         return analysis[CORE_ANALYSIS_COLUMNS]
 
 

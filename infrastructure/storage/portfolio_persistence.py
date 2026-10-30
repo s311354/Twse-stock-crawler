@@ -49,6 +49,7 @@ class SQLitePortfolioPersistence:
         """.format(incumbent_marks, challenger_marks)
         try:
             with sqlite3.connect(self.database_path) as connection:
+                self._assert_live_database(connection)
                 rows = connection.execute(
                     query,
                     (
@@ -94,6 +95,7 @@ class SQLitePortfolioPersistence:
         ]
         try:
             with sqlite3.connect(self.database_path) as connection:
+                self._assert_live_database(connection)
                 connection.executemany(
                     """
                     INSERT INTO pae_opportunity_evidence (
@@ -187,6 +189,7 @@ class SQLitePortfolioPersistence:
         """.format(incumbent_marks, challenger_marks)
         try:
             with sqlite3.connect(self.database_path) as connection:
+                self._assert_live_database(connection)
                 records = connection.execute(
                     query,
                     (
@@ -228,6 +231,7 @@ class SQLitePortfolioPersistence:
             return
         try:
             with sqlite3.connect(self.database_path) as connection:
+                self._assert_live_database(connection)
                 connection.executemany(
                     """
                     INSERT INTO pae_opportunity_evidence (
@@ -255,6 +259,7 @@ class SQLitePortfolioPersistence:
     def _initialize(self) -> None:
         try:
             with sqlite3.connect(self.database_path) as connection:
+                self._assert_live_database(connection)
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS pae_opportunity_evidence (
@@ -287,6 +292,15 @@ class SQLitePortfolioPersistence:
             raise PortfolioPersistenceError(
                 "PAE_PERSISTENCE_INIT_FAILED: {}".format(error)
             ) from error
+
+    @staticmethod
+    def _assert_live_database(connection: sqlite3.Connection) -> None:
+        # Research and foreign stores must never be reused as ordinary state,
+        # including after an existing repository object has been redirected.
+        if connection.execute("PRAGMA application_id").fetchone()[0] != 0:
+            raise PortfolioPersistenceError(
+                "PAE_PERSISTENCE_RESEARCH_OR_FOREIGN_DATABASE_FORBIDDEN"
+            )
 
 
 __all__ = ["SQLitePortfolioPersistence"]

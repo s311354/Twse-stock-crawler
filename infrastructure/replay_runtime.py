@@ -11,7 +11,8 @@ from application.replay_contracts import ReplayVersions, digest
 from application.replay_inputs import PinnedReplayEvidence
 from application.replay_service import StrictReplayEngine, json_value
 from domain.industry_profiles import IndustryProfileRegistry
-from domain.strategies.expected_return_exit_v3 import EREM_V3_MODEL_VERSION
+from domain.strategies.expected_return_exit_b import DAILY_EREM_MODEL_VERSION as EREM_V3_MODEL_VERSION
+from domain.strategies.erem_soft_reduction import SoftReductionFormalPolicy
 from application.low_entry_v6_daily import DAILY_V6_CONFIG, DAILY_V6_PARAMETER_VERSION, DAILY_V6_STRATEGY
 from domain.strategies.low_entry_v6_hybrid import model_spec
 from domain.strategies.low_entry_v6_quality import (QUALITY_POLICY_VERSION, QUALITY_BUDGETS,
@@ -28,6 +29,7 @@ from domain.fundamental_derivation import FUNDAMENTAL_DERIVATION_VERSION
 from domain.financial_taxonomy import (CASH_RECONCILIATION_POLICY, TAXONOMY_MAPPING_VERSION,
                                        OPERATING_COST_RECONCILIATION_POLICY)
 from infrastructure.replay_evidence import load_evidence
+from infrastructure.runtime_environment import current_runtime_identity
 from infrastructure.storage.replay_state import SQLiteReplayState
 from infrastructure.calendar.twse_calendar import TwseCalendar
 from infrastructure.fundamentals.ixbrl_parser import parse_ixbrl
@@ -48,6 +50,7 @@ def current_versions() -> ReplayVersions:
 def parameter_manifest() -> dict:
     """The complete effective parameter/environment input to the version hash."""
     parameters = dict(les=asdict(DAILY_V6_CONFIG), les_version=DAILY_V6_PARAMETER_VERSION,
+                      erem_exit_policy=SoftReductionFormalPolicy().record(),
                       les_strategy=DAILY_V6_STRATEGY,
                       les_score_model=model_spec(DAILY_V6_CONFIG),
                       quality_policy=QUALITY_POLICY_VERSION, quality_budgets=QUALITY_BUDGETS,
@@ -73,6 +76,7 @@ def parameter_manifest() -> dict:
                       derivation=FUNDAMENTAL_DERIVATION_VERSION,
                       profiles=[asdict(p) for p in IndustryProfileRegistry.profiles()],
                       python=platform.python_version(),
+                      runtime=current_runtime_identity(),
                       dependencies={name:version(name) for name in ("numpy", "pandas")})
     return json_value(parameters)
 

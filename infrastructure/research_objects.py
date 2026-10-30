@@ -9,7 +9,9 @@ import zipfile
 from importlib.metadata import distributions
 
 from application.replay_contracts import canonical_json, digest
+from application.work_version import WorkVersionChanged
 from infrastructure import replay_runtime as runtime
+from infrastructure.runtime_environment import current_runtime_identity
 from infrastructure.research_archive import write_bytes_once, write_once
 from infrastructure.storage.evidence_graph import EvidenceGraphReader, EvidenceGraphWriter
 
@@ -115,7 +117,50 @@ def source_paths():
 
 
 def stamps(paths):
-    return tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns, p.stat().st_ctime_ns) for p in paths)
+    result = []
+    for path in paths:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            # A removed metadata file is version drift, not an unrelated
+            # FileNotFoundError that hides the pinned-job failure contract.
+            result.append((str(path), None, None, None))
+        else:
+            result.append((str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+    return tuple(result)
+
+
+def _distribution_bindings(deps):
+    return tuple(sorted((d.metadata['Name'] or '', d.version,
+                         str(d._path) if hasattr(d, '_path') else '') for d in deps))
+
+
+def _parent_members(parents):
+    members = []
+    for parent in parents:
+        try:
+            members.extend(p for p in parent.iterdir() if p.name not in {'__pycache__', '.DS_Store'})
+        except FileNotFoundError:
+            continue
+    return sorted(members)
+
+
+def _path_changes(before, after):
+    old = {s[0]: s[1:] for s in before if s[1] is not None}
+    new = {s[0]: s[1:] for s in after if s[1] is not None}
+
+    def labels(paths):
+        result = []
+        for path in sorted(paths):
+            try:
+                result.append(str(Path(path).relative_to(runtime.ROOT)))
+            except ValueError:
+                result.append(path)
+        return {"count": len(result), "paths": result[:20]}
+
+    return dict(added=labels(new.keys() - old.keys()),
+                removed=labels(old.keys() - new.keys()),
+                modified=labels(k for k in old.keys() & new.keys() if old[k] != new[k]))
 
 
 def source_zip():
@@ -133,37 +178,101 @@ class ResearchVersionGuard:
 
     Dirty source is included, not Git HEAD. A changed file/stat, added source,
     package metadata or effective parameter rejects the job, even if restored
-    to the same version string. New contexts rehash all content.
+    to the same version string. Parent-directory timestamps only trigger a
+    distribution/member inventory check: a timestamp-only update or known
+    non-runtime cache is not a package change. New importable files and path
+    configuration still reject the job. New contexts rehash all source content.
     """
     def __init__(self):
+        self.runtime_identity = current_runtime_identity()
+        # Take the change-detection baseline before reading full source hashes,
+        # not after: an edit during the initial scan must also be rejected.
+        self.source_stamps = stamps(source_paths())
         self.versions = runtime.current_versions()
         self.parameters = runtime.parameter_manifest()
-        self.source_stamps = stamps(source_paths())
         deps = list(distributions())
+        self.distribution_bindings = _distribution_bindings(deps)
         self.environment = dict(python=platform.python_version(), platform=platform.platform(),
+            runtime=dict(self.runtime_identity),
             dependencies=sorted({(d.metadata['Name'], d.version) for d in deps if d.metadata['Name']}))
         self.metadata_paths = sorted({Path(d._path) for d in deps if hasattr(d, '_path') and Path(d._path).exists()})
-        self.metadata_files = [p for d in self.metadata_paths for p in d.rglob('*') if p.is_file()]
-        self.environment_stamps = stamps(sorted(set(self.metadata_paths + self.metadata_files +
-            [p.parent for p in self.metadata_paths])))
+        # Include nested directories so adding a new metadata member is caught
+        # without reading every installed distribution on every checkpoint.
+        self.metadata_files = [p for d in self.metadata_paths for p in d.rglob('*')
+                               if p.is_file() or p.is_dir()]
+        self.metadata_parents = sorted({p.parent for p in self.metadata_paths})
+        self.parent_stamps = stamps(self.metadata_parents)
+        self.parent_members = _parent_members(self.metadata_parents)
+        # Import configuration and root-level modules may change without
+        # changing a distribution version or its metadata directory.
+        self.import_files = [p for p in self.parent_members if p.is_file()
+                             and p.suffix in {'.pth', '.egg-link', '.py', '.pyc', '.so', '.pyd'}]
+        self.environment_stamps = stamps(sorted(set(
+            self.metadata_paths + self.metadata_files + self.import_files)))
+        self.check()
 
     def check(self):
-        if (stamps(source_paths()) != self.source_stamps or
-            digest(runtime.parameter_manifest()) != self.versions.parameters or
-            stamps(sorted(set(self.metadata_paths + self.metadata_files + [p.parent for p in self.metadata_paths])))
-                != self.environment_stamps):
-            raise ValueError('REPLAY_VERSION_CHANGED_DURING_JOB')
+        changes = {}
+        current_runtime = current_runtime_identity()
+        if current_runtime != self.runtime_identity:
+            changes['runtime'] = sorted(k for k in self.runtime_identity.keys() | current_runtime.keys()
+                                        if self.runtime_identity.get(k) != current_runtime.get(k))
+        source = stamps(source_paths())
+        if source != self.source_stamps:
+            changes['source'] = _path_changes(self.source_stamps, source)
+        parameters = runtime.parameter_manifest()
+        parameter_hash = digest(parameters)
+        if parameter_hash != self.versions.parameters:
+            changes['parameters'] = dict(expected=self.versions.parameters, actual=parameter_hash,
+                keys=sorted(k for k in self.parameters.keys() | parameters.keys()
+                            if self.parameters.get(k) != parameters.get(k)))
+        environment = stamps(sorted(set(self.metadata_paths + self.metadata_files + self.import_files)))
+        if environment != self.environment_stamps:
+            changes['environment_metadata'] = _path_changes(self.environment_stamps, environment)
+        parents = stamps(self.metadata_parents)
+        if parents != self.parent_stamps:
+            members = _parent_members(self.metadata_parents)
+            if members != self.parent_members:
+                changes['environment_inventory'] = _path_changes(
+                    [(str(p), 0, 0, 0) for p in self.parent_members],
+                    [(str(p), 0, 0, 0) for p in members])
+            bindings = _distribution_bindings(list(distributions()))
+            if bindings != self.distribution_bindings:
+                old, new = set(self.distribution_bindings), set(bindings)
+                changes['distributions'] = dict(removed=sorted({b[0] for b in old - new})[:20],
+                                                added=sorted({b[0] for b in new - old})[:20])
+            # Do not accept an unstable inventory observed during installation.
+            if stamps(self.metadata_parents) != parents:
+                changes['environment_scan'] = 'CHANGED_DURING_CHECK'
+        if changes:
+            raise WorkVersionChanged(changes)
+        self.parent_stamps = parents
         return self.versions
 
     def retain(self, objects):
         # A content index allows subsequent jobs on the same object store to
         # verify and reuse the original compressed source instead of zipping it.
-        key = digest(dict(source_files=[
-            [str(p.relative_to(runtime.ROOT)), hashlib.sha256(p.read_bytes()).hexdigest()] for p in source_paths()]))
+        paths = source_paths()
+        manifest = [[str(p.relative_to(runtime.ROOT)), hashlib.sha256(p.read_bytes()).hexdigest()]
+                    for p in paths]
+        key = digest(dict(source_files=manifest))
         index = objects.root.parent / 'source-index' / (key + '.json')
         if index.exists():
             ref = json.loads(index.read_text())['source']
-            objects.get(ref)
+            content = objects.get(ref)
+            # An object's own hash does not bind a mutable source-index entry
+            # to this source version. Check every member against the live
+            # manifest before accepting a reused immutable archive.
+            try:
+                with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                    members = archive.infolist()
+                    if ([m.filename for m in members] != [name for name, _ in manifest]
+                            or [m.file_size for m in members] != [p.stat().st_size for p in paths]
+                            or any(hashlib.sha256(archive.read(name)).hexdigest() != sha
+                                   for name, sha in manifest)):
+                        raise ValueError('RESEARCH_SOURCE_INDEX_BINDING_MISMATCH')
+            except (zipfile.BadZipFile, RuntimeError, OSError) as error:
+                raise ValueError('RESEARCH_SOURCE_INDEX_BINDING_MISMATCH') from error
         else:
             ref = objects.put(source_zip())
             write_bytes_once(index, canonical_json(dict(source=ref)).encode())

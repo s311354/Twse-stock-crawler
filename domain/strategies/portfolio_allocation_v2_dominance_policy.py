@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 
+from domain.les_v7.entry_policy_r9 import pae_admission
+
 from domain.strategies.portfolio_allocation_v2_contracts import (
     PersistenceObservationV2,
 )
@@ -29,6 +31,13 @@ class PortfolioDominancePolicyV2:
 
     def __init__(self, config: PortfolioAllocationV2Config) -> None:
         self.config = config
+
+    @staticmethod
+    def _quality_ready(security: PortfolioSecurityV2) -> bool:
+        admission = pae_admission(security)
+        if admission is not None:
+            return bool(admission["quality"]["evidence_ready"] and admission["quality"]["small_cap"] > 0)
+        return security.quality_status.upper() == "PASS"
 
     def persistence_observations(
         self,
@@ -66,7 +75,7 @@ class PortfolioDominancePolicyV2:
         if challenger.quality_score is None or incumbent.quality_score is None:
             return False
         quality_dominance = (
-            challenger.quality_status.upper() == "PASS"
+            self._quality_ready(challenger)
             and float(challenger.quality_score)
             >= float(incumbent.quality_score)
             + self.config.minimum_quality_advantage
@@ -98,7 +107,7 @@ class PortfolioDominancePolicyV2:
         if challenger.quality_score is None or incumbent.quality_score is None:
             return None
         quality_dominance = (
-            challenger.quality_status.upper() == "PASS"
+            self._quality_ready(challenger)
             and float(challenger.quality_score)
             >= float(incumbent.quality_score)
             + self.config.minimum_quality_advantage

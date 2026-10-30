@@ -30,11 +30,13 @@ class CrawlerMarketDataAdapter:
         observer: RunObserverPort | None = None,
         tpex_crawler_factory: Callable[[int], Any] | None = None,
         restriction_repository: Any | None = None,
+        native_source_capture: Any | None = None,
     ) -> None:
         self._crawler_factory = crawler_factory
         self._observer = observer or NullRunObserver()
         self._tpex_crawler_factory = tpex_crawler_factory
         self._restriction_repository = restriction_repository
+        self._native_source_capture = native_source_capture
 
     def fetch(
         self,
@@ -162,6 +164,15 @@ class CrawlerMarketDataAdapter:
             crawler.low_entry_v4_signal_dates_by_stock = {
                 str(symbol): request.as_of.isoformat() for symbol in crawler.stocknumbers if symbol
             }
+        else:
+            if self._native_source_capture is not None:
+                crawler.les_v7_source_capture = self._native_source_capture.collect(
+                    crawler, market=request.market_source)
+            # This is today's observation of official final daily data/cache,
+            # not proof that this exact version was observed on the bar date.
+            crawler.market_observed_at = datetime.datetime.now(
+                datetime.timezone.utc
+            ).isoformat()
         self._observer.record(
             "market_data_fetch_completed",
             trade_date=trade_date,

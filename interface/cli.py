@@ -9,12 +9,13 @@ import math
 import os
 import re
 import sys
+import uuid
 from dataclasses import replace
 from pathlib import Path
 
 from application.stock_service import StockAnalysisRequest
 from application.historical_replay import replay_close_cutoff
-from config.settings import AppSettings
+from config.settings import AppSettings, DATA_DIR
 from config.settings import SettingsError
 from domain.models import PortfolioPosition
 from domain.models import Stocktype
@@ -26,6 +27,8 @@ from infrastructure.crawler.twse_http_client import TwseClientError
 from infrastructure.observability import configure_structured_logging
 from infrastructure.run_lock import ProcessRunLock
 from infrastructure.run_lock import RunAlreadyActiveError
+from infrastructure.research_series import ResearchSeriesError
+from infrastructure.storage.research_portfolio import ResearchStateError
 
 
 def non_negative_int(value: str) -> int:
@@ -96,6 +99,16 @@ def create_parser() -> argparse.ArgumentParser:
             "and exit without network requests, analysis, or email."
         ),
     )
+    parser.add_argument(
+        "--les-v7-research-bundle", type=Path,
+        help="Use a READY_TO_FREEZE real offline frozen_bundle.json inside its native archive for current-data v7 research. Verifies OOF/source archives, uses the frozen stock universe, emails a labelled research report by default, and isolates PAE state; never deployment approval. --check-config sends nothing. Default warm-up: 1100 calendar days; actual valid-close requirements remain native gates.",
+    )
+    parser.add_argument("--research-id",
+        help="Optional fixed ID for --les-v7-research-bundle only. Continues isolated cross-session PAE evidence with pinned model/code/policy/universe; per-run reports stay separate.")
+    parser.add_argument("--les-v7-strategy-policy", type=Path,
+        help="Explicit immutable fixed-rule StrategyPolicy JSON; must match any fitted model's policy blocks.")
+    parser.add_argument("--les-v7-diagnostics-only", action="store_true", default=None,
+        help="Explicit fixed-policy v7 diagnostics without formal BUY/BUY_SMALL eligibility; no model fallback.")
 
     parser.add_argument(
         "stocklist",
@@ -179,6 +192,11 @@ def create_parser() -> argparse.ArgumentParser:
         "--mail",
         action="store_true",
         help="Send email to recipients.",
+    )
+    parser.add_argument(
+        "--no-mail",
+        action="store_true",
+        help="Explicitly suppress email, including the default delivery for offline v7 research.",
     )
     parser.add_argument(
         "--skip-mops",
@@ -349,6 +367,29 @@ def build_run_configuration(
 ) -> tuple[StockAnalysisRequest, AppSettings]:
     parser = create_parser()
     args = parser.parse_args(argv)
+    research = args.les_v7_research_bundle is not None
+    if args.research_id is not None:
+        if not research:
+            parser.error("--research-id requires --les-v7-research-bundle")
+        from infrastructure.research_series import validate_research_id
+        try:
+            validate_research_id(args.research_id)
+        except ValueError as error:
+            parser.error(str(error))
+    supplied = sys.argv[1:] if argv is None else argv
+    if args.no_mail and (args.mail or args.replay_mail):
+        parser.error("--no-mail cannot be combined with --mail or --replay-mail")
+    if research:
+        if args.replay_mail or args.linechart:
+            parser.error("LES_V7_RESEARCH_ONLY: replay-mail and line charts are not supported")
+        if isinstance(args.beginbacktrack, dt.date) or isinstance(args.endbacktrack, dt.date):
+            parser.error("LES_V7_RESEARCH_CURRENT_DATA_ONLY: an offline publication cannot be backdated into strict historical replay")
+        if args.type != Stocktype.ELEC:
+            parser.error("LES_V7_RESEARCH_FIXED_ELEC_SCOPE_REQUIRED")
+        if not any(value in {"-e", "--endbacktrack"} or value.startswith("--endbacktrack=")
+                   or (value.startswith("-e") and len(value) > 2)
+                   for value in supplied):
+            args.endbacktrack = 1100
     
     # Normalize the CLI only: downstream offset consumers retain integer types.
     # Explicit dates are also carried through so a single-day range never
@@ -383,24 +424,40 @@ def build_run_configuration(
         parser.error("--replay-restrictions-file requires a date -b/-e pair")
     if args.replay_mail and replay_cutoff is None:
         parser.error("--replay-mail requires a date -b/-e pair")
-    mail_enabled = args.mail or args.replay_mail
+    # Research report delivery is not model deployment or trading authority.
+    # Preflight remains read-only and needs no SMTP account; real research runs
+    # validate configured SMTP before any analysis or source refresh begins.
+    mail_enabled = ((not args.check_config) and not args.no_mail) if research else (args.mail or args.replay_mail) and not args.no_mail
+    research_run_id = uuid.uuid4().hex if research else None
+    environment = ({key: value for key, value in os.environ.items()
+                    if key not in {"TWSE_PAE_HOLDINGS_JSON", "TWSE_PAE_CURRENT_CASH"}}
+                   if replay_cutoff is not None else dict(os.environ) if research else None)
+    if research:
+        if args.research_id is not None:
+            from infrastructure.research_series import validate_study_paths
+            try:
+                validate_study_paths(DATA_DIR / "les-v7-research" / args.research_id, args.research_id)
+            except ValueError as error:
+                parser.error(str(error))
+        environment["TWSE_PAE_PERSISTENCE_PATH"] = str(DATA_DIR / "les-v7-research" / (args.research_id or research_run_id) / "portfolio.sqlite3")
     
     try:
         settings = AppSettings.from_env(
-            environ=({key: value for key, value in os.environ.items()
-                      if key not in {"TWSE_PAE_HOLDINGS_JSON", "TWSE_PAE_CURRENT_CASH"}}
-                     if replay_cutoff is not None else None),
+            environ=environment,
             mail_enabled=mail_enabled,
             mops_enabled=not args.skip_mops,
             account_equity=args.account_equity,
             mops_history_years=args.mops_history_years,
             runtime_mode=args.mode,
+            les_v7_research_bundle=args.les_v7_research_bundle,
+            les_v7_strategy_policy=args.les_v7_strategy_policy,
+            les_v7_diagnostics_only=args.les_v7_diagnostics_only,
         )
         if args.pae_holdings_file is not None or args.pae_current_cash is not None:
             settings = replace(
                 settings,
                 pae_positions=(
-                    load_pae_holdings_file(args.pae_holdings_file, allow_empty=replay_cutoff is not None)
+                    load_pae_holdings_file(args.pae_holdings_file, allow_empty=replay_cutoff is not None or research)
                     if args.pae_holdings_file is not None
                     else settings.pae_positions
                 ),
@@ -428,7 +485,8 @@ def build_run_configuration(
         if args.replay_restrictions_file is not None and not args.replay_restrictions_file.is_file():
             parser.error("Archived restriction evidence file does not exist")
 
-    stocklist = load_stocklist(args.stocklist)
+    metadata = json.loads(settings.les_v7_research_metadata_json) if research else None
+    stocklist = list(metadata["symbols"]) if research else load_stocklist(args.stocklist)
     if args.type == Stocktype.SEMI:
         stocklist = list(dict.fromkeys(stocklist or ["ALL"]))
         if any(symbol != "ALL" and re.fullmatch(r"\d{4}", symbol) is None for symbol in stocklist):
@@ -438,6 +496,8 @@ def build_run_configuration(
     tracked = set(stocklist)
     included_symbols: tuple[str, ...] = ()
     if args.include_symbols_file is not None:
+        if research:
+            parser.error("LES_V7_RESEARCH_FIXED_SCOPE: --include-symbols-file cannot expand a frozen model universe")
         included_symbols = load_include_symbols_file(args.include_symbols_file)
         for symbol in included_symbols:
             if symbol not in tracked:
@@ -445,16 +505,33 @@ def build_run_configuration(
                 tracked.add(symbol)
     for position in settings.pae_positions:
         if position.symbol not in tracked:
+            if research:
+                parser.error("LES_V7_RESEARCH_FIXED_SCOPE: account holdings outside the frozen universe are not supported")
             stocklist.append(position.symbol)
             tracked.add(position.symbol)
+
+    if research:
+        from domain.les_v7.fr2_policy import component as fr2_entry_component
+        from domain.les_v7.fr2_execution import component as fr2_execution_component
+        from domain.les_v7.valuation_price import policy as eps_price_policy
+        included_symbols = tuple(stocklist)  # Symbols, never legacy market-row indexes.
+        metadata.update(research_run_id=research_run_id, warmup_calendar_days=args.endbacktrack,
+            required_close_count_policy="NATIVE_VALID_CLOSES_NOT_CALENDAR_ESTIMATE",
+            admission_component=fr2_entry_component(), execution_component=fr2_execution_component(),
+            valuation_policy=eps_price_policy(), prediction_bundle_unchanged=True,
+            decision_thresholds=dict(BUY=75., BUY_SMALL=65.),
+            return_basis="PRICE_RETURN_ONLY_NOT_TOTAL_RETURN")
+        settings = replace(settings, les_v7_research_metadata_json=json.dumps(metadata))
 
     request = StockAnalysisRequest(
         stocklist=stocklist,
         stocktype=args.type,
-        output_file_names=(args.output_file_names + "_tpex_semi" if args.type == Stocktype.SEMI else args.output_file_names),
+        output_file_names=(f"{args.output_file_names}_LESv7_RESEARCH_{metadata['bundle_sha256'][:12]}_{research_run_id}"
+                           if research else args.output_file_names + "_tpex_semi"
+                           if args.type == Stocktype.SEMI else args.output_file_names),
         endbacktrack=args.endbacktrack,
         beginbacktrack=args.beginbacktrack,
-        subject=args.subject,
+        subject=(f"[LES_V7_RESEARCH｜研究用途｜不可下單] {args.subject}" if research else args.subject),
         ccreceiver=args.ccreceiver,
         linechart=args.linechart,
         period=args.period,
@@ -479,6 +556,17 @@ def build_run_configuration(
         history_start_date=history_start,
         history_end_date=history_end,
     )
+    if args.research_id is not None:
+        from infrastructure.research_series import make_research_identity, check_study
+        from application.replay_contracts import digest
+        metadata["research_id"] = args.research_id
+        identity = make_research_identity(metadata, request, settings)
+        metadata.update(research_identity=identity, research_identity_id=digest(identity))
+        try:
+            check_study(settings.pae_persistence_path.parent, identity)
+        except ValueError as error:
+            parser.error(str(error))
+        settings = replace(settings, les_v7_research_metadata_json=json.dumps(metadata))
     return request, settings
 
 
@@ -492,6 +580,31 @@ def build_preflight_summary(
     settings: AppSettings,
 ) -> dict[str, object]:
     """Return an operational summary without exposing SMTP credentials."""
+    from domain.strategies.expected_return_exit_b import DAILY_EREM_MODEL_VERSION
+    from domain.strategies.erem_soft_reduction import SoftReductionFormalPolicy
+    quality = None
+    from application.les_v7_preflight import daily_v7_preflight
+    readiness = daily_v7_preflight(settings, checked_at=dt.datetime.now(dt.timezone.utc), market=request.market_source)
+    if settings.daily_entry_model == "v7":
+        from domain.les_v7.quality_policy import default_quality_policy, is_source_evidence_policy, validate_quality_policy
+        from domain.les_v7.rule_baseline import baseline_policy, current_source_baseline_version
+        default = (baseline_policy(request.market_source, version=current_source_baseline_version(request.as_of or dt.datetime.now(dt.timezone.utc)))["quality_policy"]
+            if settings.les_v7_rule_baseline and settings.les_v7_source_repair else default_quality_policy())
+        configured = (json.loads(settings.les_v7_strategy_policy_json)["payload"]["quality_policy"]
+                      if settings.les_v7_strategy_policy_json else
+                      json.loads(settings.les_v7_bundle_json)["payload"]["quality_policy"]
+                      if settings.les_v7_bundle_json else default)
+        cutoff = (request.as_of or dt.datetime.now(dt.timezone.utc)).isoformat()
+        try:
+            policy = validate_quality_policy(configured, cutoff, market=request.market_source)
+        except ValueError as error:
+            if readiness["state"] != "BLOCKED":
+                raise
+            policy = dict(configured, period_selection_status="CONFIG_NOT_READY", configuration_error=str(error))
+        quality = dict(profile_id=policy.get("profile_id", "QG_V7_BOUNDED_GAPS_R1"),
+                       policy_sha256=policy.get("policy_sha256"),
+                       period_selection_status=policy.get("period_selection_status", "EXPLICIT_LEGACY_PERIOD"),
+                       independent_of_model_bundle=is_source_evidence_policy(policy))
     return {
         "account_equity": settings.account_equity,
         "backtrack": {
@@ -507,10 +620,24 @@ def build_preflight_summary(
         "mops_cache": str(settings.mops_cache_dir),
         "mops_enabled": request.mops_enabled,
         "daily_strategy_workers": settings.daily_strategy_workers,
+        "daily_entry_model": settings.daily_entry_model,
+        "daily_exit_model": DAILY_EREM_MODEL_VERSION,
+        "daily_exit_policy": SoftReductionFormalPolicy().record(),
+        "les_v7_bundle_configured": settings.les_v7_bundle_json is not None,
+        "les_v7_strategy_policy_configured": settings.les_v7_strategy_policy_json is not None,
+        "les_v7_rule_baseline_enabled": settings.les_v7_rule_baseline,
+        "les_v7_source_repair_enabled": settings.les_v7_source_repair,
+        **({"industry_benchmark_sectors": sorted(json.loads(settings.industry_benchmarks_json))}
+           if settings.industry_benchmarks_json else {}),
+        "les_v7_readiness": readiness,
+        "les_v7_quality_policy": quality,
         "output": request.output_file_names,
         "report_output": request.report_file_prefix,
         "as_of": request.as_of.isoformat() if request.as_of else None,
-        "evaluation_mode": "HISTORICAL_REPLAY" if request.as_of else "LIVE",
+        "evaluation_mode": ("OFFLINE_MODEL_RESEARCH_ON_CURRENT_DATA" if settings.les_v7_research_metadata_json
+                            else "HISTORICAL_REPLAY" if request.as_of else "LIVE"),
+        "les_v7_research_model": (json.loads(settings.les_v7_research_metadata_json)
+                                  if settings.les_v7_research_metadata_json else None),
         "pae_holding_count": len(settings.pae_positions),
         "pae_holding_symbols": [
             position.symbol for position in settings.pae_positions
@@ -524,10 +651,11 @@ def build_preflight_summary(
             and settings.smtp_receivers
             and settings.smtp_server_host
         ),
-        "status": "OK",
+        "status": "CONFIG_NOT_READY" if readiness["state"] == "BLOCKED" else "OK",
         "stock_type": request.stocktype.name,
         "market_source": request.market_source,
-        "universe": "HISTORICAL_SECTOR_UNION" if "ALL" in request.stocklist else "SELECTED",
+        "universe": ("FROZEN_MODEL_TWSE_ELEC" if settings.les_v7_research_metadata_json else
+                     "HISTORICAL_SECTOR_UNION" if "ALL" in request.stocklist else "SELECTED"),
         "symbol_count": None if "ALL" in request.stocklist else len(request.stocklist),
     }
 
@@ -541,7 +669,13 @@ def main(argv: list[str] | None = None) -> int:
         list_strategies()
         return 0
 
+    if args.research_id is not None and args.les_v7_research_bundle is None:
+        parser.error("--research-id requires --les-v7-research-bundle")
     if isinstance(args.beginbacktrack, dt.date) or isinstance(args.endbacktrack, dt.date):
+        if args.les_v7_research_bundle is not None:
+            parser.error("LES_V7_RESEARCH_CURRENT_DATA_ONLY: offline models cannot be backdated")
+        if args.les_v7_strategy_policy is not None or args.les_v7_diagnostics_only:
+            parser.error("LES_V7_DAILY_POLICY_OPTIONS_CURRENT_DATA_ONLY: historical replay retains its existing contract")
         from interface.replay import run_from_args
         try:
             result = run_from_args(args)
@@ -557,26 +691,57 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--replay-* options require a date -b/-e pair")
     
     # Validate stocklist is provided for normal operation
-    if not args.stocklist and args.type != Stocktype.SEMI:
+    if not args.stocklist and args.type != Stocktype.SEMI and args.les_v7_research_bundle is None:
         parser.error("the following arguments are required: stocklist")
     
     request, settings = build_run_configuration(argv)
     configure_structured_logging(settings.effective_log_level)
     if args.check_config:
+        summary = build_preflight_summary(request, settings)
         print(
             json.dumps(
-                build_preflight_summary(request, settings),
+                summary,
                 ensure_ascii=False,
                 sort_keys=True,
             )
         )
-        return 0
+        return 2 if summary["status"] == "CONFIG_NOT_READY" else 0
+    from application.les_v7_preflight import daily_v7_preflight
+    readiness = daily_v7_preflight(settings, checked_at=dt.datetime.now(dt.timezone.utc), market=request.market_source)
+    if readiness["state"] == "BLOCKED":
+        parser.error("LES_V7_CONFIGURATION_NOT_READY: " + "; ".join(readiness["reason_codes"]))
     try:
         with ProcessRunLock(settings.run_lock_path):
+            research_metadata = (json.loads(settings.les_v7_research_metadata_json)
+                                 if settings.les_v7_research_metadata_json else None)
+            if research_metadata:
+                from infrastructure.research_archive import write_once
+                archive = settings.pae_persistence_path.parent
+                if research_metadata.get("research_id"):
+                    from infrastructure.research_series import ensure_study, metadata_identity
+                    ensure_study(archive, metadata_identity(research_metadata))
+                    archive = archive / "runs" / research_metadata["research_run_id"]
+                write_once(archive / "request.json", dict(model_use=research_metadata,
+                    report_file_prefix=request.report_file_prefix, mail_enabled=request.mail,
+                    research_only=True, approved_for_live=False, execution_action="NO_ACTION"))
+                print("LES v7 RESEARCH ONLY: verified native archive; research report email enabled; no broker action or deployment approval.")
             build_stock_analysis_service(settings=settings).run(request)
+            if research_metadata:
+                if research_metadata.get("research_id"):
+                    from infrastructure.research_series import check_versions
+                    check_versions(metadata_identity(research_metadata))
+                write_once(archive / "completion.json", dict(status="COMPLETE", model_use=research_metadata,
+                    report_file_prefix=request.report_file_prefix, mail_enabled=request.mail, research_only=True,
+                    approved_for_live=False, execution_action="NO_ACTION"))
+                print(json.dumps(dict(status="COMPLETE", report_file_prefix=request.report_file_prefix,
+                    research_archive=str(archive), research_only=True, approved_for_live=False,
+                    execution_action="NO_ACTION"), ensure_ascii=False, sort_keys=True))
     except RunAlreadyActiveError as error:
         print(f"TWSE run status: ALREADY_RUNNING ({error})", file=sys.stderr)
         return 4
+    except (ResearchSeriesError, ResearchStateError) as error:
+        print(f"LES v7 research status: REJECTED ({error})", file=sys.stderr)
+        return 2
     except TwseCalendarError as error:
         print(f"TWSE market status: UNKNOWN ({error})", file=sys.stderr)
         return 2

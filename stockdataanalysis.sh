@@ -2,6 +2,7 @@
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PY315_PYTHON="$SCRIPT_DIR/.venv-py315/bin/python"
 VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
 
 usage() {
@@ -10,6 +11,7 @@ Usage: ./stockdataanalysis.sh [--profile PROFILE] [-b DAYS] [-e DAYS] [--check]
        ./stockdataanalysis.sh --profile PROFILE -b START_DATE -e END_DATE
          --pae-holdings-file HISTORICAL_FILE --pae-current-cash CASH
          --account-equity EQUITY --replay-id ID --replay-evidence-file JSON [--check]
+       ./stockdataanalysis.sh --profile elec --les-v7-research-bundle ARCHIVE/models/JOB_ID/frozen_bundle.json [--research-id ID] [--check]
 
 Profiles: elec, semi, chemi, bio, comp, air, veh, eleccomp
 
@@ -22,6 +24,10 @@ Holding token format:
 where entry_decision is BUY, EARLY_BUY, or BUY_SMALL. Existing shorter tokens
 remain valid.
 --check validates the complete runtime configuration without network or email.
+Daily entry defaults to LES v7; set TWSE_DAILY_ENTRY_MODEL=v6 for legacy daily output.
+TWSE_LES_V7_BUNDLE optionally loads a frozen model. Missing evidence stays N/A.
+Full v7 requires a compatible model before analysis starts. Fixed-rule diagnostics
+require --les-v7-diagnostics-only and --les-v7-strategy-policy POLICY.json.
 Integer -b/-e retain calendar-day offsets relative to the execution date.
 Date pairs (-b YYYY-MM-DD -e YYYY-MM-DD) select an inclusive history range and
 automatically replay at END_DATE 13:30 Taipei. Timestamps and premarket/intraday
@@ -31,6 +37,14 @@ research outputs, and never emails. Prepare restrictions in the evidence package
 The evidence package, not today's stocklist, supplies the replay universe.
 --check still sends nothing. An explicit historical portfolio is
 required; an empty holdings file declares no holdings. Normal runs still email.
+Offline v7 research requires a real READY_TO_FREEZE native archive. It uses the
+frozen ELEC universe, emails the research report by default, and isolates PAE
+state/research output. --check sends nothing and does not require SMTP credentials.
+--research-id pins an isolated study across sessions; model/code/policy/universe
+changes require a new ID. Without it, each research run remains independent.
+Its default warm-up is 1100 calendar days; only actual valid closes satisfy the
+model's fractal-history gates. It does not grant model deployment approval.
+--no-mail explicitly suppresses email for any run, including offline v7 research.
 EOF
 }
 
@@ -52,16 +66,23 @@ fi
 ANALYSIS_PROFILE="${TWSE_ANALYSIS_PROFILE:-elec}"
 CHECK_CONFIG=0
 BACKTRACK_END=700
+BACKTRACK_END_EXPLICIT=0
 BACKTRACK_BEGIN=0
 EXPLICIT_HOLDINGS=""
 EXPLICIT_CASH=""
 EXPLICIT_EQUITY=""
 REPLAY_RESTRICTIONS=""
 REPLAY_MAIL=0
+NO_MAIL=0
 REPLAY_ID=""
 REPLAY_EVIDENCE=""
 REPLAY_STATE=""
 REPLAY_OUTPUT=""
+LES_V7_RESEARCH_BUNDLE=""
+RESEARCH_ID=""
+RESEARCH_ID_SUPPLIED=0
+LES_V7_STRATEGY_POLICY=""
+LES_V7_DIAGNOSTICS_ONLY=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -h|--help)
@@ -72,8 +93,16 @@ while [ "$#" -gt 0 ]; do
       CHECK_CONFIG=1
       shift
       ;;
+    --les-v7-diagnostics-only)
+      LES_V7_DIAGNOSTICS_ONLY=1
+      shift
+      ;;
     --replay-mail)
       REPLAY_MAIL=1
+      shift
+      ;;
+    --no-mail)
+      NO_MAIL=1
       shift
       ;;
     --profile)
@@ -89,14 +118,14 @@ while [ "$#" -gt 0 ]; do
       ANALYSIS_PROFILE=${1#--profile=}
       shift
       ;;
-    -b|-e|--pae-holdings-file|--pae-current-cash|--account-equity|--replay-restrictions-file|--replay-id|--replay-evidence-file|--replay-state-path|--replay-output-dir)
+    -b|-e|--pae-holdings-file|--pae-current-cash|--account-equity|--replay-restrictions-file|--replay-id|--replay-evidence-file|--replay-state-path|--replay-output-dir|--les-v7-research-bundle|--les-v7-strategy-policy|--research-id)
       if [ "$#" -lt 2 ]; then
         echo "$1 requires a value" >&2
         exit 2
       fi
       case "$1" in
         -b) BACKTRACK_BEGIN=$2 ;;
-        -e) BACKTRACK_END=$2 ;;
+        -e) BACKTRACK_END=$2; BACKTRACK_END_EXPLICIT=1 ;;
         --pae-holdings-file) EXPLICIT_HOLDINGS=$2 ;;
         --pae-current-cash) EXPLICIT_CASH=$2 ;;
         --account-equity) EXPLICIT_EQUITY=$2 ;;
@@ -105,6 +134,9 @@ while [ "$#" -gt 0 ]; do
         --replay-evidence-file) REPLAY_EVIDENCE=$2 ;;
         --replay-state-path) REPLAY_STATE=$2 ;;
         --replay-output-dir) REPLAY_OUTPUT=$2 ;;
+        --les-v7-research-bundle) LES_V7_RESEARCH_BUNDLE=$2 ;;
+        --research-id) RESEARCH_ID=$2; RESEARCH_ID_SUPPLIED=1 ;;
+        --les-v7-strategy-policy) LES_V7_STRATEGY_POLICY=$2 ;;
       esac
       shift 2
       ;;
@@ -115,6 +147,17 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+if [ "$NO_MAIL" -eq 1 ] && [ "$REPLAY_MAIL" -eq 1 ]; then
+  echo "--no-mail cannot be combined with --replay-mail" >&2
+  exit 2
+fi
+if [ "$RESEARCH_ID_SUPPLIED" -eq 1 ] && [ -z "$LES_V7_RESEARCH_BUNDLE" ]; then
+  echo "--research-id requires --les-v7-research-bundle" >&2
+  exit 2
+fi
+if [ -n "$LES_V7_RESEARCH_BUNDLE" ] && [ "$BACKTRACK_END_EXPLICIT" -eq 0 ]; then
+  BACKTRACK_END=1100
+fi
 # Detect date syntax only; Python validates real calendar dates and ordering.
 # Replay must be selected BEFORE consulting current holdings or adding -m.
 DATE_RANGE=0
@@ -136,6 +179,15 @@ case "$BACKTRACK_END" in
     ;;
 esac
 REPLAY_MODE=$DATE_RANGE
+if [ -n "$LES_V7_RESEARCH_BUNDLE" ] && [ "$REPLAY_MODE" -eq 1 ]; then
+  echo "Offline LES v7 research uses current data; it cannot backdate model publication into replay." >&2
+  exit 2
+fi
+if [ "$REPLAY_MODE" -eq 0 ]; then
+  # Daily entry uses v7; explicit v6 remains available for compatibility.
+  TWSE_DAILY_ENTRY_MODEL=${TWSE_DAILY_ENTRY_MODEL:-v7}
+  export TWSE_DAILY_ENTRY_MODEL
+fi
 if [ "$REPLAY_MAIL" -eq 1 ] && [ "$REPLAY_MODE" -ne 1 ]; then
   echo "--replay-mail requires a date -b/-e pair" >&2
   exit 2
@@ -169,9 +221,9 @@ esac
 
 if [ -n "${PYTHON:-}" ]; then
   PYTHON_BIN="${PYTHON:-python3}"
-elif python3 -c "import requests, pandas, tabulate, xlsxwriter, matplotlib" >/dev/null 2>&1; then
-  PYTHON_BIN="python3"
-elif [ -x "$VENV_PYTHON" ]; then
+elif [ -x "$PY315_PYTHON" ] && "$PY315_PYTHON" -c "import sys, requests, pandas, tabulate, xlsxwriter, matplotlib; sys.exit(0 if sys.version_info[:2] == (3, 15) else 1)" >/dev/null 2>&1; then
+  PYTHON_BIN="$PY315_PYTHON"
+elif [ -x "$VENV_PYTHON" ] && "$VENV_PYTHON" -c "import requests, pandas, tabulate, xlsxwriter, matplotlib" >/dev/null 2>&1; then
   PYTHON_BIN="$VENV_PYTHON"
 else
   PYTHON_BIN="python3"
@@ -179,6 +231,7 @@ fi
 
 if ! "$PYTHON_BIN" -c "import requests, pandas, tabulate, xlsxwriter, matplotlib" >/dev/null 2>&1; then
   echo "Missing Python dependencies for stockanalysis.sh." >&2
+  echo "Selected Python interpreter failed its dependency check: $PYTHON_BIN" >&2
   if [ -x "$VENV_PYTHON" ]; then
     echo "Install them with: $VENV_PYTHON -m pip install -r \"$SCRIPT_DIR/requirements.txt\"" >&2
   else
@@ -257,8 +310,25 @@ if [ "$REPLAY_MODE" -eq 1 ]; then
   if [ "$REPLAY_MAIL" -eq 1 ]; then
     set -- "$@" --replay-mail
   fi
-else
-  set -- "$@" -m
+elif [ -z "$LES_V7_RESEARCH_BUNDLE" ] || [ "$CHECK_CONFIG" -eq 0 ]; then
+  if [ "$NO_MAIL" -eq 0 ]; then
+    set -- "$@" -m
+  fi
+fi
+if [ "$NO_MAIL" -eq 1 ]; then
+  set -- "$@" --no-mail
+fi
+if [ -n "$LES_V7_RESEARCH_BUNDLE" ]; then
+  set -- "$@" --les-v7-research-bundle "$LES_V7_RESEARCH_BUNDLE"
+fi
+if [ "$RESEARCH_ID_SUPPLIED" -eq 1 ]; then
+  set -- "$@" --research-id "$RESEARCH_ID"
+fi
+if [ -n "$LES_V7_STRATEGY_POLICY" ]; then
+  set -- "$@" --les-v7-strategy-policy "$LES_V7_STRATEGY_POLICY"
+fi
+if [ "$LES_V7_DIAGNOSTICS_ONLY" -eq 1 ]; then
+  set -- "$@" --les-v7-diagnostics-only
 fi
 if [ -n "$REPLAY_RESTRICTIONS" ]; then
   set -- "$@" --replay-restrictions-file "$REPLAY_RESTRICTIONS"

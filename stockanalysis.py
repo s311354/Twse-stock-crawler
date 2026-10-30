@@ -577,19 +577,10 @@ class TwseCrawker(LegacyCrawlerFacade):
 
 
     def days_between_isodates(self, date1: str, date2: str) -> int:
-        def is_leap_year(year: int) -> bool:
-            return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
-
-        def get_days(date: str) -> int:
-            y, m, d = map(int, date.split('-'))
-
-            days = d + int(is_leap_year(y) and m < 2)
-            days += sum(365 + int(is_leap_year(y)) for y in range(1971, y))
-            days += sum([0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][:m])
-
-            return days
-
-        return abs(get_days(date1) - get_days(date2)) + 1
+        """Inclusive calendar span, not an official trading-session count."""
+        start = datetime.date.fromisoformat(date1)
+        end = datetime.date.fromisoformat(date2)
+        return abs((end - start).days) + 1
 
 
     def get_twse_daily_stocks(self, file_name: str, stocktype: Stocktype, stocks: list[StockSelector]) -> None:

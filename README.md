@@ -31,7 +31,12 @@ compatibility boundaries, not a second implementation of the models.
 |-- aistock_twse_integration/        # owner-research and v6 execution JSON adapters
 |-- interface/
 |   |-- cli.py                      # daily analysis and date-range replay adapter
+|   |-- daily_oos_collection.py     # post-close no-mail raw candidate retention; isolated PAE
 |   |-- les_v6.py                   # offline unified/Hybrid/legacy comparison entry
+|   |-- les_v7.py                   # offline v7 request entry, shared native kernel
+|   |-- les_v7_fr2.py               # opt-in frozen predictor + FR2 research admission/execution; no mail
+|   |-- les_v7_fr3.py               # isolated new-label/new-fit FR3 training and research; no mail
+|   |-- les_v7_training.py          # manual past-only training/calibration/research-freeze CLI
 |   |-- replay.py                   # strict-replay request/result entry
 |   `-- research.py                 # evidence audit, jobs, archives and reproduction
 |-- application/
@@ -39,9 +44,11 @@ compatibility boundaries, not a second implementation of the models.
 |   |-- use_cases.py                # port-based workflow steps
 |   |-- analysis_dataset.py         # daily entry/EREM composition and typed decision assembly
 |   |-- strategy_execution.py       # prepare shared features and invoke plugins
-|   |-- daily_entry.py              # compose v6 entry with separately owned valuation fields
+|   |-- daily_entry.py              # selected v6/v7 entry with separately owned valuation fields
 |   |-- daily_valuation.py          # v5 fundamental/valuation sidecar, not v5 entry scoring
 |   |-- low_entry_v6_daily.py        # explicit deployed Hybrid config and report projection
+|   |-- low_entry_v7_daily.py        # native v7 units/evidence adapter and report projection
+|   |-- les_v7_training.py          # explicit hash-bound offline training request port
 |   |-- evidence_context.py         # work-scoped read-only financial evidence packets
 |   |-- daily_work.py               # bounded, version-guarded preprocessing caches
 |   |-- fundamental_service.py      # MOPS discovery/cache/derivation orchestration
@@ -58,8 +65,12 @@ compatibility boundaries, not a second implementation of the models.
 |   |-- features.py                 # shared immutable technical features and price-scale pairs
 |   |-- numeric_history.py          # metadata-free numeric history boundary
 |   |-- strategy.py                 # strategy abstraction/plugin registry
+|   |-- les_v7/                     # quality/localization/decision + native offline training/calibration
+|   |   |-- rule_baseline.py        # explicit model-free v6 Hybrid formulas; no predicted odds
+|   |   |-- valuation_input_policy.py # annual valuation dependencies, separate entry Quality gate
 |   `-- strategies/
 |       |-- low_entry_score_v6.py   # v6 plugins and next-session execution validation
+|       |-- low_entry_score_v7.py   # v7 plugin; no v6 rule-engine inheritance
 |       |-- low_entry_v6_hybrid.py  # context selection and one six-factor 100-point ledger
 |       |-- low_entry_v6_decision.py # explicit penalties, safety caps and final-score decision
 |       |-- low_entry_v6_quality.py # unified QualityResult and five-dimension scoring
@@ -76,6 +87,9 @@ compatibility boundaries, not a second implementation of the models.
 |   |-- fundamentals/
 |   |   |-- mops_client.py          # filing/announcement/correction discovery
 |   |   |-- ixbrl_parser.py         # normalized Inline XBRL facts
+|   |   |-- ixbrl_decoding.py       # strict source-range recovery; lossless decoding receipts
+|   |   |-- parse_identity.py       # actual raw-parser/units/schema semantic fingerprints
+|   |   |-- financial_companions.py # bounded immutable per-original audit/supplement reuse
 |   |   |-- mops_repository.py      # SQLite metadata + raw revision cache
 |   |   `-- twse_financial_batch.py # official batch financial data boundary
 |   |-- runtime/
@@ -91,8 +105,11 @@ compatibility boundaries, not a second implementation of the models.
 |   |-- research_job.py             # pinned work context, daily retention and recovery
 |   |-- research_objects.py         # content-addressed evidence/source/environment objects
 |   |-- research_archive.py         # immutable archive and reproduction support
-|   |-- report/                     # HTML renderer factory and v6 presentation
+|   |-- les_v7_market_final.py      # bounded final-bar warmup capture and verified parent reuse
+|   |-- les_v7_warmup_audit.py      # source-bound listing lifecycle and cutoff-valid warmup gaps
+|   |-- report/                     # HTML renderer factory and native v6/v7 presentation
 |   |-- storage/                    # market/fundamental caches, report evidence, PAE/replay state
+|   |   `-- local_workspace.py      # closed SQLite SSD staging, verified atomic publication
 |   `-- notification/mail.py        # SMTP boundary, separate from research execution
 |-- config/
 |   `-- settings.py                 # paths and runtime defaults
@@ -111,12 +128,12 @@ stockdataanalysis.sh -> main.py -> interface.cli -> infrastructure.bootstrap
      -> market data + official calendar/restriction evidence
      -> cache-first financial refresh + point-in-time source selection
      -> EvidenceContext + shared unit-safe technical features
-     -> DailyEntryService: LES v6 Hybrid + separate valuation sidecar
+     -> DailyEntryService: LES v7 + separate valuation sidecar (explicit v6 override)
      -> EREM -> typed decisions -> PAE portfolio allocation
      -> evidence-backed CSV/JSON + HTML -> optional notification
 ```
 
-The deployed v6 Hybrid uses decision policy **4**: context is selected before
+The retained v6 Hybrid uses decision policy **4**: context is selected before
 scoring, six factor budgets are **30/10/20/25/5/10**, and unrounded Final maps
 to **BUY >=72** or **BUY_SMALL >=62**. Quality and non-compensable safety checks
 remain separate from technical points. Policy 3 (**75/65**) is explicitly
@@ -135,13 +152,70 @@ incremental research state and completion receipts support retention/recovery.
 These entries do not send mail or simulate fills. BankEmulator owns fills,
 fees and account-ledger evolution; the crawler owns evidence and research.
 
-### Low-Entry Model v6 (daily entry pipeline) ###
+### Low-Entry Model v7 (daily default / research signals) ###
 
-Daily analysis explicitly uses the `low_entry_score_v6_hybrid` Strategy plugin for
-quality-first reversal, trend-pullback and leadership-continuation interpretation
-with `BUY` / `BUY_SMALL` signals. Daily analysis,
-typed entry fields, HTML and email subjects now use v6. The v5 valuation/CER
-sidecar and EREM/PAE policies remain separately identified, and old plugins are retained.
+`./stockdataanalysis.sh` now defaults to the independent `low_entry_score_v7`
+plugin, including shared features, typed decisions, CSV/JSON and Email rendering.
+It implements cutoff-only financial selection,
+native reported-period Quality (explicit R1/R2 compatibility retained), DFA/Higuchi features, optional five frozen localization
+heads, and one context/plan/six-factor score/decision. Without a supplied model,
+the ordinary daily entry explicitly uses the versioned **v6 Hybrid rule baseline**;
+it does not manufacture a trained model or prediction. MF-DFA and LPPL are shadow
+diagnostics. No dependencies were added.
+
+DFA512/1024 require 513/1025 cutoff-valid closing observations; five-session
+`delta_dfa512_5`/`delta_dfa1024_5` require 518/1030. These are not calendar-day
+counts. Native `diagnostics.feature_audit.fractal_history` exposes the required,
+available and missing counts without filling missing estimates. Derived
+`delta_dfa*` inputs require the same fractal null-validation as DFA/Higuchi;
+declaring them as `V7_NO_FRACTAL_BASELINE` is rejected.
+
+Manual offline training is available through `python -m interface.les_v7_training
+DATASET --config CONFIG --output-dir ROOT`. It reuses native v7 features, labels,
+inference projections and factor mapping; head OOF predictions and their
+calibrators both use strictly past matured labels. Independent holdout, null
+controls, head-feature ablation and hash-bound reports precede write-once research
+bundle publication. Missing evidence retains `NOT_READY`; actual publication
+time is never backdated. Research/synthetic bundles are not automatically deployed
+and this producer's research-only outputs are refused by ordinary daily settings. 
+
+An explicit `./stockdataanalysis.sh --profile elec --les-v7-research-bundle
+/absolute/native/archive/models/JOB_ID/frozen_bundle.json` entry now permits
+current-data **research** inference using a real `READY_TO_FREEZE` native archive.
+It verifies the original dataset/OOF/model archives, uses the frozen ELEC ticker
+universe, isolates PAE state and outputs, and emails a labelled research report
+by default using the existing SMTP configuration. `--check` sends nothing and
+does not require SMTP credentials. Email delivery does not authorize
+deployment or backdate publication into replay. The research entry defaults to
+1100 calendar days for warmup; sufficient actual valid closes remain a native
+gate.
+
+Add `--research-id elec-fr2-study-01` to carry native PAE Persistence across
+current-data research days in a dedicated, identity-bound SQLite store. Each
+execution still has its own run ID, output and completion receipt. Same-data-day
+retries cannot accumulate duplicate observations; changed same-day observations,
+out-of-order dates, or changed model/code/policy/ordered universe are refused.
+Cash/equity/holdings are supplied per run, never inferred from the persistence
+store. Ordinary daily state remains isolated; omit the flag to retain independent
+per-run research. 
+
+
+```sh
+cd /Volumes/Transcend-Dev/GitHub/python_practices/tools/Twse-stock-crawler
+./stockdataanalysis.sh --check
+./stockdataanalysis.sh
+# Optional learned daily v7 requires a compatible, reviewed deployment model.
+TWSE_LES_V7_BUNDLE=/absolute/path/frozen_bundle.json ./stockdataanalysis.sh -e 1100 -b 0
+# Opt out of the default model-free baseline; a missing model then blocks preflight.
+TWSE_LES_V7_RULE_BASELINE=false ./stockdataanalysis.sh --profile elec --check
+# Explicit fixed-strategy diagnostics; no probability/formal score/entry fallback.
+./stockdataanalysis.sh --profile elec --les-v7-diagnostics-only \
+  --les-v7-strategy-policy /absolute/path/strategy_policy.json --check
+# Explicit old daily behavior; never an automatic missing-model fallback.
+TWSE_DAILY_ENTRY_MODEL=v6 ./stockdataanalysis.sh
+.venv/bin/python -m interface.les_v7 examples/les_v7_not_ready.json
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/strategies/test_daily_v7_pipeline.py tests/strategies/test_low_entry_score_v7.py -q
+```
 
 ### Expected Return Exit Model v3 ###
 
@@ -180,9 +254,9 @@ EREM decision mapping:
 
 ### Portfolio Allocation Engine v2 ###
 
-Portfolio Allocation Engine v2 (`portfolio_allocation_v2`, schema `pae.portfolio_decision.v2`) is the daily production allocator. It consumes published LES v6 and EREM v3 outputs, with the existing valuation/CER sidecar, and adds opportunity-cost allocation, complete-portfolio improvement, explicit cash preference, and atomic four-seat replacement rules.
+Portfolio Allocation Engine v2 (`portfolio_allocation_v2`, schema `pae.portfolio_decision.v2`) is the daily production allocator. It consumes the selected LES model and EREM v3 outputs, with the existing valuation/CER sidecar, and adds opportunity-cost allocation, complete-portfolio improvement, explicit cash preference, and atomic four-seat replacement rules. Qualified daily v7 BUY/BUY_SMALL signals can supply authorized, account-bound PAE candidate quotas; broker/order execution remains separate.
 
-The daily premarket entry universe accepts only hard-gate-complete LES v6 `BUY` and `BUY_SMALL` decisions. Its setup-specific thresholds, position cap, and execution plan come from the frozen v6 report, not a v5 threshold. PAE remains an independent allocation gate and may decline an LES BUY. A high LES score never overrides missing core quality, failed Risk, Falling-Knife, liquidity, or point-in-time evidence. Legacy `EARLY_BUY` remains readable for old holdings but is not produced by v6.
+Under the explicit v6 compatibility mode, the premarket entry universe accepts only hard-gate-complete v6 `BUY` and `BUY_SMALL` decisions. Thresholds, position cap, and execution plan come from the frozen native report, not a v5 threshold. Daily v7 uses its native gates and separately bound PAE authorization record. PAE remains an independent allocation gate and may decline an LES BUY. A high LES score never overrides missing core quality, failed Risk, Falling-Knife, liquidity, or point-in-time evidence. Legacy `EARLY_BUY` remains readable for old holdings but is not produced by v6/v7.
 
 | Effective holdings | Mode | Authority |
 |---:|---|---|
@@ -262,15 +336,6 @@ options:
                         Optional current portfolio cash in NTD.
   --mode {release,debug}
                         Runtime output mode. release suppresses diagnostic details; debug enables per-date and per-symbol diagnostics.
-```
-
-### Local Run Instructions ###
-
-Create or refresh the local environment:
-
-```
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
 ```
 
 Run the automated workflow after configuring `.env.example`:

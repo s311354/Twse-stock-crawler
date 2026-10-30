@@ -58,7 +58,9 @@ def test_available_strategies_returns_all_builtin_names():
     names = available_strategies()
     
     assert isinstance(names, list)
-    assert len(names) == 14
+    assert len(names) == 16
+    assert "expected_return_exit_v3_b1" in names
+    assert "low_entry_score_v7" in names
     assert "low_entry_score_v5" in names
     assert "low_entry_score_v6" in names
     assert "low_entry_score_v6_hybrid" in names

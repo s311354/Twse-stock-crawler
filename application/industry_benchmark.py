@@ -1,9 +1,52 @@
 """Import official industry evidence using the existing document/proof verifier."""
 from collections.abc import Mapping
 from copy import deepcopy
+import json
+from pathlib import Path
 
 from application.research_evidence import verified_document, verify_publication
 from domain.industry_benchmark import SCHEMA, SOURCE_SCHEMA, identity, source_binding, validate_packet
+
+MAX_SOURCE_FILE_BYTES = 16 * 1024 * 1024
+
+
+def load_industry_benchmarks(path, *, document_reader=None) -> dict:
+    """Import an explicitly supplied bounded raw-source mapping, with no I/O fetch.
+
+    The file maps official sector codes (or their existing enum aliases) to
+    ``industry-benchmark-source/v1`` packets. Public input never accepts a
+    self-certified normalized PASS packet. No path is inferred when disabled.
+    """
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("DUPLICATE_INDUSTRY_JSON_KEY")
+            result[key] = value
+        return result
+
+    with Path(path).expanduser().open("rb") as source:
+        body = source.read(MAX_SOURCE_FILE_BYTES + 1)
+    if len(body) > MAX_SOURCE_FILE_BYTES:
+        raise ValueError("BOUNDED_INDUSTRY_SOURCE_FILE_REQUIRED")
+    payload = json.loads(body.decode("utf-8"), object_pairs_hook=unique_object)
+    if not isinstance(payload, dict):
+        raise ValueError("INDUSTRY_SECTOR_MAPPING_REQUIRED")
+    from domain.industry_benchmark import sector_code
+    prepared = {}
+    for key, packet in payload.items():
+        code = sector_code(key)
+        if not code.isdecimal():
+            raise ValueError("INVALID_INDUSTRY_SECTOR_KEY")
+        if code in prepared:
+            raise ValueError("DUPLICATE_NORMALIZED_INDUSTRY_SECTOR")
+        if not isinstance(packet, Mapping):
+            raise ValueError("RAW_INDUSTRY_SOURCE_PACKET_REQUIRED")
+        normalized = prepare_industry_benchmark(packet, document_reader=document_reader)
+        if normalized is None or sector_code(normalized["sector"]) != code:
+            raise ValueError("INDUSTRY_SECTOR_KEY_MISMATCH")
+        prepared[code] = normalized
+    return prepared
 
 
 def prepare_industry_context(context: Mapping, *, document_reader=None) -> dict:

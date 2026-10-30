@@ -54,6 +54,26 @@ QUALITY_SCORING_POLICY = {
     "return_weights": QUALITY_RETURN_WEIGHTS,
     "diagnostic_only": list(QUALITY_DIAGNOSTIC_ONLY),
 }
+# Explicit opt-in for v7 R4. The v6/R3 constants and default calculation remain
+# frozen: old results must not inherit a new coverage or ratio interpretation.
+QUALITY_R4_POLICY_VERSION = "2026-10-13-v7-reported-limited-gaps-r4"
+QUALITY_R4_COVERAGE_MINIMA = {name: 0. for name in QUALITY_BUDGETS}
+QUALITY_R4_SCORING_POLICY = dict(QUALITY_SCORING_POLICY,
+    optional_coverage_policy="TOTAL_75_NO_OPTIONAL_DOMAIN_FLOORS",
+    minimum_available_weight=75., minimum_confidence=65., minimum_score=65.,
+    missing_penalty_rate=.25, observed_reject_floor=60.,
+    known_nonpositive_denominator_policy="NOT_MEANINGFUL_ZERO_POINTS_COVERED_WITH_VERIFIED_DEPENDENCIES")
+
+
+def quality_scoring_rules(policy_version=None):
+    """Resolve only registered native rules; never silently fall back."""
+    if policy_version in (None, QUALITY_POLICY_VERSION):
+        return QUALITY_POLICY_VERSION, QUALITY_SCORING_POLICY, QUALITY_COVERAGE_MINIMA
+    if policy_version == QUALITY_R4_POLICY_VERSION:
+        return QUALITY_R4_POLICY_VERSION, QUALITY_R4_SCORING_POLICY, QUALITY_R4_COVERAGE_MINIMA
+    raise ValueError("UNREGISTERED_NATIVE_QUALITY_POLICY")
+
+
 BALANCE_FIELDS = (
     "current_assets", "non_current_assets", "total_assets",
     "current_liabilities", "total_liabilities", "total_equity",
@@ -235,13 +255,14 @@ class QualityResult:
     optional: dict | None = None
 
 
-def quality_evidence_complete(quality: QualityResult) -> bool:
+def quality_evidence_complete(quality: QualityResult, *, policy_version=None) -> bool:
     """Shared evidence floor for scoring, rendering and execution validation.
 
     Missing soft metrics can be penalized without becoming observed values.
     The new ledger must agree with coverage and cannot conceal required gaps.
     Legacy manually supplied quality contracts retain the basic coverage check.
     """
+    version, scoring_policy, coverage_minima = quality_scoring_rules(policy_version)
     confidence = number(quality.confidence)
     if quality.integrity != "PASS" or confidence is None or not QUALITY_MINIMUM_CONFIDENCE <= confidence <= 100:
         return False
@@ -249,7 +270,7 @@ def quality_evidence_complete(quality: QualityResult) -> bool:
         return False
     covered = 0.
     coverage_values = {}
-    for group, minimum in QUALITY_COVERAGE_MINIMA.items():
+    for group, minimum in coverage_minima.items():
         value = number(quality.coverage.get(group))
         if value is None or not minimum <= value <= 100:
             return False
@@ -258,12 +279,12 @@ def quality_evidence_complete(quality: QualityResult) -> bool:
     if covered + 1e-9 < QUALITY_MINIMUM_AVAILABLE_WEIGHT:
         return False
     metrics = quality.metrics
-    if metrics.get("quality_policy_version") not in {None, QUALITY_POLICY_VERSION}:
+    if metrics.get("quality_policy_version") not in ({None, version} if version == QUALITY_POLICY_VERSION else {version}):
         # Retain the metadata-free legacy contract, not a previous version's
         # penalty ledger masquerading as this version's execution evidence.
         return False
-    if metrics.get("quality_policy_version") == QUALITY_POLICY_VERSION:
-        if metrics.get("quality_scoring_policy") != QUALITY_SCORING_POLICY:
+    if metrics.get("quality_policy_version") == version:
+        if metrics.get("quality_scoring_policy") != scoring_policy:
             return False
         reported = metrics.get("quality_reported_inputs")
         ledger = metrics.get("quality_field_checks")
@@ -780,8 +801,10 @@ def verification_diagnostics(records: Sequence[Mapping], *, symbol: str, as_of: 
 
 
 def evaluate_quality(records: Sequence[Mapping], *, symbol: str, market: str,
-                     as_of: object, preprocessing=None) -> QualityResult:
+                     as_of: object, preprocessing=None, policy_version=None) -> QualityResult:
     """Evaluate only versions published by decision time, never today's latest retroactively."""
+    version, scoring_policy, coverage_minima = quality_scoring_rules(policy_version)
+    limited_gaps = version == QUALITY_R4_POLICY_VERSION
     field_ledger, metric_checks = {}, {}
     def failed(reason: str, status: str = "REJECT", integrity: str = "FAIL") -> QualityResult:
         return QualityResult(status, None, 0, integrity, {}, {},
@@ -881,9 +904,9 @@ def evaluate_quality(records: Sequence[Mapping], *, symbol: str, market: str,
     # evaluated later without diluting (or inflating) the core evidence floor.
     metrics: dict = {f"{key}_ttm": ttm(key) for key in (*DIAGNOSTIC_TTM_FIELDS, "capex")}
     metrics.update({key + "_previous_ttm": ttm(key, 4) for key in DIAGNOSTIC_TTM_FIELDS[:4]})
-    metrics["quality_policy_version"] = QUALITY_POLICY_VERSION
+    metrics["quality_policy_version"] = version
     metrics["quality_scoring_policy"] = {key: dict(value) if isinstance(value, dict) else
-        list(value) if isinstance(value, list) else value for key, value in QUALITY_SCORING_POLICY.items()}
+        list(value) if isinstance(value, list) else value for key, value in scoring_policy.items()}
     metrics["quality_profitability_basis"] = QUALITY_PROFITABILITY_BASIS
     metrics["quality_profitability_window"] = QUALITY_PROFITABILITY_WINDOW
     metrics["quality_field_checks"] = field_ledger
@@ -940,7 +963,9 @@ def evaluate_quality(records: Sequence[Mapping], *, symbol: str, market: str,
                    revenue_growth=rev_growth, liability_growth=liability_growth, liability_divergence=divergence)
     award("balance_sheet", 6, 1., name="balance_sheet_identity")
     award("balance_sheet", 10, bands(debt, (.4, .5, .6, .7), (1, .75, .5, .25), ascending=True), name="debt_ratio")
-    award("balance_sheet", 9, bands(current_ratio, (1.5, 1.2, 1), (1, 5/7, 2/7)), name="current_ratio")
+    current_not_meaningful = limited_gaps and balances["current_liabilities"] == 0
+    award("balance_sheet", 9, 0. if current_not_meaningful else bands(current_ratio, (1.5, 1.2, 1), (1, 5/7, 2/7)),
+          name="current_ratio", state="NOT_MEANINGFUL" if current_not_meaningful else None)
     metrics["quality_diagnostic_checks"] = {"liability_divergence": dict(
         value=divergence, status="EVALUATED" if divergence is not None else "PENDING_VERIFICATION",
         scored=False, affects_gate=False)}
@@ -948,6 +973,7 @@ def evaluate_quality(records: Sequence[Mapping], *, symbol: str, market: str,
     margin_fields = (("gross_margin", 6), ("operating_margin", 8), ("net_margin", 6))
     for name, weight in margin_fields:
         values = []
+        known_nonpositive = []
         numerator_field = "operating_income" if name == "operating_margin" else "net_income"
         needed_fields = ("revenue", "cost_of_revenue" if name == "gross_margin" else numerator_field)
         for group, keys in (("comparative", "comparison_keys"), ("current", "current_keys")):
@@ -958,6 +984,8 @@ def evaluate_quality(records: Sequence[Mapping], *, symbol: str, market: str,
                 cost = reported[group]["cost_of_revenue"]
                 numerator = revenue - cost if revenue is not None and cost is not None else None
             values.append(ratio(numerator, revenue))
+            known_nonpositive.append(limited_gaps and numerator is not None
+                                     and revenue is not None and revenue <= 0)
         now = values[-1]
         metrics[name] = now
         # Uniform three-part policy; peer rank is diagnostic only. The budget
@@ -974,16 +1002,24 @@ def evaluate_quality(records: Sequence[Mapping], *, symbol: str, market: str,
             ttm_history.append(ratio(numerator, revenue))
         metrics[f"{name}_ttm_history"] = ttm_history
         metrics[f"{name}_drawdown_4q"] = margin_drawdown(ttm_history)  # diagnostic only
-        award("profitability", weight * QUALITY_PROFITABILITY_PARTS["positive"], float(now > 0) if now is not None else None, name=name + "_positive")
+        award("profitability", weight * QUALITY_PROFITABILITY_PARTS["positive"],
+              0. if known_nonpositive[-1] else float(now > 0) if now is not None else None,
+              name=name + "_positive", state="NOT_MEANINGFUL" if known_nonpositive[-1] else None)
         history = values[:-1]
         history_rank = sum(.5 if isclose(x, now, abs_tol=1e-12) else float(x < now)
                            for x in history) / len(history) if now is not None and all(x is not None for x in history) else None
-        award("profitability", weight * QUALITY_PROFITABILITY_PARTS["history"], history_rank if now is not None and now > 0 else (0. if history_rank is not None else None), name=name + "_history")
+        history_not_meaningful = (any(known_nonpositive)
+            and all(value is not None or known for value, known in zip(values, known_nonpositive)))
+        award("profitability", weight * QUALITY_PROFITABILITY_PARTS["history"],
+              0. if history_not_meaningful else history_rank if now is not None and now > 0 else (0. if history_rank is not None else None),
+              name=name + "_history", state="NOT_MEANINGFUL" if history_not_meaningful else None)
         recent = values
         drawdown = margin_drawdown(recent)
         metrics[f"{name}_reported_drawdown"] = drawdown
         stable = float(now > 0 and drawdown <= .05 + 1e-12 and now >= recent[0] - .01 - 1e-12) if drawdown is not None else None
-        award("profitability", weight * QUALITY_PROFITABILITY_PARTS["stability"], stable, name=name + "_stability")
+        award("profitability", weight * QUALITY_PROFITABILITY_PARTS["stability"],
+              0. if history_not_meaningful else stable, name=name + "_stability",
+              state="NOT_MEANINGFUL" if history_not_meaningful else None)
         # Peer diagnostics retain their explicit TTM receipt; do not mix
         # reported-period scoring margins with a TTM comparison universe.
         peer_evidence = latest.get("quality_peer_evidence", {}).get(name, {})
@@ -1125,7 +1161,7 @@ def evaluate_quality(records: Sequence[Mapping], *, symbol: str, market: str,
                    quality_minimum_available_weight=QUALITY_MINIMUM_AVAILABLE_WEIGHT,
                    quality_minimum_confidence=QUALITY_MINIMUM_CONFIDENCE,
                    quality_minimum_score=MINIMUM_ENTRY_QUALITY,
-                   quality_coverage_minima=dict(QUALITY_COVERAGE_MINIMA),
+                   quality_coverage_minima=dict(coverage_minima),
                    quality_required_gaps={key: [field_ledger[f"{latest_period}:{key.removesuffix('_reported')}"]]
                                           for key in required_missing},
                    quality_score_basis="FIXED_100_BUDGET_MINUS_EVIDENCE_PENALTY")
@@ -1143,7 +1179,7 @@ def evaluate_quality(records: Sequence[Mapping], *, symbol: str, market: str,
     metrics.update(quality_verification=verification, quality_dc_inputs=dc_inputs,
                    quality_dc_weights=dict(QUALITY_DC_WEIGHTS))
     enough = (available >= QUALITY_MINIMUM_AVAILABLE_WEIGHT
-              and all(coverage[k] >= limit for k, limit in QUALITY_COVERAGE_MINIMA.items()))
+              and all(coverage[k] >= limit for k, limit in coverage_minima.items()))
     if confidence < 50 or score is None:
         status = "DATA_INSUFFICIENT"
     elif required_missing:

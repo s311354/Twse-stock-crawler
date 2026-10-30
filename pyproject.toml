@@ -8,24 +8,34 @@ version = "1.0.0"
 description = "TWSE market research and owner-scoped AIStock integration"
 readme = "README.md"
 requires-python = ">=3.11"
+classifiers = [
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
+]
 dependencies = [
-  "numpy==2.4.4",
-  "pandas==3.0.2",
+  'numpy==2.4.4; python_version < "3.15"',
+  'numpy==2.5.4; python_version >= "3.15"',
+  'pandas==3.0.2; python_version < "3.15"',
+  'pandas==3.0.6; python_version >= "3.15"',
   "requests==2.33.1",
 ]
 
 [project.optional-dependencies]
 analysis = [
-  "matplotlib==3.10.8",
+  'matplotlib==3.10.8; python_version < "3.15"',
+  'matplotlib==3.11.2; python_version >= "3.15"',
   "tabulate==0.10.0",
   "XlsxWriter==3.2.9",
 ]
-test = ["pytest==9.0.2"]
+test = ['pytest==9.0.2; python_version < "3.15"', 'pytest==9.1.1; python_version >= "3.15"']
 
 [project.scripts]
 aistock-twse-crawler = "interface.cli:main"
 aistock-owner-research = "aistock_twse_integration.owner_research:cli"
 aistock-shared-refresh = "aistock_twse_integration.shared_refresh:cli"
+aistock-les-v7 = "interface.les_v7:main"
+aistock-les-v7-training = "interface.les_v7_training:main"
+aistock-les-v7-dataset = "interface.les_v7_dataset:main"
 
 [tool.setuptools]
 py-modules = ["stockanalysis", "textmewhenitsdone", "twstockcrawler"]
@@ -34,6 +44,7 @@ packages = [
   "application",
   "config",
   "domain",
+  "domain.les_v7",
   "domain.strategies",
   "infrastructure",
   "infrastructure.calendar",
@@ -41,6 +52,7 @@ packages = [
   "infrastructure.fundamentals",
   "infrastructure.notification",
   "infrastructure.report",
+  "infrastructure.runtime",
   "infrastructure.storage",
   "interface",
   "twse",

@@ -36,8 +36,17 @@ def save_evidence(payload: dict, destination: Path, *, document_reader=None) -> 
     return evidence_id
 
 
-def load_evidence(path: str | Path) -> tuple[str, dict]:
-    document = json.loads(Path(path).read_text(encoding="utf-8"))
+def load_evidence(path: str | Path, *, max_bytes: int | None = None) -> tuple[str, dict]:
+    if max_bytes is None:
+        document = json.loads(Path(path).read_text(encoding="utf-8"))
+    else:
+        if type(max_bytes) is not int or max_bytes < 1:
+            raise ValueError("INVALID_EVIDENCE_READ_LIMIT")
+        with Path(path).open("rb") as stream:
+            content = stream.read(max_bytes + 1)
+        if len(content) > max_bytes:
+            raise ValueError("EVIDENCE_READ_SIZE_LIMIT")
+        document = json.loads(content)
     payload = document["payload"]
     if payload.get("schema") not in {EVIDENCE_SCHEMA, RAW_EVIDENCE_SCHEMA} or digest(payload) != document["evidence_id"]:
         raise ValueError("REPLAY_EVIDENCE_SIGNATURE_MISMATCH")

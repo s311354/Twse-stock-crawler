@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -102,6 +103,8 @@ def build_stock_analysis_runtime(
         ),
         mops_cache_configured=bool(effective_settings.mops_cache_dir),
         daily_strategy_workers=effective_settings.daily_strategy_workers,
+        daily_entry_model=effective_settings.daily_entry_model,
+        les_v7_bundle_configured=effective_settings.les_v7_bundle_json is not None,
         smtp_configured=bool(
             effective_settings.smtp_email
             and effective_settings.smtp_password
@@ -148,7 +151,7 @@ def build_stock_analysis_runtime(
         tpex_crawler_factory = lambda size: TwseCrawker(
             size,
             twse_client=TpexClient(http_client=shared_http_client),
-            csv_repository=TpexCsvRepository(),
+            csv_repository=TpexCsvRepository(workspace_root=effective_settings.local_workspace_dir),
             app_settings=effective_settings,
             market_history_cache=market_history_cache,
             market_source="TPEX",
@@ -207,20 +210,49 @@ def build_stock_analysis_runtime(
     restriction_repository = TradingRestrictionRepository(
         effective_settings.mops_cache_dir / "trading_restrictions.sqlite3"
     )
+    native_source_capture = None
+    if (crawler_factory is None and effective_settings.daily_entry_model == "v7"
+            and effective_settings.les_v7_native_evidence and effective_settings.les_v7_rule_baseline
+            and effective_settings.les_v7_source_repair):
+        from infrastructure.runtime.native_source_capture import NativeSourceCapture
+        native_source_capture = NativeSourceCapture(
+            effective_settings.mops_cache_dir.parent / "native-source", clock=effective_now_provider,
+            valuation_history_database=effective_settings.market_history_cache_path)
     market_data_adapter = CrawlerMarketDataAdapter(
         effective_crawler_factory,
         observer=observer,
         tpex_crawler_factory=tpex_crawler_factory,
         restriction_repository=restriction_repository,
+        native_source_capture=native_source_capture,
+    )
+    fundamental_coordinator = FundamentalRefreshCoordinator(
+        effective_fundamental_service, observer=observer,
+        restriction_repository=restriction_repository, now_provider=effective_now_provider,
     )
     fundamental_adapter = CrawlerFundamentalAdapter(
         effective_fundamental_service,
         observer=observer,
-        coordinator=FundamentalRefreshCoordinator(
-            effective_fundamental_service, observer=observer,
-            restriction_repository=restriction_repository, now_provider=effective_now_provider,
-        ),
+        coordinator=fundamental_coordinator,
     )
+    research_metadata = (json.loads(effective_settings.les_v7_research_metadata_json)
+                         if effective_settings.les_v7_research_metadata_json else None)
+    from domain.strategies.erem_soft_reduction import FORMAL_VERSION
+    portfolio_id = "default:" + FORMAL_VERSION
+    if research_metadata and research_metadata.get("research_id"):
+        from infrastructure.research_series import (
+            check_study, check_versions, metadata_identity, ResearchSeriesError,
+        )
+        from infrastructure.storage.research_portfolio import SQLiteResearchPortfolioPersistence
+        identity = metadata_identity(research_metadata)
+        path = effective_settings.pae_persistence_path
+        if path.name != "portfolio.sqlite3" or check_study(path.parent, identity) is None:
+            raise ResearchSeriesError("RESEARCH_STUDY_NOT_INITIALIZED")
+        check_versions(identity)
+        portfolio_persistence = SQLiteResearchPortfolioPersistence(
+            path, identity, check_version=lambda: check_versions(identity))
+        portfolio_id = "research:" + research_metadata["research_id"]
+    else:
+        portfolio_persistence = SQLitePortfolioPersistence(effective_settings.pae_persistence_path)
     service = StockAnalysisService(
         fetch_market_data=FetchMarketData(
             market_data_adapter,
@@ -236,13 +268,14 @@ def build_stock_analysis_runtime(
             CrawlerStrategyAdapter(
                 observer=observer,
                 portfolio_allocator=PortfolioAllocationV2Pipeline(
-                    persistence=SQLitePortfolioPersistence(
-                        effective_settings.pae_persistence_path
-                    )
+                    persistence=portfolio_persistence,
+                    portfolio_id=portfolio_id,
                 ),
                 portfolio_positions=effective_settings.pae_positions,
                 portfolio_current_cash=effective_settings.pae_current_cash,
                 account_equity=effective_settings.account_equity,
+                restriction_refresh=fundamental_coordinator.ensure_current_restrictions,
+                now_provider=effective_now_provider,
             )
         ),
         generate_report=GenerateReport(
@@ -260,6 +293,8 @@ def build_stock_analysis_runtime(
         ),
         observer=observer,
         work_scope=work_scope or (lambda: native_work_scope(
+            effective_settings.local_workspace_dir / "source-preprocessing.sqlite3"
+            if effective_settings.local_workspace_dir is not None else
             effective_settings.mops_cache_dir / "daily_preprocessing.sqlite3"
             if effective_settings.mops_cache_dir else None)),
         performance_sink=performance_sink or (lambda request, context, metrics: retain_daily_performance(

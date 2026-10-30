@@ -6,12 +6,15 @@ import datetime
 import logging
 import sqlite3
 import time
+import weakref
+from collections.abc import Mapping
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from application.contracts import AnalysisContext
 from application.contracts import StockAnalysisRequest
 from application.daily_performance import measure_stage
+from application.daily_work import current_work
 from application.observability import NullRunObserver
 from application.mops_refresh_control import RefreshDeferred
 from application.leadership_screen import screen_once, watch_result_key
@@ -19,6 +22,7 @@ from application.ports import RunObserverPort
 from domain.fundamental_derivation import FundamentalBundle
 from domain.security_identity import SecurityIdentity
 from domain.security_identity import resolve_security_identity
+from domain.trading_restrictions import restriction_check
 from domain.strategies.low_entry_v6_watch import screen_leadership
 from infrastructure.crawler.twse_http_client import TwseClientError
 from infrastructure.crawler.twse_http_client import TwseNetworkError
@@ -46,6 +50,99 @@ class FundamentalRefreshCoordinator:
         self._observer = observer or NullRunObserver()
         self._restriction_repository = restriction_repository
         self._now_provider = now_provider
+
+    @staticmethod
+    def _restriction_bar(crawler):
+        scheduled = getattr(crawler, "iso_scheduled_times", ())
+        return scheduled[-1] if scheduled else max(
+            (str(dates[-1])[:10] for dates in getattr(crawler, "daily_dates", ()) if dates), default=None)
+
+    def _collect_restrictions(self, context, *, market, started_at, completion_clock=None):
+        """Collect one complete market response set; never retain an old CLEAR.
+
+        The normal refresh and the native daily pre-freeze repair share this
+        collector. Production supplies the real clock through bootstrap; legacy
+        callers without a provider retain their existing injected start clock.
+        """
+        crawler = context.resource
+        crawler.trading_restrictions = {}
+        batch = getattr(self.fundamental_service, "financial_batch_client", None)
+        client = getattr(batch, "http_client", None)
+        if client is None or market not in {"TWSE", "TPEX"}:
+            return started_at
+        from infrastructure.crawler.trading_restrictions import TradingRestrictionClient, TpexTradingRestrictionClient
+        collector = TpexTradingRestrictionClient if market == "TPEX" else TradingRestrictionClient
+        try:
+            evidence = collector(client).load(
+                getattr(crawler, "stocknumbers", ()),
+                session_date=context.market_date.isoformat(), observed_at=started_at)
+            clock = completion_clock or self._now_provider
+            completed = clock() if clock is not None else started_at
+            if (completed.tzinfo is None or completed < started_at
+                    or completed.astimezone(TAIPEI_TIMEZONE).date() != started_at.date()):
+                return started_at
+            completed = completed.astimezone(TAIPEI_TIMEZONE)
+            for item in evidence.values():
+                item["available_at"] = completed.isoformat()
+            bar = self._restriction_bar(crawler)
+            symbols = [str(s) for s in getattr(crawler, "stocknumbers", ()) if s]
+            # One missing/partial response is not a complete negative list.
+            if (not bar or any(restriction_check(evidence.get(s, {}), market=market,
+                    market_data_date=bar, decision_time=completed)["status"] == "UNKNOWN" for s in symbols)):
+                return completed
+            crawler.trading_restrictions = evidence
+            if self._restriction_repository is not None and bar:
+                try:
+                    self._restriction_repository.record(evidence, market=market,
+                        market_data_date=bar, decision_time=completed)
+                except (OSError, sqlite3.Error, ValueError) as error:
+                    logging.warning("Restriction archive write failed; current evidence retained: %s", error)
+            return completed
+        except (TwseClientError, ValueError, TypeError, AttributeError) as error:
+            logging.warning("Restriction evidence unavailable; entries fail closed: %s", error)
+            return started_at
+
+    def ensure_current_restrictions(self, context: AnalysisContext) -> None:
+        """Repair aged current-daily evidence at most once before cutoff freeze.
+
+        Only a job that entered live fundamental refresh is armed. Replay,
+        skip-MOPS and legacy daily paths never gain implicit HTTP requests.
+        """
+        crawler = context.resource
+        settings = getattr(crawler, "app_settings", None)
+        market = getattr(crawler, "_restriction_refresh_market", None)
+        job = getattr(crawler, "_restriction_refresh_context", None)
+        if (context.as_of is not None or market not in {"TWSE", "TPEX"}
+                or not isinstance(job, weakref.ReferenceType) or job() is not context
+                or getattr(settings, "daily_entry_model", "v6") != "v7"
+                or not getattr(settings, "les_v7_native_evidence", False)
+                or getattr(crawler, "_restriction_recapture_attempted", False)):
+            return
+        clock = self._now_provider or (lambda: datetime.datetime.now(TAIPEI_TIMEZONE))
+        now = clock()
+        if not isinstance(now, datetime.datetime) or now.utcoffset() is None:
+            crawler.trading_restrictions = {}
+            return
+        now = now.astimezone(TAIPEI_TIMEZONE)
+        bar = self._restriction_bar(crawler)
+        symbols = [str(s) for s in getattr(crawler, "stocknumbers", ()) if s]
+        if not bar or not symbols:
+            crawler.trading_restrictions = {}
+            return  # No evaluable batch: an HTTP request cannot repair bars.
+        evidence = getattr(crawler, "trading_restrictions", {})
+        if not isinstance(evidence, Mapping):
+            evidence = {}
+        if (bar and symbols and all(restriction_check(evidence.get(s, {}), market=market,
+                market_data_date=bar, decision_time=now)["status"] != "UNKNOWN" for s in symbols)):
+            return  # A fresh RESTRICTED observation is valid evidence too.
+        crawler._restriction_recapture_attempted = True
+        with measure_stage("restriction_pre_freeze_refresh"):
+            completed = self._collect_restrictions(context, market=market, started_at=now,
+                completion_clock=clock)
+        captured = bool(getattr(crawler, "trading_restrictions", {}))
+        self._observer.record("restriction_pre_freeze_refresh", source=market,
+            status="SUCCESS" if captured else "UNKNOWN", attempted_at=now.isoformat(),
+            observed_at=completed.isoformat() if captured else None, symbol_count=len(symbols))
 
     def refresh(
         self,
@@ -76,43 +173,12 @@ class FundamentalRefreshCoordinator:
             return
 
         localized_time = analysis_time.astimezone(TAIPEI_TIMEZONE)
-        # Current lists are dated by observation, not by the last completed bar.
-        # Never fetch a present-day list on behalf of a historical requested date.
-        batch_client = getattr(self.fundamental_service, "financial_batch_client", None)
-        http_client = getattr(batch_client, "http_client", None)
-        crawler.trading_restrictions = {}
-        if http_client is not None and request.market_source in {"TWSE", "TPEX"}:
-            from infrastructure.crawler.trading_restrictions import TradingRestrictionClient, TpexTradingRestrictionClient
-            restriction_client = TpexTradingRestrictionClient if request.market_source == "TPEX" else TradingRestrictionClient
-            try:
-                crawler.trading_restrictions = restriction_client(http_client).load(
-                    stocknumbers, session_date=context.market_date.isoformat(), observed_at=localized_time,
-                )
-                # The complete response set is only known after the final HTTP
-                # response, never at request start. Do not backdate the archive.
-                completed_at = self._now_provider() if self._now_provider else localized_time
-                if completed_at.tzinfo is None:
-                    raise ValueError("Restriction observation requires a timezone-aware clock")
-                completed_at = completed_at.astimezone(TAIPEI_TIMEZONE)
-                if completed_at < localized_time or completed_at.date() != localized_time.date():
-                    crawler.trading_restrictions = {}
-                else:
-                    for item in crawler.trading_restrictions.values():
-                        item["available_at"] = completed_at.isoformat()
-                    localized_time = completed_at
-                if self._restriction_repository is not None:
-                    scheduled = getattr(crawler, "iso_scheduled_times", [])
-                    bar_date = scheduled[-1] if scheduled else None
-                    if bar_date:
-                        try:
-                            self._restriction_repository.record(
-                                crawler.trading_restrictions, market=request.market_source,
-                                market_data_date=bar_date, decision_time=localized_time,
-                            )
-                        except (OSError, sqlite3.Error, ValueError) as error:
-                            logging.warning("Restriction archive write failed; current evidence retained: %s", error)
-            except TwseClientError as error:
-                logging.warning("LES v6 restriction evidence unavailable; entries fail closed: %s", error)
+        # Current lists are dated by actual observation, not the completed bar.
+        crawler._restriction_refresh_market = request.market_source
+        crawler._restriction_refresh_context = weakref.ref(context)
+        crawler._restriction_recapture_attempted = False
+        localized_time = self._collect_restrictions(context,
+            market=request.market_source, started_at=localized_time)
         analysis_signal_date = localized_time.isoformat()
         # Research observations use completed bars and official restrictions;
         # no financial or entry status is rewritten by this pre-refresh pass.
@@ -162,7 +228,8 @@ class FundamentalRefreshCoordinator:
         consecutive_network_failures = 0
         consecutive_storage_failures = 0
         consecutive_schema_failures = 0
-        bundles_by_issuer: dict[str, FundamentalBundle] = {}
+        retention = getattr(current_work(), "snapshot_retention", None)
+        bundles_by_issuer = retention.bundles() if retention is not None else {}
         reset_scope_fallbacks = getattr(
             self.fundamental_service,
             "reset_scope_fallback_diagnostics",
@@ -240,7 +307,12 @@ class FundamentalRefreshCoordinator:
                     error,
                 )
 
-        preloaded_bundles: dict[str, FundamentalBundle] = {}
+        # Native preloading and per-issuer reuse have the same work lifetime.
+        # Use one owner map: decoding a preload only to retain the identical
+        # snapshot in a second map otherwise pickles the full financial graph
+        # again for every issuer. Legacy dict-returning callers keep their
+        # existing separate mutable maps.
+        preloaded_bundles = bundles_by_issuer if retention is not None else {}
         preload_cached_bundles = getattr(
             self.fundamental_service,
             "load_cached_bundles",
@@ -250,12 +322,21 @@ class FundamentalRefreshCoordinator:
             preload_started = time.monotonic()
             try:
                 with measure_stage("fundamental_bulk_preload"):
-                    preloaded_bundles = preload_cached_bundles(
-                        list(dict.fromkeys(issuer_symbols)),
-                        signal_date=analysis_signal_date,
-                        sector=sector,
-                        history_years=request.mops_history_years,
-                    )
+                    streaming_preload = getattr(self.fundamental_service, "load_cached_bundles_into", None)
+                    if retention is not None and callable(streaming_preload):
+                        streaming_preload(list(dict.fromkeys(issuer_symbols)),
+                            signal_date=analysis_signal_date, sector=sector,
+                            history_years=request.mops_history_years,
+                            sink=preloaded_bundles.__setitem__)
+                    else:
+                        loaded = preload_cached_bundles(list(dict.fromkeys(issuer_symbols)),
+                            signal_date=analysis_signal_date, sector=sector,
+                            history_years=request.mops_history_years)
+                        if retention is None:
+                            preloaded_bundles = loaded
+                        else:
+                            preloaded_bundles.update(loaded)
+                        del loaded
                 self._observer.record(
                     "fundamental_cache_preload_completed",
                     trade_date=context.market_date.isoformat(),
@@ -270,6 +351,12 @@ class FundamentalRefreshCoordinator:
                     ),
                 )
             except (MopsStorageError, TwseClientError) as error:
+                if retention is not None:
+                    # Legacy assignment never publishes a partly returned
+                    # preload dict after failure. Discard streamed partials as
+                    # well; storage/capacity/hash errors outside these source
+                    # exception types still propagate without fallback.
+                    preloaded_bundles.clear()
                 self._observer.record(
                     "fundamental_cache_preload_failed",
                     level=logging.DEBUG,
@@ -294,6 +381,9 @@ class FundamentalRefreshCoordinator:
                     },
                 )
 
+        # Later misses populate the shared issuer map. Preserve the actual
+        # preload set for scheduling and diagnostics, not its growing contents.
+        preloaded_symbols = frozenset(preloaded_bundles)
         control = getattr(self.fundamental_service, "refresh_control", None)
         if control is not None:
             try:
@@ -307,7 +397,7 @@ class FundamentalRefreshCoordinator:
                                     if diagnostics.get(symbol, {}).get("backfill_needed")
                                     and not diagnostics[symbol].get("local_review_required")
                                     and diagnostics[symbol].get("quality_status") != "REJECT"]
-                control.schedule([symbol for symbol in issuer_symbols if symbol not in preloaded_bundles],
+                control.schedule([symbol for symbol in issuer_symbols if symbol not in preloaded_symbols],
                                  priority_symbols=priority_symbols)
                 self._observer.record(
                     "leadership_verification_queue", source="STRATEGY", status="RESEARCH_ONLY",
@@ -577,6 +667,14 @@ class FundamentalRefreshCoordinator:
                 issuer_symbol=issuer_symbol,
                 security_type=identity.security_type.value,
             )
+            native_v7 = (getattr(getattr(crawler, "app_settings", None), "daily_entry_model", "v6") == "v7"
+                         and getattr(getattr(crawler, "app_settings", None), "les_v7_native_evidence", False))
+            # A live refresh may advance its causal time after a new original
+            # is actually ingested. Source supplements must use that same bound,
+            # not the earlier request-start clock. Replay never enters this loop.
+            source_cutoff = (bundle.as_of or analysis_signal_date) if native_v7 else analysis_signal_date
+            bundle = self._attach_v7_sources(bundle, crawler=crawler, issuer=issuer_symbol,
+                                             cutoff=source_cutoff, market=request.market_source)
             setter(
                 stock_no,
                 annual_fundamentals=bundle.annual_fundamentals,
@@ -669,16 +767,22 @@ class FundamentalRefreshCoordinator:
             source="MOPS",
             status="SUCCESS",
             issuer_symbol_count=len(set(issuer_symbols)),
-            preloaded_symbol_count=len(preloaded_bundles),
+            preloaded_symbol_count=len(preloaded_symbols),
             duration_seconds=round(time.monotonic() - refresh_started, 3),
         )
+        if retention is not None:
+            # Only per-instrument collected snapshots are needed by strategies;
+            # discard preload/issuer encodings without decoding them again.
+            preloaded_bundles.clear()
+            bundles_by_issuer.clear()
 
     def _replay_cached_fundamentals(self, context: AnalysisContext, request: StockAnalysisRequest) -> None:
         crawler = context.resource
         cutoff = request.as_of
         assert cutoff is not None
         sector = "24" if request.market_source == "TPEX" else request.stocktype.name
-        bundles: dict[str, FundamentalBundle] = {}
+        retention = getattr(current_work(), "snapshot_retention", None)
+        bundles = retention.bundles() if retention is not None else {}
         for index, symbol in enumerate(crawler.stocknumbers):
             if not symbol:
                 continue
@@ -690,6 +794,8 @@ class FundamentalRefreshCoordinator:
                         identity.issuer_symbol, as_of=cutoff, sector=sector, market=request.market_source,
                     )
                 bundle = self._attach_security_identity(bundles[identity.issuer_symbol], identity)
+                bundle = self._attach_v7_sources(bundle, crawler=crawler, issuer=identity.issuer_symbol,
+                                                 cutoff=cutoff.isoformat(), market=request.market_source)
                 crawler.set_low_entry_v4_fundamentals(
                     symbol, bundle.annual_fundamentals, bundle.snapshot,
                     account_equity=request.account_equity, signal_date=cutoff.isoformat(),
@@ -699,6 +805,65 @@ class FundamentalRefreshCoordinator:
                                        signal_date=cutoff.isoformat(), account_equity=request.account_equity)
         self._observer.record("fundamental_historical_replay_completed", source="MOPS_CACHE",
                               status="SUCCESS", cutoff=cutoff.isoformat(), issuer_symbol_count=len(bundles))
+        if retention is not None:
+            bundles.clear()
+
+    def _attach_v7_sources(self, bundle, *, crawler, issuer, cutoff, market):
+        """R2/R3 local enrichment; reuse bounded work prep, never selections."""
+        settings = getattr(crawler, "app_settings", None)
+        if getattr(settings, "daily_entry_model", "v6") != "v7":
+            return bundle
+        import json
+        from domain.les_v7.contracts import identity
+        from domain.les_v7.quality_policy import is_source_evidence_policy, is_r7_policy
+        from domain.les_v7.financial_sources import FINANCIAL_MAPPING
+        from domain.les_v7.valuation_earnings import MAPPING_VERSION as EARNINGS_MAPPING
+        from domain.les_v7.financial_sources_r5 import SOURCE_REPAIR_POLICY_R5
+        captured = getattr(settings, "les_v7_bundle_json", None)
+        extra = bundle.snapshot.get("les_v7_context", {})
+        strategy = getattr(settings, "les_v7_strategy_policy_json", None)
+        explicit = (json.loads(strategy)["payload"]["quality_policy"] if strategy else
+                    json.loads(captured)["payload"]["quality_policy"] if captured else extra.get("quality_policy"))
+        if explicit is not None and not is_source_evidence_policy(explicit):
+            return bundle  # Do not add source work/metadata to an old R1 path.
+        reader = getattr(self.fundamental_service, "load_v7_financial_sources", None)
+        if not callable(reader):
+            return bundle
+        records = bundle.snapshot.get("les_v6_mops_filings", bundle.snapshot.get("les_v6_filings", ()))
+        # The key touches only immutable source headers, not financial graphs.
+        source_repair = bool(getattr(settings, "les_v7_source_repair", False)
+            and getattr(settings, "les_v7_rule_baseline", False) and not getattr(crawler, "replay_as_of", None))
+        effective_quality = explicit
+        if source_repair and effective_quality is None and not captured and not strategy:
+            from domain.les_v7.rule_baseline import baseline_policy, current_source_baseline_version
+            effective_quality = baseline_policy(market,
+                version=current_source_baseline_version(cutoff))["quality_policy"]
+        audit_repair_r7 = source_repair and is_r7_policy(effective_quality)
+        r7_identity = {}
+        if audit_repair_r7:
+            from infrastructure.fundamentals.parse_identity import source_fingerprint
+            from domain.les_v7.financial_audit_r7 import SOURCE_VERSION
+            r7_identity = dict(audit_source_policy=SOURCE_VERSION,
+                audit_source_semantics=source_fingerprint((
+                    ("domain/les_v7/financial_audit_r7.py", ()),
+                    ("domain/les_v7/financial_sources_r5.py", ()),
+                    ("domain/fundamental_derivation.py", ()),
+                    ("domain/text_normalization.py", ()),
+                )))
+        key = identity(dict(issuer=issuer, market=market, cutoff=cutoff, mapping=FINANCIAL_MAPPING,
+            earnings_mapping=EARNINGS_MAPPING,
+            source_repair_policy=SOURCE_REPAIR_POLICY_R5 if source_repair else None,
+            sources=[{k: row.get(k) for k in ("content_sha256", "revision_id", "available_at", "period_end")}
+                     for row in records], **r7_identity))
+        compute = lambda: reader(issuer, as_of=cutoff, records=records, market=market,
+            **({"source_repair": True} if source_repair else {}),
+            **({"audit_repair_r7": True} if audit_repair_r7 else {}))
+        work = current_work()
+        with measure_stage("v7_financial_sources"):
+            additions = work.memo_json("v7_financial_sources", key, compute) if work is not None else compute()
+        snapshot = dict(bundle.snapshot)
+        snapshot["les_v7_context"] = dict(extra, **additions)
+        return FundamentalBundle(bundle.annual_fundamentals, snapshot, bundle.as_of)
 
     @staticmethod
     def _attach_security_identity(

@@ -23,6 +23,19 @@ from infrastructure.stock_analysis_adapters import CrawlerFundamentalAdapter
 from interface.cli import build_request
 
 
+@pytest.fixture(autouse=True)
+def isolated_native_preprocessing(tmp_path, monkeypatch):
+    """Orchestration doubles must not open the user's daily parse cache.
+
+    Keep the actual work context, version guard and cache implementation. Only
+    its repairable storage path is isolated, as are the injected fake crawlers.
+    """
+    from infrastructure import bootstrap
+    original = bootstrap.native_work_scope
+    monkeypatch.setattr(bootstrap, "native_work_scope",
+        lambda parse_cache_path=None: original(tmp_path / "daily_preprocessing.sqlite3"))
+
+
 class DummyStockType:
     value = (13,)
 

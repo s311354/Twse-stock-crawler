@@ -13,6 +13,7 @@ from domain.model_contracts import StrategyDecision
 from infrastructure.report.contracts import HtmlRenderer
 from infrastructure.report.contracts import MetricColumn
 from infrastructure.report.low_entry_v6_renderer import LowEntryV6Renderer
+from infrastructure.report.low_entry_v7_renderer import LowEntryV7Renderer, rendered_model_label
 from infrastructure.report.portfolio_renderer import (
     PortfolioAllocationRenderer,
 )
@@ -1116,20 +1117,23 @@ class DailyStrategyEmailRenderer(HtmlRenderer):
     ) -> str:
         unique_decisions = self.portfolio_renderer.latest_by_symbol(decisions)
         versions = {item.value("LES Model Version", "5.0.0") for item in unique_decisions}
-        if "6.0.0" in versions and len(versions) != 1:
+        if versions & {"6.0.0", "7.0.0"} and len(versions) != 1:
             raise ValueError("Mixed LES versions cannot share a daily report")
-        entry_renderer = LowEntryV6Renderer() if not versions or versions == {"6.0.0"} else self.entry_renderer
+        entry_renderer = (LowEntryV7Renderer() if versions == {"7.0.0"} else
+                          LowEntryV6Renderer() if not versions or versions == {"6.0.0"} else self.entry_renderer)
         entry_card = entry_renderer.render_entry_summary(unique_decisions)
         portfolio_card = self.portfolio_renderer.render(unique_decisions)
         details = entry_renderer.render_analysis(
             unique_decisions,
             include_entry_summary=False,
         )
+        label = rendered_model_label(details) if versions == {"7.0.0"} else None
+        card_title = "今日決策卡" + ("｜" + html.escape(label) if label else "")
         return """
         {}
         <main class="twse-daily-report">
           <section data-section="daily-decision-cards" style="margin:12px 0 18px">
-            <h2 style="margin:0 0 8px;color:#263d47">今日決策卡</h2>
+            <h2 style="margin:0 0 8px;color:#263d47">{}</h2>
             {}
             {}
           </section>
@@ -1137,6 +1141,7 @@ class DailyStrategyEmailRenderer(HtmlRenderer):
         </main>
         """.format(
             self._RESPONSIVE_STYLE,
+            card_title,
             entry_card,
             portfolio_card,
             details,
@@ -1154,6 +1159,7 @@ class RendererFactory:
         "low_entry_score_v6": LowEntryV6Renderer(),
         "low_entry_score_v6_hybrid": LowEntryV6Renderer(),
         "low_entry_score_v6_hybrid_legacy": LowEntryV6Renderer(),
+        "low_entry_score_v7": LowEntryV7Renderer(),
         "expected_return_exit_v3": ExpectedReturnExitV3Renderer(),
         "portfolio_allocation_v1": PortfolioAllocationRenderer(),
         "portfolio_allocation_v2": PortfolioAllocationRenderer(),

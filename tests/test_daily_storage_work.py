@@ -290,7 +290,7 @@ def test_metrics_receipt_is_saved_with_logging_disabled(tmp_path):
         assert json.loads(path.read_text())["status"] == status
 
 
-def test_global_parse_lru_does_not_hide_new_work_version(tmp_path):
+def test_global_parse_lru_never_retains_native_work_versions(tmp_path):
     from infrastructure.fundamentals.mops_queries import _raw_normalized_facts
     from tests.fundamentals.test_ixbrl_units import document
     content = document()
@@ -300,11 +300,19 @@ def test_global_parse_lru_does_not_hide_new_work_version(tmp_path):
     signature = stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size
     sha = hashlib.sha256(content).hexdigest()
     probe = DailyPerformance()
+    _raw_normalized_facts.cache_clear()
     with probe.activate():
         for version in ("code-A", "code-A", "code-B"):
-            with DailyWorkContext(version).activate():
-                _raw_normalized_facts(path, sha, signature, "same-parser-label")
-    assert probe.counters["raw_unit_parse_calls"] == 2
+            work = DailyWorkContext(version)
+            try:
+                with work.activate():
+                    _raw_normalized_facts(path, sha, signature, "same-parser-label")
+                    _raw_normalized_facts(path, sha, signature, "same-parser-label")
+            finally:
+                work.close()
+    # Each work re-verifies its source; only its own retry is a memory hit.
+    assert probe.counters["raw_unit_parse_calls"] == 3
+    assert _raw_normalized_facts.cache_info().currsize == 0
 
 
 def test_disk_cache_capacity_evicts_only_repairable_parses(tmp_path):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 import re
 import time
 from urllib.parse import urljoin
@@ -189,12 +190,21 @@ class TwseHttpClient:
         context: str = "TWSE request",
         content_validator: Callable[[bytes], None] | None = None,
         before_attempt: Callable[[], None] | None = None,
+        read_timeout_seconds: float | None = None,
     ) -> TwseBinaryResponse:
         """Request raw bytes with the same retry, SSL, and rate-limit policy."""
 
         normalized_method = method.upper()
         if normalized_method not in {"GET", "POST"}:
             raise ValueError("method must be GET or POST")
+        if read_timeout_seconds is not None and (
+            type(read_timeout_seconds) not in (int, float)
+            or not math.isfinite(read_timeout_seconds)
+            or not 0 < read_timeout_seconds <= 120
+        ):
+            raise ValueError("read_timeout_seconds must be finite, positive and at most 120")
+        options = ({"read_timeout_seconds": read_timeout_seconds}
+                   if read_timeout_seconds is not None else {})
 
         last_error: TwseClientError | None = None
         for attempt in range(1, self.config.max_attempts + 1):
@@ -207,6 +217,7 @@ class TwseHttpClient:
                     headers=headers,
                     context=context,
                     before_attempt=before_attempt,
+                    **options,
                 )
                 self._validate_http_status(response=response, context=context)
                 content = bytes(response.content)
@@ -249,7 +260,10 @@ class TwseHttpClient:
         headers: Mapping[str, str] | None,
         context: str,
         before_attempt: Callable[[], None] | None = None,
+        read_timeout_seconds: float | None = None,
     ) -> Response:
+        options = ({"read_timeout_seconds": read_timeout_seconds}
+                   if read_timeout_seconds is not None else {})
         try:
             return self._session_request(
                 method=method,
@@ -259,6 +273,7 @@ class TwseHttpClient:
                 headers=headers,
                 verify=True,
                 before_attempt=before_attempt,
+                **options,
             )
         except requests_exceptions.SSLError as error:
             if not self._should_use_ssl_fallback(error):
@@ -288,6 +303,7 @@ class TwseHttpClient:
                     headers=headers,
                     verify=False,
                     before_attempt=before_attempt,
+                    **options,
                 )
             except requests_exceptions.RequestException as fallback_error:
                 raise TwseNetworkError(
@@ -320,11 +336,13 @@ class TwseHttpClient:
         headers: Mapping[str, str] | None,
         verify: bool,
         before_attempt: Callable[[], None] | None = None,
+        read_timeout_seconds: float | None = None,
     ) -> Response:
         request = self.session.get if method == "GET" else self.session.post
         kwargs: dict[str, object] = {
             "params": params,
-            "timeout": self.config.timeout_seconds,
+            "timeout": (self.config.timeout_seconds, read_timeout_seconds)
+                if read_timeout_seconds is not None else self.config.timeout_seconds,
             "verify": verify,
         }
         if data is not None:

@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import MISSING, dataclass, fields, replace
 from datetime import date
 import re
 from typing import Any
 
 import pandas as pd
 
-from domain.text_normalization import normalize_cjk_text
+from domain.text_normalization import normalize_cjk_text, unverified_text_encoding
 
 
 FUNDAMENTAL_DERIVATION_VERSION = (
@@ -17,7 +17,30 @@ FUNDAMENTAL_DERIVATION_VERSION = (
 )
 
 
-@dataclass(frozen=True)
+def _financial_pickle_state(value):
+    # Retain the pre-slots dictionary pickle shape for archived/private callers.
+    return {field.name: getattr(value, field.name) for field in fields(value)}
+
+
+def _restore_financial_pickle(value, state):
+    # Old frozen dataclasses were pickled with __dict__. Explicit restoration
+    # keeps those payloads readable after removing each fact's instance dict.
+    definitions = fields(value)
+    names = tuple(field.name for field in definitions)
+    values = state if isinstance(state, dict) else dict(zip(names, state, strict=True))
+    if set(values) - set(names):
+        raise ValueError("INVALID_FINANCIAL_PICKLE_FIELDS")
+    for field in definitions:
+        if field.name in values:
+            restored = values[field.name]
+        elif field.default is not MISSING:
+            restored = field.default
+        else:
+            raise ValueError("MISSING_FINANCIAL_PICKLE_FIELD:" + field.name)
+        object.__setattr__(value, field.name, restored)
+
+
+@dataclass(frozen=True, slots=True)
 class FiledFact:
     concept: str
     numeric_value: float | None
@@ -29,8 +52,14 @@ class FiledFact:
     unit: str | None = None
     context_id: str | None = None
 
+    def __getstate__(self):
+        return _financial_pickle_state(self)
 
-@dataclass(frozen=True)
+    def __setstate__(self, state):
+        _restore_financial_pickle(self, state)
+
+
+@dataclass(frozen=True, slots=True)
 class FiledFinancials:
     fiscal_year: int
     quarter: int
@@ -48,6 +77,12 @@ class FiledFinancials:
     audit_status: str | None = None
     # Read from the hash-verified original, never inferred from fiscal dates.
     taxonomy_schema_refs: tuple[str, ...] = ()
+
+    def __getstate__(self):
+        return _financial_pickle_state(self)
+
+    def __setstate__(self, state):
+        _restore_financial_pickle(self, state)
 
 
 @dataclass(frozen=True)
@@ -564,13 +599,14 @@ def _audit_facts_by_period(
     return tuple(current), tuple(prior), prior_end
 
 
-def _derive_audit_evidence(latest: FiledFinancials) -> dict[str, object]:
+def _derive_audit_evidence(latest: FiledFinancials, *, allow_unreviewed_components: bool = False) -> dict[str, object]:
     current, prior, prior_end = _audit_facts_by_period(latest)
-    evidence = _derive_period_audit_evidence(replace(latest, facts=current))
+    evidence = _derive_period_audit_evidence(replace(latest, facts=current),
+                                            allow_unreviewed_components=allow_unreviewed_components)
     if prior and prior_end is not None:
         comparative = _derive_period_audit_evidence(replace(
             latest, facts=prior, fiscal_year=prior_end.year,
-        ))
+        ), allow_unreviewed_components=allow_unreviewed_components)
         source = str(comparative["audit_opinion_source"])
         opinion = comparative["audit_opinion"]
         # Structured prior facts outrank comparative mentions in the current
@@ -601,8 +637,10 @@ def _derive_audit_evidence(latest: FiledFinancials) -> dict[str, object]:
     return evidence
 
 
-def _derive_period_audit_evidence(latest: FiledFinancials) -> dict[str, object]:
+def _derive_period_audit_evidence(latest: FiledFinancials, *, allow_unreviewed_components: bool = False) -> dict[str, object]:
     facts = latest.facts
+    decoding_incomplete = any(fact.concept in _AUDIT_CONCEPTS and unverified_text_encoding(fact.text_value)
+                              for fact in facts)
     report_bodies = [
         fact.text_value or ""
         for fact in facts
@@ -766,7 +804,8 @@ def _derive_period_audit_evidence(latest: FiledFinancials) -> dict[str, object]:
             opinion = "QUALIFIED_MATERIAL_MISSTATEMENT"
             material_issue = True
             concern_classification = "QUALIFIED_MATERIAL_MISSTATEMENT"
-        elif _is_non_significant_component_scope_limitation(qualified_basis):
+        elif _is_non_significant_component_scope_limitation(qualified_basis,
+                allow_unreviewed_components=allow_unreviewed_components):
             opinion = "QUALIFIED_SCOPE_LIMITATION"
             material_issue = False
             concern_classification = "QUALIFIED_SCOPE_LIMITATION"
@@ -788,6 +827,15 @@ def _derive_period_audit_evidence(latest: FiledFinancials) -> dict[str, object]:
         opinion = "UNKNOWN"
         material_issue = None
         concern_classification = "UNKNOWN"
+    if decoding_incomplete:
+        # A diagnostic string is not opinion evidence. Do not let a good body
+        # or another unqualified flag hide an unreadable qualified/adverse flag.
+        # Positively identified hard risks survive; otherwise safety is unknown.
+        if opinion not in {"ADVERSE", "DISCLAIMER", "QUALIFIED_MATERIAL_MISSTATEMENT"}:
+            opinion, material_issue = "UNKNOWN", None
+            concern_classification = opinion_source = "SOURCE_TEXT_DECODING_UNVERIFIED"
+        if going_concern is False:
+            going_concern = None
     comparative_opinion = _classify_comparative_opinion(
         normalized,
         current_fiscal_year=latest.fiscal_year,
@@ -804,7 +852,7 @@ def _derive_period_audit_evidence(latest: FiledFinancials) -> dict[str, object]:
         "comparative_audit_opinion": comparative_opinion,
         "accounting_concern_classification": concern_classification,
         "audit_evidence_available": evidence_available,
-        "audit_review_required": evidence_available and opinion == "UNKNOWN",
+        "audit_review_required": evidence_available and (opinion == "UNKNOWN" or decoding_incomplete),
         "audit_opinion_source": opinion_source,
         "comparative_audit_opinion_source": (
             "REPORT_BODY_COMPARATIVE"
@@ -821,6 +869,8 @@ def _opinion_abstract_is_true(
     accepted = {concepts} if isinstance(concepts, str) else set(concepts)
     for fact in facts:
         if fact.concept not in accepted:
+            continue
+        if unverified_text_encoding(fact.text_value):
             continue
         text = normalize_cjk_text(fact.text_value).lower()
         if text in _NON_AFFIRMATIVE_FLAGS - {""}:
@@ -889,7 +939,7 @@ def _qualified_basis_text(
     return " ".join(dict.fromkeys(candidates)).strip()
 
 
-def _is_non_significant_component_scope_limitation(basis: str) -> bool:
+def _is_non_significant_component_scope_limitation(basis: str, *, allow_unreviewed_components: bool = False) -> bool:
     if not basis:
         return False
     compact_basis = re.sub(r"\s+", "", _normalize_audit_text(basis))
@@ -931,9 +981,14 @@ def _is_non_significant_component_scope_limitation(basis: str) -> bool:
             "equity-method invest",
         )
     )
+    if allow_unreviewed_components:
+        # Exact observed English wording: the adjective "consolidated" can
+        # separate non-significance from subsidiaries in the basis section.
+        english_component |= re.search(r"\bnon-?significant\s+consolidated\s+subsidiar", normalized_basis) is not None
     english_unreviewed = any(
         marker in normalized_basis
-        for marker in ("not reviewed", "not audited", "unaudited")
+        for marker in ("not reviewed", "not audited", "unaudited",
+                       *(("unreviewed financial statements",) if allow_unreviewed_components else ()))
     )
     return (chinese_component and chinese_unreviewed) or (
         english_component and english_unreviewed

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import time
+import datetime
+from collections.abc import Callable
 
 from application.contracts import AnalysisContext
 from application.contracts import StrategyEvaluation
@@ -23,12 +25,16 @@ class CrawlerStrategyAdapter:
         portfolio_positions: tuple[PortfolioPosition, ...] = (),
         portfolio_current_cash: float | None = None,
         account_equity: float = 1_000_000.0,
+        restriction_refresh: Callable[[AnalysisContext], None] | None = None,
+        now_provider: Callable[[], datetime.datetime] | None = None,
     ) -> None:
         self._observer = observer or NullRunObserver()
         self._portfolio_allocator = portfolio_allocator
         self._portfolio_positions = portfolio_positions
         self._portfolio_current_cash = portfolio_current_cash
         self._account_equity = account_equity
+        self._restriction_refresh = restriction_refresh
+        self._now_provider = now_provider or (lambda: datetime.datetime.now(datetime.timezone.utc))
 
     def evaluate(self, context: AnalysisContext) -> StrategyEvaluation:
         started = time.perf_counter()
@@ -51,6 +57,11 @@ class CrawlerStrategyAdapter:
             "value": self._account_equity, "available_cash": cash,
             "intended_weight": .25, "capacity_weight": .25,
         }
+        if getattr(getattr(crawler, "app_settings", None), "daily_entry_model", "v6") == "v7":
+            crawler.les_v6_portfolio["positions"] = [
+                {"symbol": position.symbol, "shares": position.shares}
+                for position in self._portfolio_positions
+            ]
         if self._portfolio_allocator is not None:
             crawler.portfolio_entry_les_by_stock = {
                 position.symbol: position.entry_les
@@ -69,6 +80,31 @@ class CrawlerStrategyAdapter:
             }
         with measure_stage("profit_diagnostics"):
             maxprofits = crawler.cal_max_profit()
+        settings = getattr(crawler, "app_settings", None)
+        if (context.as_of is None
+                and getattr(settings, "daily_entry_model", "v6") == "v7"
+                and getattr(settings, "les_v7_native_evidence", False)):
+            # Freeze one actual clock after collection for every stock/model.
+            # Replay and legacy daily paths retain their existing cutoffs.
+            if self._restriction_refresh is not None:
+                self._restriction_refresh(context)
+            cutoff = self._now_provider()
+            if not isinstance(cutoff, datetime.datetime) or cutoff.utcoffset() is None:
+                raise ValueError("Daily decision cutoff requires a timezone-aware clock")
+            crawler.les_v7_decision_time = cutoff.astimezone(datetime.timezone.utc).isoformat()
+            # This account was constructed for this native daily assessment;
+            # bind it to the same frozen clock, not an inferred historical time.
+            crawler.les_v6_portfolio["as_of"] = crawler.les_v7_decision_time
+            capture = getattr(crawler, "les_v7_source_capture", None)
+            if capture is not None:
+                crawler.les_v7_source_selections = capture.selections(
+                    crawler, cutoff=crawler.les_v7_decision_time)
+            self._observer.record(
+                "v7_daily_cutoff_fixed", source="STRATEGY", status="SUCCESS",
+                decision_time=crawler.les_v7_decision_time,
+                cutoff_policy="AFTER_COLLECTION_CURRENT_DAILY_ONLY",
+                market_observed_at=getattr(crawler, "market_observed_at", None),
+            )
         decision_builder = getattr(
             crawler,
             "build_strategy_decisions",
@@ -86,12 +122,15 @@ class CrawlerStrategyAdapter:
                 "fundamental_snapshots_by_stock",
                 {},
             )
-            sector_by_symbol = {
-                str(symbol): str(snapshot.get("sector", "")).strip()
-                for symbol, snapshot in snapshots.items()
-                if isinstance(snapshot, dict)
-                and str(snapshot.get("sector", "")).strip()
-            }
+            from application.snapshot_retention import snapshot_metadata
+            sector_by_symbol = {}
+            for symbol in snapshots:
+                metadata = snapshot_metadata(snapshots, symbol)
+                if not isinstance(metadata, dict):
+                    continue  # Preserve the legacy sector projection contract.
+                sector = str(metadata.get("sector", "")).strip()
+                if sector:
+                    sector_by_symbol[str(symbol)] = sector
             with measure_stage("pae"):
                 decisions = allocator.enrich(
                     decisions,

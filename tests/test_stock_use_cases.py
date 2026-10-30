@@ -251,3 +251,90 @@ def test_service_emits_failed_summary_when_a_use_case_raises() -> None:
         service.run(request())
 
     assert observer_calls == ["STARTED", "FAILED"]
+
+
+@pytest.mark.parametrize("changed_at", ["fetch", "fundamentals", "strategies", "report", "notification", None])
+def test_version_drift_stops_at_stage_boundary_and_never_reports_success(changed_at):
+    from application.daily_work import DailyWorkContext, current_work
+    from application.work_version import WorkVersionChanged
+
+    calls, statuses, events = [], [], []
+    state = {"changed": False}
+
+    def check():
+        if state["changed"]:
+            raise WorkVersionChanged({"source": {"modified": {"count": 1, "paths": ["synthetic.py"]}}})
+
+    work = DailyWorkContext("SYNTHETIC", check_version=check)
+
+    class UseCase:
+        def __init__(self, name):
+            self.name = name
+
+        def execute(self, *args):
+            calls.append(self.name)
+            state["changed"] = self.name == changed_at
+            return object()
+
+    class Observer:
+        def start(self, request):
+            statuses.append("STARTED")
+
+        def finish(self, status):
+            statuses.append(status)
+
+        def record(self, name, **metrics):
+            events.append((name, metrics))
+
+    # The native port returns its active work; nullcontext callers remain
+    # compatible. A real notification provider is never used in this test.
+    from contextlib import contextmanager
+
+    @contextmanager
+    def scope():
+        with work.activate():
+            yield work
+
+    service = StockAnalysisService(
+        fetch_market_data=UseCase("fetch"), refresh_fundamentals=UseCase("fundamentals"),
+        evaluate_strategies=UseCase("strategies"), generate_report=UseCase("report"),
+        send_notification=UseCase("notification"), line_chart=None,
+        observer=Observer(), work_scope=scope)
+    sequence = ["fetch", "fundamentals", "strategies", "report", "notification"]
+    if changed_at is None:
+        assert service.run(request(mail=True)) is True
+        assert statuses == ["STARTED", "SUCCESS"]
+        assert calls == sequence
+        assert not [v for name, v in events if name == "work_version_changed"]
+    else:
+        with pytest.raises(WorkVersionChanged):
+            service.run(request(mail=True))
+        assert statuses == ["STARTED", "FAILED"]
+        assert calls == sequence[:sequence.index(changed_at) + 1]
+        error = next(v for name, v in events if name == "work_version_changed")
+        assert error["status"] == "FAILED" and error["changes"]["source"]
+    assert service.last_performance["status"] == statuses[-1]
+    assert current_work() is None
+
+
+def test_scope_entry_failure_is_observed_without_starting_analysis():
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from application.work_version import WorkVersionChanged
+
+    statuses = []
+
+    @contextmanager
+    def failed_scope():
+        raise WorkVersionChanged({"runtime": ["gil_enabled"]})
+        yield
+
+    service = StockAnalysisService(
+        fetch_market_data=None, refresh_fundamentals=None, evaluate_strategies=None,
+        generate_report=None, send_notification=None, line_chart=None, work_scope=failed_scope,
+        observer=SimpleNamespace(start=lambda _: statuses.append("STARTED"), finish=statuses.append,
+                                 record=lambda *args, **kwargs: None))
+    with pytest.raises(WorkVersionChanged):
+        service.run(request())
+    assert statuses == ["STARTED", "FAILED"]
+    assert service.last_performance["status"] == "FAILED"

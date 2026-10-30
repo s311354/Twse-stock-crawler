@@ -4,6 +4,7 @@ from dataclasses import replace
 from application.market_history import MarketHistoryInput
 from domain.industry_benchmark import sector_code
 from domain.numeric_history import metadata_free_frame
+from application.snapshot_retention import materialize_history_snapshot
 
 
 PER_STOCK_SEQUENCES = (
@@ -14,6 +15,9 @@ PER_STOCK_MAPPINGS = (
     "annual_fundamentals", "fundamental_snapshots", "fundamental_statuses",
     "fundamental_status_details", "signal_dates", "trading_restrictions",
     "les_v6_research_context", "entry_les_by_stock", "entry_dates_by_stock", "entry_decisions_by_stock",
+    "fundamental_capture_cutoffs",
+    "native_source_selections",
+    "captured_market_evidence",
 )
 
 
@@ -29,12 +33,23 @@ def isolate_stock_market(market: MarketHistoryInput, item: int) -> MarketHistory
     symbol = market.stock_numbers[item]
     updates = {name: (getattr(market, name)[item],) for name in PER_STOCK_SEQUENCES}
     updates.update({name: {symbol: values[symbol]} if symbol in (values := getattr(market, name)) else {}
-                    for name in PER_STOCK_MAPPINGS})
+                    for name in PER_STOCK_MAPPINGS if name != "fundamental_snapshots"})
+    source = updates["native_source_selections"].get(symbol, {})
+    if "r10_valuation_context" in source:
+        # Immutable work packets are shared in-process, but workers receive a
+        # detached JSON-native transport packet, never a mutable shared graph.
+        from application.low_entry_v7_daily import plain
+        updates["native_source_selections"] = {symbol: plain(source)}
+    # Materialize only this stock before transport; never pickle a live cache,
+    # private spool path, or another issuer's financial graph into a worker.
+    updates["fundamental_snapshots"] = (
+        {symbol: materialize_history_snapshot(market, symbol, cutoff=market.signal_dates.get(symbol))}
+        if symbol in market.fundamental_snapshots else {})
     if symbol in market.annual_fundamentals:
         # The native EvidenceContext already ignores annual DataFrame attrs;
         # don't transport unused metadata or its full financial graph.
         updates["annual_fundamentals"] = {symbol: metadata_free_frame(market.annual_fundamentals[symbol])}
-    sector = sector_code(market.fundamental_snapshots.get(symbol, {}).get("sector") or market.default_sector)
+    sector = sector_code(updates["fundamental_snapshots"].get(symbol, {}).get("sector") or market.default_sector)
     updates["industry_benchmarks"] = ({sector: market.industry_benchmarks[sector]}
                                       if sector in market.industry_benchmarks else {})
     # Do not recalculate the batch's completed session from just this stock.

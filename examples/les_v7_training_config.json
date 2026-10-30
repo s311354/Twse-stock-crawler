@@ -1,0 +1,126 @@
+{
+  "schema": "les-v7-training-config/v1",
+  "feature_names": [
+    "slope5",
+    "dfa512"
+  ],
+  "feature_bounds": [
+    [
+      -10,
+      10
+    ],
+    [
+      0,
+      3
+    ]
+  ],
+  "context_rules": {
+    "REVERSAL": {
+      "field": "close",
+      "op": "lt",
+      "value": 105
+    },
+    "TREND_PULLBACK": {
+      "op": "all",
+      "args": [
+        {
+          "field": "close",
+          "op": "gt",
+          "value": 110
+        },
+        {
+          "field": "close",
+          "op": "lt",
+          "value": 120
+        }
+      ]
+    },
+    "LEADERSHIP_CONTINUATION": {
+      "field": "close",
+      "op": "gt",
+      "value": 125
+    }
+  },
+  "trigger_rules": {
+    "near_pullback_support": {
+      "field": "close",
+      "op": "gt",
+      "value": 0
+    },
+    "tight_base_or_retest": {
+      "field": "close",
+      "op": "gt",
+      "value": 0
+    }
+  },
+  "reference_policy": {
+    "policy_id": "REFERENCE_H20",
+    "version": "SYNTHETIC_TEST_ONLY",
+    "entry_rule": "CUTOFF_CLOSE_NEXT_SESSION_BAND",
+    "support_rule": "STRICT_PIVOT_ELSE_PRIOR_LL20",
+    "reference_shares": 1,
+    "entry_band_atr": [
+      0,
+      0.25
+    ],
+    "cost_up_per_share": 0.02,
+    "cost_stop_per_share": 0.02,
+    "leadership_rr_min": 1.8
+  },
+  "quality_policy": {
+    "profile_id": "QG_V7_REPORTED_PERIOD_R3",
+    "policy_id": "QG_V7_REPORTED_PERIOD_R3_20261012",
+    "policy_version": "QG_REPORTED_POLICY_R3",
+    "mapping_version": "QG_MAP_R3",
+    "source_mapping_id": "MOPS_REPORTED_PERIOD_EVIDENCE_R3",
+    "filing_schedule_version": "LATEST_VERIFIED_PUBLISHED_PERIOD_R1",
+    "latest_required_period_policy": "LATEST_VERIFIED_PUBLISHED_PERIOD_NO_OLDER_FALLBACK",
+    "tax_rule": "VERIFIED_TTM_TAX_DIAGNOSTIC_ONLY",
+    "capex_rule": "VERIFIED_REPORTED_PPE_ACQUISITION_PAYMENT",
+    "freshness_full_age_days": 180,
+    "freshness_max_age_days": 275,
+    "freshness_policy": "NATIVE_REPORTED_PERIOD_180_FULL_275_REDUCED_THEN_BLOCKED",
+    "overdue_filing_verification": "NOT_VERIFIED_NO_OFFICIAL_SCHEDULE_EVIDENCE",
+    "latest_required_period": "LATEST_VERIFIED_PUBLISHED_PERIOD",
+    "source_mapping_sha256": "5cc874f10c2aff598c8c5887594ed3b5668001c7d3d4f6943aceaac9233638e0",
+    "policy_sha256": "9083b33449f4860c4090c1525eb9a7735bdbbc3a1f7e9413f0f26e3371a51cfa"
+  },
+  "fit_cutoff": "2025-06-17T13:30:00+08:00",
+  "validation_start": "2025-06-18T13:30:00+08:00",
+  "validation_end": "2025-06-18T13:30:00+08:00",
+  "evaluation_cutoff": "2025-07-21T13:30:00+08:00",
+  "folds": [
+    {
+      "fold_id": "synthetic-past-1",
+      "fit_cutoff": "2025-04-04T13:30:00+08:00",
+      "prediction_start": "2025-04-07T13:30:00+08:00",
+      "prediction_end": "2025-04-07T13:30:00+08:00"
+    },
+    {
+      "fold_id": "synthetic-past-2",
+      "fit_cutoff": "2025-05-12T13:30:00+08:00",
+      "prediction_start": "2025-05-13T13:30:00+08:00",
+      "prediction_end": "2025-05-13T13:30:00+08:00"
+    }
+  ],
+  "min_head_rows": 2,
+  "min_calibration_rows": 2,
+  "min_weight_rows": 3,
+  "min_context_weight_rows": 1,
+  "min_holdout_rows": 3,
+  "head_iterations": 20,
+  "calibration_iterations": 30,
+  "regularization": 0.01,
+  "null_seed": 19,
+  "null_replicates": 16,
+  "weight_solver": {
+    "max_iterations": 1000,
+    "tolerance": 0.000001
+  },
+  "acceptance": {
+    "max_brier": 1,
+    "max_timing_nll": 100,
+    "max_pinball_loss": 10
+  },
+  "example_scope": "SYNTHETIC_TEST_ONLY_ENGINEERING_TEMPLATE_NOT_MARKET_ACCEPTANCE"
+}

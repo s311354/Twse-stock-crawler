@@ -1,6 +1,10 @@
 __pycache__/
 **/__pycache__/
 .pytest_cache/
+.venv*/
+build/
+dist/
+*.egg-info/
 .env
 twse/*
 !twse/
@@ -8,3 +12,9 @@ twse/*
 data/*
 !data/
 !data/.gitkeep
+
+# R18 local immutable source clones and verification output (retain locally).
+/tmp/r18-mops-fixed-*/
+/tmp/les-r18-*.xml
+/tmp/les-r18-*.json
+/tmp/les-v7-r18-fixed-436-*/

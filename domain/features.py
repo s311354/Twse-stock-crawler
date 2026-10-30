@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 import json
 
@@ -59,6 +60,48 @@ class SharedFeatureConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class _FrozenFeatureColumn:
+    """Detached numeric bytes, with the old scalar-inference fallback.
+
+    A bytes-backed NumPy view cannot become writable, unlike an owning array
+    with writeable=False. Consumers receive copies and never its backing view.
+    The numeric dtype mirrors the previous tolist()/pandas inference, rather
+    than retaining narrow input dtypes and changing plugin output contracts.
+    """
+
+    buffer: bytes | None
+    dtype: str | None
+    fallback: tuple[object, ...] | None = None
+
+    @classmethod
+    def from_series(cls, series: pd.Series) -> "_FrozenFeatureColumn":
+        dtype = series.dtype
+        numeric = isinstance(dtype, np.dtype) and (
+            dtype.kind in "biu" or dtype.kind == "f" and dtype.itemsize <= 8
+            or dtype.kind == "c" and dtype.itemsize <= 16)
+        if not numeric:
+            return cls(None, None, deepcopy(tuple(series.tolist())))
+        values = series.to_numpy(copy=False)
+        if dtype.kind == "b":
+            inferred = np.dtype("bool")
+        elif dtype.kind in "iu":
+            inferred = np.dtype("uint64" if dtype.kind == "u" and len(values)
+                                and values.max() > np.iinfo(np.int64).max else "int64")
+        else:
+            inferred = np.dtype("complex128" if dtype.kind == "c" else "float64")
+        # The former DataFrame({column: []}) contract infers float64 even for
+        # empty integer/bool sources; Series([]) is handled separately below.
+        if not len(values):
+            inferred = np.dtype("float64")
+        return cls(np.ascontiguousarray(values, dtype=inferred).tobytes(), inferred.str)
+
+    def detached_values(self):
+        if self.buffer is None:
+            return list(deepcopy(self.fallback))
+        return np.frombuffer(self.buffer, dtype=self.dtype).copy()
+
+
+@dataclass(frozen=True, slots=True)
 class FeatureFrame:
     """Immutable feature values with copy-on-read pandas interoperability."""
 
@@ -67,7 +110,7 @@ class FeatureFrame:
     source_fingerprint: str
     _index: tuple[object, ...]
     _columns: tuple[str, ...]
-    _values: tuple[tuple[object, ...], ...]
+    _values: tuple[_FrozenFeatureColumn | tuple[object, ...], ...]
 
     @classmethod
     def from_pandas(
@@ -78,10 +121,7 @@ class FeatureFrame:
         source_data: pd.DataFrame,
     ) -> "FeatureFrame":
         columns = tuple(str(column) for column in frame.columns)
-        values = tuple(
-            tuple(frame[column].tolist())
-            for column in frame.columns
-        )
+        values = tuple(_FrozenFeatureColumn.from_series(frame[column]) for column in frame.columns)
         return cls(
             config=config,
             pipeline_version=FEATURE_PIPELINE_VERSION,
@@ -114,7 +154,9 @@ class FeatureFrame:
         except ValueError as error:
             raise KeyError("Unknown shared feature '{}'".format(name)) from error
         return pd.Series(
-            list(self._values[position]),
+            # Retain the previous empty-Series inference (object), which is
+            # intentionally different from the empty-DataFrame column dtype.
+            self._detached_values(position) if len(self) else [],
             index=pd.Index(self._index),
             name=name,
         )
@@ -124,11 +166,19 @@ class FeatureFrame:
 
         return pd.DataFrame(
             {
-                column: list(values)
-                for column, values in zip(self._columns, self._values)
+                column: self._detached_values(position)
+                for position, column in enumerate(self._columns)
             },
             index=pd.Index(self._index),
         )
+
+    def _detached_values(self, position: int):
+        values = self._values[position]
+        if isinstance(values, _FrozenFeatureColumn):
+            return values.detached_values()
+        # Read old in-process/pickled tuple-backed FeatureFrames without
+        # rewriting them; dataclasses.replace retains the same public fields.
+        return list(deepcopy(values))
 
 
 class SharedFeaturePipeline:

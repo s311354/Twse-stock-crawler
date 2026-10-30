@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import logging
 import json
+import math
 from collections.abc import Mapping
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -108,6 +109,26 @@ class StrategyDecisionSchema:
         self._validate_valuation(decision)
         if decision.value("LES Model Version") == "6.0.0":
             self._validate_v6(decision)
+        elif decision.value("LES Model Version") == "7.0.0":
+            self._validate_v7(decision)
+
+    @staticmethod
+    def _validate_v7(decision):
+        from application.v7_report_input import v7_report_binding
+        try:
+            binding = v7_report_binding(decision.value("LES v7 Report"))
+            if binding.symbol != decision.value("證券代號"):
+                raise ValueError("v7 symbol mismatch")
+            from domain.les_v7.contracts import timestamp
+            if (timestamp(binding.cutoff_at) != decision.evaluated_at
+                    or binding.signal_date != str(decision.value("日期"))[:10]
+                    or not math.isclose(binding.close * 1000,
+                                        decision.value("收盤"), rel_tol=0, abs_tol=.000001)):
+                raise ValueError("v7 cutoff, date or price mismatch")
+            for key, value in binding.fields:
+                if decision.value(key) != value: raise ValueError("v7 projection mismatch:" + key)
+        except (TypeError, ValueError, KeyError) as error:
+            raise StrategyContractError(f"Invalid LES v7 decision: {error}") from error
 
     @staticmethod
     def _validate_v6(decision: StrategyDecision) -> None:
@@ -152,7 +173,7 @@ class StrategyDecisionSchema:
     def _validate_valuation(self, decision: StrategyDecision) -> None:
         status = decision.value("Valuation Model Status")
         entry_decision = decision.value("低點決策")
-        if entry_decision == "BUY" and decision.value("LES Model Version") != "6.0.0":
+        if entry_decision == "BUY" and decision.value("LES Model Version") not in {"6.0.0", "7.0.0"}:
             if status != "COMPLETE":
                 raise StrategyContractError(
                     "BUY decisions require complete valuation evidence"
@@ -218,7 +239,9 @@ class StrategyDecisionAssembler:
                 )
                 continue
             evaluated_at = self._evaluated_at(market, item, symbol)
-            snapshot = market.fundamental_snapshots.get(symbol, {})
+            # Identity/source metadata never needs the full financial graph.
+            from application.snapshot_retention import snapshot_metadata
+            snapshot = snapshot_metadata(market.fundamental_snapshots, symbol)
             extended_at = self._timestamp(
                 snapshot.get("available_at"),
                 fallback=evaluated_at,
@@ -298,6 +321,9 @@ class StrategyDecisionAssembler:
             from application.low_entry_v6_daily import V6_PROJECTED_COLUMNS
             if name in V6_PROJECTED_COLUMNS:
                 source = FieldSource.LES_V6
+        if row.get("LES Model Version") == "7.0.0":
+            from application.low_entry_v7_daily import V7_PROJECTED_COLUMNS
+            if name in V7_PROJECTED_COLUMNS: source = FieldSource.LES_V7
         available_at = self._available_at_for(
             name=name,
             source=source,
@@ -549,9 +575,11 @@ class StrategyDecisionAssembler:
         if source is FieldSource.SIGNAL_FEATURES:
             return "signal-features-v1"
         if source is FieldSource.EREM_V3:
-            return EREM_V3_MODEL_VERSION
+            return StrategyDecisionAssembler._version_value(row.get("EREM Model Version"), EREM_V3_MODEL_VERSION)
         if source is FieldSource.LES_V6:
             return "6.0.0"
+        if source is FieldSource.LES_V7:
+            return "7.0.0"
         if source is FieldSource.LES_V5:
             return "5.0.0"
         if source is FieldSource.LES_V5_VALUATION:
@@ -591,7 +619,7 @@ class StrategyDecisionAssembler:
             return FieldUnit.DATE
         if name in {"Entry Candidate", "Entry Trigger Price", "ATR14"}:
             return FieldUnit.TWD_SCALED_1000
-        if name == "Falling Knife Veto":
+        if name in {"Falling Knife Veto", "LES v7 Execution Eligible"}:
             return FieldUnit.BOOLEAN
         if "version" in lowered or "版本" in name:
             return FieldUnit.VERSION

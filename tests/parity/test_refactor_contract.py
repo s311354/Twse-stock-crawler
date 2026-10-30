@@ -255,7 +255,7 @@ def test_cli_strategy_dataset_and_renderer_contracts_are_stable() -> None:
     cli_actions = _cli_actions()
     expected_cli = fixture["cli"]
     assert isinstance(expected_cli, dict)
-    # Explicitly reviewed additive replay options. Preserve the legacy actions
+    # Explicitly reviewed additive v7/replay options. Preserve the legacy actions
     # and hash rather than regenerating the golden contract to hide a change.
     replay_options = [
         {"dest": "replay_mail", "options": ["--replay-mail"], "nargs": 0, "choices": None},
@@ -266,9 +266,21 @@ def test_cli_strategy_dataset_and_renderer_contracts_are_stable() -> None:
         {"dest": "replay_output_dir", "options": ["--replay-output-dir"], "nargs": None, "choices": None},
         {"dest": "replay_parse_cache", "options": ["--replay-parse-cache"], "nargs": None, "choices": None},
     ]
-    replay_names = {action["dest"] for action in replay_options}
-    assert [action for action in cli_actions if action["dest"] in replay_names] == replay_options
-    legacy_actions = [action for action in cli_actions if action["dest"] not in replay_names]
+    v7_options = [
+        {"dest": "les_v7_research_bundle", "options": ["--les-v7-research-bundle"], "nargs": None, "choices": None},
+        # Named isolated research is already covered by test_v7_research_id_cli;
+        # admit only its exact additive action, keeping the old golden intact.
+        {"dest": "research_id", "options": ["--research-id"], "nargs": None, "choices": None},
+        {"dest": "les_v7_strategy_policy", "options": ["--les-v7-strategy-policy"], "nargs": None, "choices": None},
+        {"dest": "les_v7_diagnostics_only", "options": ["--les-v7-diagnostics-only"], "nargs": 0, "choices": None},
+    ]
+    # The existing explicit delivery opt-out is covered by research CLI/OOS
+    # tests. Admit its exact additive action, never rewrite the legacy golden.
+    no_mail = [{"dest": "no_mail", "options": ["--no-mail"], "nargs": 0, "choices": None}]
+    additions = v7_options + replay_options + no_mail
+    additive_names = {action["dest"] for action in additions}
+    assert [action for action in cli_actions if action["dest"] in additive_names] == additions
+    legacy_actions = [action for action in cli_actions if action["dest"] not in additive_names]
     assert legacy_actions == expected_cli["actions"]
     assert _digest(legacy_actions) == expected_cli["sha256"]
 
@@ -279,6 +291,16 @@ def test_cli_strategy_dataset_and_renderer_contracts_are_stable() -> None:
     added = {"Industry Quality Profile", "Industry Profile Version", "Industry Profile Mode", "Industry Shadow Decision",
              "LES v6 Formal Score", "LES v6 Estimated Score", "LES v6 Score Coverage",
              "LES v6 Raw Score", "LES v6 Penalty", "LES v6 Adjusted Score", "LES v6 Safety Cap", "LES v6 Final Score"}
+    from application.low_entry_v7_daily import V7_DAILY_COLUMNS
+    added.update(V7_DAILY_COLUMNS)
+    # Previously adopted formal B is additive: its six provenance/control
+    # columns do not replace any legacy EREM calculation or golden column.
+    formal_b_columns = {"EREM Model Version", "EREM Exit Policy Version", "EREM Exit Policy",
+                        "EREM Native Decision", "EREM Reduction Status", "EREM Reduction Cooldown"}
+    from domain.strategies.expected_return_exit_b import DAILY_EREM_OUTPUT_COLUMNS
+    from domain.strategies.expected_return_exit_v3 import EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS
+    assert set(DAILY_EREM_OUTPUT_COLUMNS) - set(EXPECTED_RETURN_EXIT_OUTPUT_COLUMNS) == formal_b_columns
+    added.update(formal_b_columns)
     assert added.issubset(ANALYSIS_COLUMNS)
     original_columns = [name for name in ANALYSIS_COLUMNS if name not in added]
     assert len(original_columns) == expected_columns["count"]
@@ -290,13 +312,18 @@ def test_cli_strategy_dataset_and_renderer_contracts_are_stable() -> None:
     hybrid = {"low_entry_score_v6_hybrid", "low_entry_score_v6_hybrid_legacy"}
     assert hybrid.issubset(_BUILTIN_STRATEGIES)
     assert get_strategy("low_entry_score_v6_hybrid").version == "6.0.0"
-    assert sorted(set(_BUILTIN_STRATEGIES) - hybrid) == sorted(expected_strategies)
+    # The wrapper opts into v7; earlier plugin versions remain pinned.
+    assert get_strategy("low_entry_score_v7").version == "7.0.0"
+    assert "low_entry_score_v7" in RendererFactory._renderers
+    formal_b = {"expected_return_exit_v3_b1"}
+    assert get_strategy("expected_return_exit_v3_b1").version == "3.2.4:EREM_SOFT_REDUCE_CONFIRM_COOLDOWN_B1"
+    assert sorted(set(_BUILTIN_STRATEGIES) - hybrid - {"low_entry_score_v7"} - formal_b) == sorted(expected_strategies)
     assert {
         name: get_strategy(name).version
         for name in sorted(expected_strategies)
     } == expected_strategies
     assert hybrid.issubset(RendererFactory._renderers)
-    assert sorted(set(RendererFactory._renderers) - hybrid) == fixture["renderers"]
+    assert sorted(set(RendererFactory._renderers) - hybrid - {"low_entry_score_v7"}) == fixture["renderers"]
     assert STRATEGY_DECISION_SCHEMA_VERSION == fixture["decision_schema_version"]
 
 

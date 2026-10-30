@@ -7,6 +7,14 @@ import re
 import unicodedata
 
 
+UNVERIFIED_TEXT_ENCODING_PREFIX = "UNVERIFIED_TEXT_ENCODING["
+
+
+def unverified_text_encoding(value: str | None) -> bool:
+    """A source decoding diagnostic must never act as an affirmative flag."""
+    return isinstance(value, str) and value.startswith(UNVERIFIED_TEXT_ENCODING_PREFIX)
+
+
 _CJK_CHARACTER_CLASS = (
     "\u3040-\u30ff"
     "\u3100-\u312f"
@@ -49,4 +57,4 @@ def normalize_cjk_text(value: str | None) -> str:
         normalized = decoded
 
 
-__all__ = ["normalize_cjk_text"]
+__all__ = ["normalize_cjk_text", "UNVERIFIED_TEXT_ENCODING_PREFIX", "unverified_text_encoding"]

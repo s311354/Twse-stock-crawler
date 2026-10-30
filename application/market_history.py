@@ -11,6 +11,7 @@ from dataclasses import field
 import pandas as pd
 
 from domain.numeric_history import metadata_free_frame, SCREEN_SOURCE_ROWS_ATTR
+from application.snapshot_retention import snapshot_metadata
 
 from domain.market_breadth import MARKET_BREADTH_ATTR
 from domain.market_breadth import MARKET_BREADTH_HISTORY_ATTR
@@ -73,6 +74,22 @@ class MarketHistoryInput:
     market_source: str = "TWSE"
     replay_as_of: str | None = None
     industry_benchmarks: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
+    entry_model: str = "v6"
+    les_v7_bundle_json: str | None = None
+    les_v7_strategy_policy_json: str | None = None
+    les_v7_diagnostics_only: bool = False
+    les_v7_native_evidence: bool = False
+    les_v7_rule_baseline: bool = False
+    market_observed_at: str | None = None
+    fundamental_capture_cutoffs: Mapping[str, str] = field(default_factory=dict)
+    les_v7_source_repair: bool = False
+    native_source_selections: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
+    # Explicit retained observations, not a current clock inferred by replay.
+    # Native validators still bind symbol, market, availability and bars hash.
+    captured_market_evidence: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
+    # Explicit public research entry marker; appended for positional caller
+    # compatibility. A generic model alone does not opt into a new policy.
+    les_v7_research_metadata_json: str | None = None
 
     def __post_init__(self) -> None:
         if self.stock_count < 0:
@@ -230,6 +247,35 @@ class MarketHistoryAssembler:
                     visible_breadth[str(date)] = dict(snapshot)
             history.attrs[MARKET_BREADTH_HISTORY_ATTR] = visible_breadth
         history.attrs[PRICE_SCALE_ATTR] = 1000.0
+        if market.entry_model == "v7":
+            history.attrs["daily_entry_model"] = "v7"
+            history.attrs["les_v7_bundle_json"] = market.les_v7_bundle_json
+            if market.les_v7_research_metadata_json:
+                history.attrs["les_v7_research_metadata_json"] = market.les_v7_research_metadata_json
+            if market.les_v7_strategy_policy_json:
+                history.attrs["les_v7_strategy_policy_json"] = market.les_v7_strategy_policy_json
+            history.attrs["les_v7_diagnostics_only"] = market.les_v7_diagnostics_only
+            history.attrs["les_v7_native_evidence"] = market.les_v7_native_evidence
+            history.attrs["les_v7_rule_baseline"] = market.les_v7_rule_baseline
+            history.attrs["les_v7_source_repair"] = market.les_v7_source_repair
+            if market.les_v7_source_repair:
+                history.attrs["les_v7_native_sources"] = market.native_source_selections.get(stock_no, {})
+            if stock_no in market.fundamental_capture_cutoffs:
+                history.attrs["les_v7_fundamental_capture_cutoff"] = market.fundamental_capture_cutoffs[stock_no]
+            if market.les_v7_native_evidence and stock_no in market.captured_market_evidence:
+                history.attrs["les_v7_market_evidence"] = dict(market.captured_market_evidence[stock_no])
+            elif market.les_v7_native_evidence and market.market_observed_at:
+                history.attrs["les_v7_market_evidence"] = {
+                    "symbol": stock_no, "market": market.market_source,
+                    "session_date": market_data_through,
+                    "source": market.market_source + "_DAILY",
+                    "source_available_at": market.market_observed_at,
+                    "price_unit": "TWD", "volume_unit": "shares", "amount_unit": "TWD",
+                    "source_final": history.attrs[MARKET_SESSION_FINAL_ATTR],
+                    "availability_basis": "CURRENT_OBSERVATION",
+                    "evidence_origin": "CURRENT_OBSERVATION_OF_OFFICIAL_FINAL_DAILY_DATA_OR_CACHE",
+                    "historical_original_observation_verified": False,
+                }
         history.attrs["les_v6_daily_identity"] = {
             "symbol": stock_no, "name": market.stock_names[item],
             "sector": market.default_sector,
@@ -251,7 +297,7 @@ class MarketHistoryAssembler:
             key: research[key] for key in ("watch", "watch_input_sha256", "watch_result_sha256") if key in research
         }
         from domain.industry_benchmark import INDUSTRY_BENCHMARK_ATTR, sector_code
-        snapshot = market.fundamental_snapshots.get(stock_no, {})
+        snapshot = snapshot_metadata(market.fundamental_snapshots, stock_no)
         sector = sector_code(snapshot.get("sector") or market.default_sector)
         if include_evidence:
             history.attrs[INDUSTRY_BENCHMARK_ATTR] = market.industry_benchmarks.get(sector)
@@ -260,8 +306,9 @@ class MarketHistoryAssembler:
                 market.annual_fundamentals[stock_no].copy()
             )
         if include_evidence and stock_no in market.fundamental_snapshots:
+            from application.snapshot_retention import materialize_history_snapshot
             history.attrs[FUNDAMENTAL_SNAPSHOT_ATTR] = dict(
-                market.fundamental_snapshots[stock_no]
+                materialize_history_snapshot(market, stock_no, cutoff=history.attrs[SIGNAL_DATE_ATTR])
             )
         if stock_no in market.fundamental_statuses:
             history.attrs[FUNDAMENTAL_STATUS_ATTR] = (

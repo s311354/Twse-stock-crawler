@@ -150,13 +150,21 @@ class ExpectedReturnExitV3Strategy(Strategy):
     name = EXPECTED_RETURN_EXIT_STRATEGY_NAME
     description = (
         "Holding confidence with decaying Entry LES memory, three-state VWAP, "
-        "confirmed soft exits, new-position grace, trend, momentum, volatility, "
+        "immediate low-confidence exits, new-position grace, trend, momentum, volatility, "
         "distribution, and relative strength"
     )
     version = EREM_V3_MODEL_VERSION
 
-    def __init__(self, config: ExpectedReturnExitV3Config | None = None) -> None:
+    def __init__(self, config: ExpectedReturnExitV3Config | None = None, *, soft_reduction_policy=None) -> None:
         self.config = config or ExpectedReturnExitV3Config()
+        self.soft_reduction_policy = soft_reduction_policy
+        if soft_reduction_policy is not None:
+            from domain.strategies.erem_soft_reduction import SoftReductionResearchPolicy, SoftReductionFormalPolicy
+            if type(soft_reduction_policy) not in (SoftReductionResearchPolicy, SoftReductionFormalPolicy):
+                raise ValueError("EXPLICIT_EREM_RESEARCH_POLICY_REQUIRED")
+            self.name = EXPECTED_RETURN_EXIT_STRATEGY_NAME + (
+                "_soft_reduction_research_r1" if soft_reduction_policy.research_only else "_b1")
+            self.version = EREM_V3_MODEL_VERSION + ":" + soft_reduction_policy.version
 
     def run(self, data: pd.DataFrame) -> pd.DataFrame:
         features = SharedFeaturePipeline(
@@ -172,7 +180,14 @@ class ExpectedReturnExitV3Strategy(Strategy):
         latest_only: bool = False,
     ) -> pd.DataFrame:
         if data.empty:
-            return pd.DataFrame([self._empty_result()])
+            result = pd.DataFrame([self._empty_result()])
+            if self.soft_reduction_policy is not None:
+                result["EREM Native Decision"] = result["EREM 決策訊號"]
+                result["EREM Research Policy" if self.soft_reduction_policy.research_only
+                       else "EREM Exit Policy Version"] = self.soft_reduction_policy.version
+                result["EREM Reduction Status"] = "UNKNOWN_EMPTY_INPUT"
+                result["EREM Reduction Cooldown"] = 0
+            return result
 
         features.assert_compatible(data)
         if features.config != self._shared_feature_config():
@@ -448,6 +463,14 @@ class ExpectedReturnExitV3Strategy(Strategy):
             exit_confirmed=exit_confirmed,
             entry_grace=entry_grace,
         )
+        soft_reduction_audit = None
+        native_decision = decision
+        if self.soft_reduction_policy is not None:
+            from domain.strategies.erem_soft_reduction import apply_soft_reduction_policy
+            soft_reduction_audit = apply_soft_reduction_policy(decision, entry_les=entry_les,
+                holding_days=holding_days, entry_decision=entry_decision, entry_grace=entry_grace,
+                policy=self.soft_reduction_policy)
+            decision = soft_reduction_audit["decision"]
         reduction_percentage = proposed_reduction_percentage.where(
             decision.eq("EXIT") | decision.str.startswith("REDUCE"),
             0.0,
@@ -543,6 +566,12 @@ class ExpectedReturnExitV3Strategy(Strategy):
             index=df.tail(1).index if latest_only else df.index,
         )
 
+        if soft_reduction_audit is not None:
+            result["EREM Native Decision"] = native_decision.reindex(result.index)
+            result["EREM Research Policy" if self.soft_reduction_policy.research_only
+                   else "EREM Exit Policy Version"] = self.soft_reduction_policy.version
+            result["EREM Reduction Status"] = soft_reduction_audit["status"].reindex(result.index)
+            result["EREM Reduction Cooldown"] = soft_reduction_audit["cooldown_remaining"].reindex(result.index)
         return pd.concat([df.tail(1) if latest_only else df, result], axis=1)
 
     def run_latest_with_features(self, data: pd.DataFrame, features: FeatureFrame) -> pd.DataFrame:
@@ -595,12 +624,13 @@ class ExpectedReturnExitV3Strategy(Strategy):
         holding_days: pd.Series,
         entry_decision: pd.Series,
     ) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
-        """Confirm soft exits without carrying pre-entry weakness forward.
+        """Track exit warnings and entry grace without pre-entry carryover.
 
         Hard stops and confirmed fundamental risks remain outside EREM and may
-        still exit immediately.  This confirmation applies only to EREM's
-        score-driven soft exit so one weak session does not churn a new or
-        otherwise valid holding.
+        still exit immediately. The current native <40 EXIT is immediate too;
+        exit_confirmed is diagnostic, not an execution delay. Entry grace only
+        suppresses an ordinary REDUCE. The optional, separately versioned
+        research policy confirms reductions, not these EXIT warnings.
         """
         exit_warning = (
             holding_confidence < self.config.exit_confidence_threshold

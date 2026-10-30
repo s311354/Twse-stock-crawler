@@ -6,6 +6,97 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize("explicit_end", [None, "700"])
+@pytest.mark.parametrize("check", [False, True])
+def test_offline_research_wrapper_defaults_to_mail_except_preflight(tmp_path, explicit_end, check):
+    captured = tmp_path / "argv.txt"
+    fake_python = tmp_path / "python"
+    fake_python.write_text('#!/bin/sh\nif [ "${1:-}" = "-c" ]; then exit 0; fi\n'
+                           'printf "%s\\n" "$@" > "$CAPTURED_ARGS"\n')
+    fake_python.chmod(0o755)
+    bundle = tmp_path / "native archive" / "frozen_bundle.json"
+    command = ["./stockdataanalysis.sh", "--profile", "elec", "--les-v7-research-bundle", str(bundle)]
+    if check:
+        command += ["--check"]
+    if explicit_end:
+        command += ["-e", explicit_end]
+    result = subprocess.run(command, cwd=PROJECT_ROOT, env={"PATH": "/usr/bin:/bin", "PYTHON": str(fake_python),
+        "CAPTURED_ARGS": str(captured)}, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    args = captured.read_text().splitlines()
+    assert args[args.index("--les-v7-research-bundle") + 1] == str(bundle)
+    assert args[args.index("-e") + 1] == (explicit_end or "1100")
+    assert ("-m" in args) is not check
+    assert "--replay-mail" not in args
+    assert ("--check-config" in args) is check
+
+
+def test_offline_research_wrapper_explicitly_suppresses_default_mail(tmp_path):
+    captured = tmp_path / "argv.txt"
+    fake_python = tmp_path / "python"
+    fake_python.write_text('#!/bin/sh\nif [ "${1:-}" = "-c" ]; then exit 0; fi\n'
+                           'printf "%s\\n" "$@" > "$CAPTURED_ARGS"\n')
+    fake_python.chmod(0o755)
+    bundle = tmp_path / "native archive" / "frozen_bundle.json"
+    result = subprocess.run(["./stockdataanalysis.sh", "--profile", "elec",
+        "--les-v7-research-bundle", str(bundle), "--no-mail"], cwd=PROJECT_ROOT,
+        env={"PATH": "/usr/bin:/bin", "PYTHON": str(fake_python), "CAPTURED_ARGS": str(captured)},
+        capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    args = captured.read_text().splitlines()
+    assert "--no-mail" in args and "-m" not in args
+
+
+def test_research_wrapper_forwards_fixed_research_id_without_changing_bundle_or_scope(tmp_path):
+    captured = tmp_path / "argv.txt"
+    fake_python = tmp_path / "python"
+    fake_python.write_text('#!/bin/sh\nif [ "${1:-}" = "-c" ]; then exit 0; fi\n'
+                           'printf "%s\\n" "$@" > "$CAPTURED_ARGS"\n')
+    fake_python.chmod(0o755)
+    bundle = tmp_path / "SYNTHETIC archive" / "frozen_bundle.json"
+    command = ["./stockdataanalysis.sh", "--profile", "elec",
+        "--les-v7-research-bundle", str(bundle), "--research-id", "elec-study_01", "--check"]
+    result = subprocess.run(command, cwd=PROJECT_ROOT,
+        env={"PATH": "/usr/bin:/bin", "PYTHON": str(fake_python), "CAPTURED_ARGS": str(captured)},
+        capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    args = captured.read_text().splitlines()
+    assert args[args.index("--research-id") + 1] == "elec-study_01"
+    assert args[args.index("--les-v7-research-bundle") + 1] == str(bundle)
+    assert "--check-config" in args and "-m" not in args
+    assert args[args.index("-e") + 1] == "1100"
+
+
+def test_research_wrapper_rejects_fixed_id_without_bundle_before_python(tmp_path):
+    captured = tmp_path / "argv.txt"
+    fake_python = tmp_path / "python"
+    fake_python.write_text('#!/bin/sh\nif [ "${1:-}" = "-c" ]; then exit 0; fi\n'
+                           'printf "%s\\n" "$@" > "$CAPTURED_ARGS"\n')
+    fake_python.chmod(0o755)
+    result = subprocess.run(["./stockdataanalysis.sh", "--profile", "elec",
+        "--research-id", "elec-study_01", "--check"], cwd=PROJECT_ROOT,
+        env={"PATH": "/usr/bin:/bin", "PYTHON": str(fake_python), "CAPTURED_ARGS": str(captured)},
+        capture_output=True, text=True)
+    assert result.returncode != 0
+    assert not captured.exists()
+
+
+@pytest.mark.parametrize("configured,expected", [(None, "v7"), ("v6", "v6")])
+def test_daily_wrapper_selects_v7_with_explicit_v6_compatibility(tmp_path, configured, expected):
+    captured = tmp_path / "model.txt"
+    fake_python = tmp_path / "python"
+    fake_python.write_text('#!/bin/sh\nif [ "${1:-}" = "-c" ]; then exit 0; fi\n'
+                           'printf "%s" "$TWSE_DAILY_ENTRY_MODEL" > "$CAPTURED_MODEL"\n')
+    fake_python.chmod(0o755)
+    env = {"PATH": "/usr/bin:/bin", "PYTHON": str(fake_python), "CAPTURED_MODEL": str(captured)}
+    if configured is not None:
+        env["TWSE_DAILY_ENTRY_MODEL"] = configured
+    result = subprocess.run(["./stockdataanalysis.sh", "--check"], cwd=PROJECT_ROOT,
+                            env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert captured.read_text() == expected
+
+
 @pytest.mark.parametrize("replay_mail", [False, True])
 def test_historical_wrapper_preserves_date_range_and_opt_in_mail(tmp_path: Path, replay_mail: bool) -> None:
     captured = tmp_path / "argv.txt"

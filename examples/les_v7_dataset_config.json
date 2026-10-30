@@ -1,0 +1,134 @@
+{
+  "schema": "les-v7-dataset-build-config/v1",
+  "event_start": "2026-07-06",
+  "event_end": "2026-07-08",
+  "evaluation_cutoff": "2026-08-07T13:30:00+08:00",
+  "event_sampling": "ALL_FIXED_UNIVERSE_OFFICIAL_SESSIONS",
+  "max_events": 64,
+  "seed": {
+    "feature_names": [
+      "slope5",
+      "dfa512"
+    ],
+    "feature_bounds": [
+      [
+        -10,
+        10
+      ],
+      [
+        0,
+        3
+      ]
+    ],
+    "context_rules": {
+      "REVERSAL": {
+        "op": "all",
+        "args": [
+          {
+            "field": "return20",
+            "op": "lt",
+            "value": 0
+          },
+          {
+            "field": "no_low2",
+            "op": "eq",
+            "value": true
+          }
+        ]
+      },
+      "TREND_PULLBACK": {
+        "field": "close",
+        "op": "ge",
+        "other_field": "ema20"
+      },
+      "LEADERSHIP_CONTINUATION": {
+        "field": "close",
+        "op": "ge",
+        "other_field": "ema10"
+      }
+    },
+    "reference_policy": {
+      "policy_id": "REFERENCE_H20",
+      "version": "DECLARED_COUNTERFACTUAL_H20_RAW_PRICE_R1",
+      "entry_rule": "CUTOFF_CLOSE_NEXT_SESSION_BAND",
+      "support_rule": "STRICT_PIVOT_ELSE_PRIOR_LL20",
+      "reference_shares": 1,
+      "entry_band_atr": [
+        0,
+        0.25
+      ],
+      "cost_path_policy": {
+        "schema": "les-v7-reference-path-policy/v1",
+        "version": "H20_OPEN_ONLY_NO_DAY_TRADE_COST_AFTER_R1",
+        "market": "TWSE",
+        "instrument_type": "ORDINARY_STOCK",
+        "entry_rule": "NEXT_OFFICIAL_SESSION_OPEN_IN_BAND",
+        "exit_rule": "FIRST_STOP_OR_NET_2R_ELSE_H20_CLOSE",
+        "exit_activation": "NEXT_SESSION_AFTER_FILL",
+        "shares_rule": "NATIVE_REFERENCE_SHARES",
+        "price_grid": "ORDINARY_STOCK_TICK_R1",
+        "coordinate_policy": "RAW_UNADJUSTED_NO_ACTIONS_COVERED",
+        "slippage_bps": "0",
+        "available_at": "2026-10-13T00:00:00+08:00",
+        "source_evidence_ids": [
+          "DECLARED_COUNTERFACTUAL_REFERENCE_POLICY_NOT_HISTORICAL_DEPLOYMENT"
+        ],
+        "cost_policy": {
+          "version": "DECLARED_CENT_LINEAR_COST_ASSUMPTION_R1",
+          "buy_rate": "0.001425",
+          "sell_rate": "0.004425",
+          "minimum_buy_fee": "0",
+          "minimum_sell_fee": "0",
+          "currency_quantum": "0.01",
+          "rounding": "ROUND_HALF_UP",
+          "available_at": "2026-10-13T00:00:00+08:00",
+          "effective_start": "2024-01-01",
+          "effective_end": "2027-12-31",
+          "evidence_ids": [
+            "DECLARED_RESEARCH_COST_ASSUMPTION_NOT_BROKER_FEE_CERTIFICATION"
+          ]
+        }
+      },
+      "leadership_rr_min": 1.8
+    }
+  },
+  "path_policy": {
+    "schema": "les-v7-reference-path-policy/v1",
+    "version": "H20_OPEN_ONLY_NO_DAY_TRADE_COST_AFTER_R1",
+    "market": "TWSE",
+    "instrument_type": "ORDINARY_STOCK",
+    "entry_rule": "NEXT_OFFICIAL_SESSION_OPEN_IN_BAND",
+    "exit_rule": "FIRST_STOP_OR_NET_2R_ELSE_H20_CLOSE",
+    "exit_activation": "NEXT_SESSION_AFTER_FILL",
+    "shares_rule": "NATIVE_REFERENCE_SHARES",
+    "price_grid": "ORDINARY_STOCK_TICK_R1",
+    "coordinate_policy": "RAW_UNADJUSTED_NO_ACTIONS_COVERED",
+    "slippage_bps": "0",
+    "available_at": "2026-10-13T00:00:00+08:00",
+    "source_evidence_ids": [
+      "DECLARED_COUNTERFACTUAL_REFERENCE_POLICY_NOT_HISTORICAL_DEPLOYMENT"
+    ],
+    "cost_policy": {
+      "version": "DECLARED_CENT_LINEAR_COST_ASSUMPTION_R1",
+      "buy_rate": "0.001425",
+      "sell_rate": "0.004425",
+      "minimum_buy_fee": "0",
+      "minimum_sell_fee": "0",
+      "currency_quantum": "0.01",
+      "rounding": "ROUND_HALF_UP",
+      "available_at": "2026-10-13T00:00:00+08:00",
+      "effective_start": "2024-01-01",
+      "effective_end": "2027-12-31",
+      "evidence_ids": [
+        "DECLARED_RESEARCH_COST_ASSUMPTION_NOT_BROKER_FEE_CERTIFICATION"
+      ]
+    }
+  },
+  "coordinate_coverages": [],
+  "example_scope": "REAL_ARCHIVE_PARTIAL_AUDIT_TEMPLATE_NOT_OPTIMIZED_MODEL_OR_MARKET_ACCEPTANCE",
+  "limitations": [
+    "NO_COORDINATE_ACTION_COVERAGE_PROVIDED",
+    "REQUIRES_VERIFIED_OFFICIAL_CALENDAR",
+    "RAW_FINAL_BARS_NOT_ORIGINAL_OBSERVATIONS"
+  ]
+}

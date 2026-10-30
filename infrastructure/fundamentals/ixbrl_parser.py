@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from hashlib import sha256
 from math import isfinite, pow
 
 from domain.fundamental_models import FilingDocument
@@ -12,6 +13,9 @@ from domain.fundamental_models import XbrlContext
 from domain.financial_taxonomy import ixbrl_schema_refs
 from infrastructure.crawler.twse_http_client import TwseSchemaChangedError
 from infrastructure.fundamentals.ixbrl_units import UnitParser
+from infrastructure.fundamentals.ixbrl_decoding import (
+    IXBRL_PARSER_VERSION, decode_document, decode_fact_range,
+)
 
 
 # Preserve visible text boundaries without inserting spaces between inline spans.
@@ -29,10 +33,13 @@ class _RawFact:
     is_nil: bool
     format: str | None = None
     text: str = ""
+    source_start: int = 0
+    source_end: int = 0
+    source_complete: bool = True
 
 
 class _InlineXbrlParser(UnitParser):
-    def __init__(self) -> None:
+    def __init__(self, source: str = "") -> None:
         super().__init__()
         self.contexts: dict[str, XbrlContext] = {}
         self.raw_facts: list[_RawFact] = []
@@ -42,6 +49,14 @@ class _InlineXbrlParser(UnitParser):
         self._context_text: list[str] = []
         self._dimension_name: str | None = None
         self._fact: _RawFact | None = None
+        self._source = source
+        self._line_offsets = [0, *(match.end() for match in re.finditer("\n", source))]
+
+    def _source_offset(self):
+        if not self._source:
+            return 0
+        line, column = self.getpos()
+        return self._line_offsets[line - 1] + column
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         super().handle_starttag(tag, attrs)
@@ -75,6 +90,12 @@ class _InlineXbrlParser(UnitParser):
 
         if normalized_tag not in {"ix:nonfraction", "ix:nonnumeric"}:
             return
+        if self._source and self._fact is not None:
+            # Damaged-document recovery must retain a pending witness when a
+            # nested fact would otherwise overwrite an unfinished audit body.
+            self._fact.source_end = self._source_offset()
+            self._fact.source_complete = False
+            self.raw_facts.append(self._fact)
         scale_text = attributes.get("scale", "0")
         try:
             scale = int(scale_text)
@@ -89,6 +110,7 @@ class _InlineXbrlParser(UnitParser):
             is_numeric=normalized_tag == "ix:nonfraction",
             is_nil=attributes.get("xsi:nil", "").lower() == "true",
             format=attributes.get("format") or None,
+            source_start=self._source_offset() + len(self.get_starttag_text()),
         )
 
     def handle_data(self, data: str) -> None:
@@ -142,6 +164,17 @@ class _InlineXbrlParser(UnitParser):
             return
         expected_tag = "ix:nonfraction" if self._fact.is_numeric else "ix:nonnumeric"
         if normalized_tag == expected_tag:
+            # HTMLParser dispatches a self-closing tag's end at its start
+            # position. Its payload is empty, never a reversed byte interval.
+            self._fact.source_end = max(self._fact.source_start, self._source_offset())
+            self.raw_facts.append(self._fact)
+            self._fact = None
+
+    def close(self):
+        super().close()
+        if self._source and self._fact is not None:
+            self._fact.source_end = len(self._source)
+            self._fact.source_complete = False
             self.raw_facts.append(self._fact)
             self._fact = None
 
@@ -157,14 +190,8 @@ class _InlineXbrlParser(UnitParser):
 
 
 def decode_mops_content(content: bytes) -> str:
-    """Decode MOPS bytes deterministically while tolerating legacy encodings."""
-
-    for encoding in ("utf-8", "big5", "cp950", "latin-1"):
-        try:
-            return content.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return content.decode("utf-8", errors="replace")
+    """Discovery-HTML compatibility; facts use separate range validation."""
+    return decode_document(content)[0]
 
 
 def parse_ixbrl(content: bytes | str) -> list[NormalizedFact]:
@@ -175,12 +202,40 @@ def parse_ixbrl(content: bytes | str) -> list[NormalizedFact]:
     the filing repository for exact source reconstruction.
     """
 
-    parser = _InlineXbrlParser()
-    parser.feed(decode_mops_content(content) if isinstance(content, bytes) else content)
+    return parse_ixbrl_evidence(content)[0]
+
+
+def parse_ixbrl_evidence(content: bytes | str) -> tuple[list[NormalizedFact], dict]:
+    """Facts plus a deterministic decoding receipt bound to original bytes.
+
+    Fully decodable documents retain the legacy codec order and text behavior.
+    Only globally damaged byte documents use strict, per-fact range recovery.
+    No original bytes, filing availability or stored historical facts change.
+    """
+    if isinstance(content, bytes):
+        source, codec, failures = decode_document(content)
+        receipt = dict(schema="ixbrl-decoding-receipt/v1", parser_version=IXBRL_PARSER_VERSION,
+            content_sha256=sha256(content).hexdigest(), encoding=codec,
+            mode="DOCUMENT_STRICT" if codec else "STRICT_FACT_RANGES",
+            document_failures=failures, facts=[])
+    else:
+        source, codec = content, "unicode-input"
+        receipt = dict(schema="ixbrl-decoding-receipt/v1", parser_version=IXBRL_PARSER_VERSION,
+            content_sha256=None, encoding=codec, mode="UNICODE_INPUT", document_failures=[], facts=[])
+    parser = _InlineXbrlParser(source if codec is None else "")
+    parser.feed(source)
+    parser.close()
     facts: list[NormalizedFact] = []
     for raw in parser.raw_facts:
         if not raw.concept or not raw.context_id:
             continue
+        if codec is None:
+            raw.text, decoded = decode_fact_range(content, raw.source_start, raw.source_end,
+                concept=raw.concept, context_id=raw.context_id, numeric=raw.is_numeric,
+                complete=raw.source_complete)
+            # Sparse receipt: unchanged ASCII facts need no per-field repair.
+            if decoded["encoding"] != "ascii":
+                receipt["facts"].append(decoded)
         context = parser.contexts.get(raw.context_id, XbrlContext(raw.context_id))
         text = _normalize_text(raw.text)
         numeric_value = (_parse_number(text, raw.scale, raw.sign, raw.format)
@@ -201,7 +256,7 @@ def parse_ixbrl(content: bytes | str) -> list[NormalizedFact]:
                 dimensions=context.dimensions,
             )
         )
-    return facts
+    return facts, receipt
 
 
 class IxbrlFilingParser:
@@ -253,4 +308,6 @@ __all__ = [
     "decode_mops_content",
     "ixbrl_schema_refs",
     "parse_ixbrl",
+    "parse_ixbrl_evidence",
+    "IXBRL_PARSER_VERSION",
 ]

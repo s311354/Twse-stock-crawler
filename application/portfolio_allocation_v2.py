@@ -86,6 +86,30 @@ class PortfolioAllocationV2Pipeline:
         self.persistence = persistence or NullPortfolioPersistenceV2()
         self.portfolio_id = portfolio_id
 
+    def evaluate_request(self, request: PortfolioAllocationRequestV2,
+                         trade_date: datetime.date) -> PortfolioAllocationDecisionV2:
+        """Public native allocation/persistence boundary for isolated research.
+
+        Callers own explicit verified securities and account inputs. This does
+        not load daily state, infer holdings, or weaken native allocation gates.
+        """
+        if not isinstance(request, PortfolioAllocationRequestV2) or request.portfolio_id != self.portfolio_id:
+            raise PortfolioAllocationInputError('PAE_REQUEST_PORTFOLIO_ID_MISMATCH')
+        if type(trade_date) is not datetime.date:
+            raise PortfolioAllocationInputError('PAE_REQUEST_TRADE_DATE_REQUIRED')
+        return self._evaluate_with_persistence(request, trade_date)
+
+    def verified_security(self, decision: StrategyDecision, context: PortfolioRuntimeContext,
+                          *, position: PortfolioPosition | None = None) -> PortfolioSecurityV2:
+        """Reuse the daily adapter for a validated, explicitly account-bound row."""
+        from application.strategy_contracts import StrategyDecisionSchema
+        StrategyDecisionSchema().validate(decision)
+        if context.current_cash is None:
+            raise PortfolioAllocationInputError('PAE_EXPLICIT_CASH_REQUIRED')
+        if decision.value('LES Model Version') == '7.0.0':
+            self._validate_v7_account(decision, context.account_equity, context.current_cash, context.positions)
+        return self._security(decision, context, position=position)
+
     def enrich(
         self,
         decisions: Sequence[StrategyDecision],
@@ -151,6 +175,9 @@ class PortfolioAllocationV2Pipeline:
             by_symbol,
             context,
         )
+        for decision in decisions:
+            if decision.value("LES Model Version") == "7.0.0":
+                self._validate_v7_account(decision, context.account_equity, available_cash, context.positions)
         holdings = tuple(
             self._security(
                 by_symbol[position.symbol],
@@ -180,6 +207,22 @@ class PortfolioAllocationV2Pipeline:
             trade_date,
             input_mode,
         )
+
+    @staticmethod
+    def _validate_v7_account(decision: StrategyDecision, equity: float, cash: float,
+                             positions: Sequence[PortfolioPosition]) -> None:
+        from application.strategy_contracts import StrategyDecisionSchema
+        from application.v7_report_input import v7_report_binding
+        from domain.les_v7.allocation import account_positions
+        StrategyDecisionSchema().validate(decision)
+        binding = v7_report_binding(decision.value("LES v7 Report"))
+        if not binding.authorized:
+            return
+        if (not math.isclose(binding.account_value, equity, rel_tol=0, abs_tol=.0001)
+                or not math.isclose(binding.account_cash, cash, rel_tol=0, abs_tol=.0001)
+                or [dict(symbol=s,shares=n) for s,n in binding.account_positions] != account_positions([
+                    {"symbol": position.symbol, "shares": position.shares} for position in positions])):
+            raise PortfolioAllocationInputError("V7_PAE_ACCOUNT_BINDING_MISMATCH")
 
     def _resolve_positions(
         self,
@@ -252,13 +295,20 @@ class PortfolioAllocationV2Pipeline:
         request: PortfolioAllocationRequestV2,
         trade_date: datetime.date,
     ) -> PortfolioAllocationDecisionV2:
+        session = getattr(self.persistence, "evaluate_session_v2", None)
+        if callable(session):
+            return session(request, trade_date, evaluate=lambda persistence:
+                self._evaluate_native_persistence(request, trade_date, persistence))
+        return self._evaluate_native_persistence(request, trade_date, self.persistence)
+
+    def _evaluate_native_persistence(self, request, trade_date, persistence):
         if not request.holdings or not request.candidates:
             return self.engine.allocate(request)
         incumbents = tuple(item.stock_id for item in request.holdings)
         challengers = tuple(item.stock_id for item in request.candidates)
         observations = self.engine.persistence_observations(request)
-        self.persistence.record_session_v2(trade_date, observations)
-        evidence = self.persistence.load_recent_v2(
+        persistence.record_session_v2(trade_date, observations)
+        evidence = persistence.load_recent_v2(
             incumbents,
             challengers,
             through_date=trade_date,
@@ -301,8 +351,8 @@ class PortfolioAllocationV2Pipeline:
             if item is not None
         ]
         data_confidence = min(confidences) if confidences else None
-        is_v6 = decision.value("LES Model Version") == "6.0.0"
-        if is_v6:
+        native_quality = decision.value("LES Model Version") in {"6.0.0", "7.0.0"}
+        if native_quality:
             data_confidence = self._number(decision.value("Data Confidence"))
         quality_confidence = self._number(
             decision.value("Quality Confidence")
@@ -313,9 +363,9 @@ class PortfolioAllocationV2Pipeline:
             decision.value("Quality Hard Rejects", "NONE")
         ).upper()
         quality_status = self._quality_status(
-            decision.value("Quality Status" if is_v6 else "LES v5 Final Quality Status")
+            decision.value("Quality Status" if native_quality else "LES v5 Final Quality Status")
         )
-        if is_v6:
+        if native_quality:
             quality_confidence = data_confidence
         erem_reason = self._text(decision.value("EREM 理由", ""))
         holding_confidence = self._number(
@@ -341,13 +391,33 @@ class PortfolioAllocationV2Pipeline:
             current_shares * float(price or 0.0) / context.account_equity
         )
         stop_price = self._decision_price(decision, "策略停損")
-        return PortfolioSecurityV2(
+        security_type = PortfolioSecurityV2
+        policy_options = {}
+        native_valuation_gate = None
+        if decision.value("LES Model Version") == "7.0.0":
+            import json
+            from application.strategy_contracts import StrategyDecisionSchema
+            from application.v7_report_input import read_v7_report_json
+            from domain.les_v7.entry_policy_r9 import is_r9, R9PortfolioSecurityV2
+            report = read_v7_report_json(decision.value("LES v7 Report"))
+            if is_r9(report):
+                StrategyDecisionSchema().validate(decision)
+                admission = report["diagnostics"]["entry_admission"]
+                quality_status = report["diagnostics"]["quality"]["status"]
+                native_valuation_gate = admission["valuation"]["native_state"]
+                security_type = R9PortfolioSecurityV2
+                policy_options["entry_admission_json"] = json.dumps(admission, sort_keys=True, allow_nan=False)
+                # Native quota is incremental; PAE's field is a TOTAL target.
+                # At/above the new cap, retain holdings with no automatic trim.
+                position_cap = current_weight + float(decision.value("Position Fraction") or 0.)
+                risk_budget = liquidity_cap = position_cap
+        return security_type(
             stock_id=symbol,
             sector_id=sector,
             correlation_cluster_id=cluster,
             quality_status=quality_status,
             quality_score=self._number(
-                decision.value("Quality Score" if is_v6 else "LES v5 Final Quality Score")
+                decision.value("Quality Score" if native_quality else "LES v5 Final Quality Score")
             ),
             quality_confidence=quality_confidence,
             data_confidence=data_confidence,
@@ -355,7 +425,7 @@ class PortfolioAllocationV2Pipeline:
                 decision.value("Valuation Model Status", "UNKNOWN")
             ),
             valuation_gate=self._text(
-                decision.value("Valuation Gate", "UNKNOWN")
+                native_valuation_gate if native_valuation_gate is not None else decision.value("Valuation Gate", "UNKNOWN")
             ),
             bear_cagr=self._number(
                 decision.value("Bear Case Expected CAGR")
@@ -415,6 +485,7 @@ class PortfolioAllocationV2Pipeline:
             cyclical_state=self._text(
                 decision.value("Cyclical State", "CYCLICAL_CLEAR")
             ),
+            **policy_options,
         )
 
     def _append_result(

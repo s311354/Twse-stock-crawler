@@ -23,7 +23,8 @@ StockhtmlMessage = """\
 
     <body>
         <p>
-        TWSE daily strategy analysis covering {days} trading days ({begin} ~ {end}) is complete.<br>
+        TWSE daily strategy analysis is complete. Input lookback: {days} calendar days ({begin} ~ {end}).<br>
+        Single-cutoff signals; this is not a day-by-day historical backtest.<br>
         The report below separates entry timing from position-exit evaluation.<br>
         <br>
 
@@ -147,9 +148,13 @@ class TextMeWhenItsDone(object):
     ) -> None:
         # Create the email message
         msg = MIMEMultipart('alternative')
-        if les_model_version not in {"5.0.0", "6.0.0"}:
+        if les_model_version not in {"5.0.0", "6.0.0", "7.0.0"}:
             raise ValueError("Unsupported daily LES model version")
         msg['Subject'] = "[TWSE Stock {}] [{}]: LES v{} / EREM v3 ({} ~ {})".format(subject, stocktype, les_model_version.split('.')[0], iso_scheduled_times[0], iso_scheduled_times[-1])
+        if les_model_version == "7.0.0":
+            from infrastructure.report.low_entry_v7_renderer import rendered_model_label
+            if label := rendered_model_label(entryanalysis):
+                msg.replace_header('Subject', f"[{label}] " + msg['Subject'])
 
         # RFC 5322
         msg['From']  = email

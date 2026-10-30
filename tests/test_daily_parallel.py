@@ -24,7 +24,8 @@ def test_stock_packet_preserves_global_context_and_excludes_other_financials():
     market = two_stock_market()
     market = replace(market, fallback_date="", industry_benchmarks={"24": {"benchmark": 2}, "99": {"unrelated": 9}},
         fundamental_snapshots={"2330": {"sector": "24", "proof": [1]}, "2317": {"secret_other_issuer": [2]}},
-        entry_les_by_stock={"2330": 78, "2317": 95})
+        entry_les_by_stock={"2330": 78, "2317": 95},
+        les_v7_research_metadata_json='{"scope":"SYNTHETIC_GLOBAL_RESEARCH_METADATA"}')
     isolated = isolate_stock_market(market, 0)
     for name in PER_STOCK_SEQUENCES:
         assert len(getattr(isolated, name)) == 1
@@ -34,14 +35,20 @@ def test_stock_packet_preserves_global_context_and_excludes_other_financials():
     assert isolated.fallback_date == max(row[-1] for row in market.dates)
     assert isolated.market_breadth_snapshots == market.market_breadth_snapshots
     assert isolated.industry_benchmarks == {"24": {"benchmark": 2}}
+    assert isolated.les_v7_research_metadata_json == market.les_v7_research_metadata_json
     # Transport is detached; editing worker input cannot mutate the parent.
     restored = pickle.loads(pickle.dumps(isolated))
+    assert restored.les_v7_research_metadata_json == market.les_v7_research_metadata_json
     restored.fundamental_snapshots["2330"]["proof"].append(3)
     assert market.fundamental_snapshots["2330"]["proof"] == [1]
     # Fail visibly in review when the public input gains a new field.
     assert {f.name for f in fields(MarketHistoryInput)} == set(PER_STOCK_SEQUENCES + PER_STOCK_MAPPINGS) | {
         "stock_count", "account_equity", "default_sector", "les_v6_portfolio", "fallback_date",
-        "market_breadth_snapshots", "market_source", "replay_as_of", "industry_benchmarks"}
+        "market_breadth_snapshots", "market_source", "replay_as_of", "industry_benchmarks",
+        "entry_model", "les_v7_bundle_json", "les_v7_strategy_policy_json",
+        "les_v7_research_metadata_json",
+        "les_v7_diagnostics_only", "les_v7_native_evidence", "les_v7_rule_baseline",
+        "les_v7_source_repair", "market_observed_at"}
 
 
 @pytest.mark.parametrize("cache", [False, True])

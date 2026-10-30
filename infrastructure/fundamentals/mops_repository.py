@@ -223,6 +223,15 @@ class MopsRepository:
     ) -> dict[str, list[MopsFiling]]:
         return self.queries.load_filings_many(symbols, as_of=as_of, uow=uow)
 
+    def load_financial_audit_evidence(self, symbol, as_of, *, periods, uow=None):
+        return self.queries.load_financial_audit_evidence(symbol, as_of, periods=periods, uow=uow)
+
+    def load_v7_financial_sources(self, symbol, as_of, *, periods, uow=None, source_repair=False, market="TWSE", audit_repair_r7=False):
+        return self.queries.load_v7_financial_sources(symbol, as_of, periods=periods, uow=uow,
+            **({"source_repair": True, "market": market} if source_repair else {}),
+            **({"audit_repair_r7": True, **({"market": market} if not source_repair else {})}
+               if audit_repair_r7 else {}))
+
     def load_filed_financials(
         self,
         symbol: str,

@@ -426,44 +426,10 @@ class MopsFundamentalService:
                         uow=uow,
                         history=history,
                     )
-                    bundle = self.snapshot_assembler.attach_base_evidence(
-                        self.point_in_time.bundle_as_of(
-                            entry.bundle,
-                            effective_signal,
-                        ),
-                        resolution,
-                        symbol=symbol,
-                        signal_time=effective_signal,
-                        uow=uow,
-                        history=history,
-                        persist_snapshot=False,
-                    )
-                    batch_state = batch_states.get(symbol)
-                    if (
-                        current_batch is not None
-                        and entry.latest_period >= current_batch.period
-                        and batch_state is None
-                    ):
-                        self.snapshot_assembler.save_batch_state(
-                            symbol,
-                            current_batch,
-                            uow=uow,
-                        )
-                    snapshot = dict(bundle.snapshot)
-                    # Preserve the original route's full output: nominally
-                    # complete snapshots already carried this preload marker;
-                    # newly reusable partial catalogs previously used load(),
-                    # whose local hit does not add it. Work completeness must
-                    # not change financial evidence or operational metadata.
-                    if not any(self._preload_reasons(symbol, entry, identities[symbol], current_batch,
-                            effective_signal=effective_signal, history_years=history_years,
-                            catalog=None).values()):
-                        snapshot["remote_refresh_skipped"] = True
-                    reusable[symbol] = FundamentalBundle(
-                        annual_fundamentals=bundle.annual_fundamentals,
-                        snapshot=snapshot,
-                        as_of=bundle.as_of,
-                    )
+                    reusable[symbol] = self._finish_cached_preload(symbol, entry, current_batch,
+                        effective_signal=effective_signal, selected=identities[symbol],
+                        history_years=history_years, history=history, resolution=resolution,
+                        batch_state=batch_states.get(symbol), uow=uow)
 
         logging.debug(
             "MOPS snapshot preload requested=%s candidates=%s reused=%s "
@@ -481,6 +447,81 @@ class MopsFundamentalService:
             },
         )
         return reusable
+
+    def _finish_cached_preload(self, symbol, entry, current_batch, *, effective_signal,
+                               selected, history_years, history, resolution, batch_state, uow):
+        """Shared native/legacy assembly; storage policy never alters evidence."""
+        bundle = self.snapshot_assembler.attach_base_evidence(
+            self.point_in_time.bundle_as_of(entry.bundle, effective_signal), resolution,
+            symbol=symbol, signal_time=effective_signal, uow=uow, history=history,
+            persist_snapshot=False)
+        if current_batch is not None and entry.latest_period >= current_batch.period and batch_state is None:
+            self.snapshot_assembler.save_batch_state(symbol, current_batch, uow=uow)
+        snapshot = dict(bundle.snapshot)
+        # Preserve the pre-existing complete/partial-catalog marker policy.
+        if not any(self._preload_reasons(symbol, entry, selected, current_batch,
+                effective_signal=effective_signal, history_years=history_years,
+                catalog=None).values()):
+            snapshot["remote_refresh_skipped"] = True
+        return FundamentalBundle(bundle.annual_fundamentals, snapshot, bundle.as_of)
+
+    def load_cached_bundles_into(self, symbols, *, signal_date, sector, history_years=5, sink):
+        """Native opt-in: bulk metadata, then hydrate/validate/retain one issuer.
+
+        ``load_cached_bundles`` remains the legacy dict-returning contract. Both
+        routes use the same eligibility and assembly functions and cutoff. A
+        sink failure propagates; it cannot silently switch to newer live data.
+        """
+        if history_years < 3:
+            raise ValueError("history_years must be at least 3")
+        effective_signal = self.point_in_time.effective_signal_time(
+            pd.to_datetime(signal_date, utc=True, errors="raise"))
+        sectors = {symbol: self._resolve_sector(symbol, sector)
+                   for symbol in dict.fromkeys(str(item).strip() for item in symbols) if symbol}
+        retained = []
+        with self.repository.unit_of_work() as uow:
+            cached = self._load_active_entries(sectors, as_of=effective_signal.isoformat(),
+                                               derivation_version=FUNDAMENTAL_DERIVATION_VERSION, uow=uow)
+            identities = self.repository.load_filings_many(list(cached),
+                                                          as_of=effective_signal.isoformat(), uow=uow)
+            loader = getattr(self.repository, "load_filing_catalogs_many", None)
+            catalogs = loader(list(cached), as_of=effective_signal.isoformat(), uow=uow) if callable(loader) else {}
+            candidates = []
+            for symbol, entry in cached.items():
+                current_batch = self.snapshot_assembler.eligible_batch_snapshot(self._daily_financials, symbol, effective_signal)
+                if isinstance(entry, CachedFundamentalHeader):
+                    reasons = self._preload_reasons(symbol, entry, identities.get(symbol, []), current_batch,
+                        effective_signal=effective_signal, history_years=history_years, catalog=catalogs.get(symbol))
+                    if any(reasons.values()):
+                        count_work("fundamental_preload_header_rejections")
+                        for reason, rejected in reasons.items():
+                            if rejected:
+                                count_work("fundamental_preload_reject_" + reason)
+                        continue
+                candidates.append(symbol)
+            histories = self.repository.load_financial_batch_snapshots_many(
+                candidates, as_of=effective_signal.isoformat(), uow=uow) if candidates else {}
+            states = self.repository.load_financial_batch_states(candidates, uow=uow) if candidates else {}
+            for symbol in candidates:
+                inspected = self._hydrate_entry(cached[symbol], uow=uow)
+                if inspected is None:
+                    continue
+                eligible = self._eligible_cached_bundles({symbol: inspected}, identities,
+                    effective_signal=effective_signal, history_years=history_years, catalogs=catalogs)
+                if symbol not in eligible:
+                    del inspected, eligible
+                    continue
+                entry, current_batch = eligible[symbol]
+                history = histories.get(symbol, [])
+                resolution = self._resolve_batch_snapshot(symbol, effective_signal, uow=uow, history=history)
+                bundle = self._finish_cached_preload(symbol, entry, current_batch,
+                    effective_signal=effective_signal, selected=identities[symbol], history_years=history_years,
+                    history=history, resolution=resolution, batch_state=states.get(symbol), uow=uow)
+                sink(symbol, bundle)
+                retained.append(symbol)
+                # No full universe of inspected or assembled bundles survives.
+                del bundle, entry, inspected, eligible
+        return tuple(retained)
 
     def _eligible_cached_bundles(
         self, cached: dict[str, CachedFundamentalBundle], identities: dict[str, list[FilingRecord]],
@@ -824,6 +865,73 @@ class MopsFundamentalService:
             FUNDAMENTAL_DERIVATION_VERSION,
         )
         return bundle
+
+    def load_v7_financial_audits(self, symbol, *, as_of, records, market="TWSE"):
+        """Public local-only R2 source companion; never refreshes or saves.
+
+        Only the latest cutoff-eligible MOPS period needs current audit proof.
+        Alternate/legacy repositories without this verified-source port leave
+        an explicit gap rather than promoting existing summary flags.
+        """
+        reader = getattr(self.repository, "load_financial_audit_evidence", None)
+        if not callable(reader):
+            return {}
+        cutoff = pd.to_datetime(as_of, utc=True, errors="raise")
+        eligible = [row for row in records if row.get("source") == "MOPS_IXBRL"
+            and pd.to_datetime(row.get("available_at"), utc=True, errors="coerce") <= cutoff]
+        if not eligible:
+            return {}
+        latest = max(pd.Period(row["period_end"], freq="Q") for row in eligible)
+        with self.repository.unit_of_work() as uow:
+            proofs = reader(symbol, cutoff.isoformat(), periods=((latest.year, latest.quarter),), uow=uow)
+        return {sha: dict(proof, market=market) for sha, proof in proofs.items()}
+
+    def load_v7_financial_sources(self, symbol, *, as_of, records, market="TWSE", source_repair=False, audit_repair_r7=False):
+        """Map nine recent quarters plus five visible annual original periods.
+
+        This port never refreshes, changes publication time or activates a
+        snapshot. Every cutoff selects again; only raw parse work is reusable.
+        The annual valuation port also consumes older Q4 originals, so its
+        source companions must not be truncated to the quarterly Quality
+        window. The union requests at most fourteen distinct periods.
+        """
+        reader = getattr(self.repository, "load_v7_financial_sources", None)
+        if not callable(reader):
+            return dict(financial_audits={}, financial_supplements={})
+        cutoff = pd.to_datetime(as_of, utc=True, errors="raise")
+        eligible = [row for row in records if row.get("source") == "MOPS_IXBRL"
+            and pd.to_datetime(row.get("available_at"), utc=True, errors="coerce") <= cutoff]
+        if not eligible:
+            return dict(financial_audits={}, financial_supplements={})
+        visible_periods = {pd.Period(row["period_end"], freq="Q") for row in eligible}
+        latest = max(visible_periods)
+        quarterly_periods = tuple(latest - i for i in range(9))
+        annual_periods = sorted((period for period in visible_periods if period.quarter == 4),
+                                reverse=True)[:5]
+        periods = tuple((period.year, period.quarter) for period in
+                        dict.fromkeys((*quarterly_periods, *annual_periods)))
+        with self.repository.unit_of_work() as uow:
+            values = reader(symbol, cutoff.isoformat(), periods=periods, uow=uow,
+                **({"source_repair": True, "market": market} if source_repair else {}),
+                **({"audit_repair_r7": True, **({"market": market} if not source_repair else {})}
+                   if audit_repair_r7 else {}))
+        selected_hashes = {row.get("content_sha256") for row in eligible}
+        result = {group: {sha: dict(proof, market=market) for sha, proof in nodes.items()
+                        if sha in selected_hashes}
+                for group, nodes in values.items()}
+        # MOPS has an issuer identity, not a trading-venue identity. Preserve
+        # proof operands; enrich the separately captured venue consistently.
+        if source_repair:
+            from domain.les_v7.contracts import identity
+            for node in result.get("financial_repairs_r5", {}).values():
+                node["audit_evidence_r5"] = dict(node["audit_evidence_r5"], market=market)
+                # Venue enrichment changes the proof content, not the filing.
+                # Keep the additive repair's old/new links bound to the exact
+                # enriched proofs, without mutating the repository's packet.
+                node["source_repair_r5"] = dict(node["source_repair_r5"],
+                    old_audit_proof_id=identity(result["financial_audits"][node["content_sha256"]]),
+                    new_audit_proof_id=identity(node["audit_evidence_r5"]))
+        return result
 
     def load_historical(self, symbol: str, *, as_of: dt.datetime, sector: str,
                         market: str = "TWSE") -> FundamentalBundle:

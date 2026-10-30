@@ -25,6 +25,62 @@ MAX_CACHE_BYTES = 64 * 1024 * 1024
 MAX_BATCH_NODES = 128
 MAX_WRITE_BATCH_NODES = 1024
 MAX_COMPRESSED_NODE_BYTES = MAX_NODE_BYTES + 8192
+SQLITE_READER_CACHE_BYTES = 32 * 1024 * 1024
+MAX_READER_STORES = 8
+MAX_JSON_BLOCK_BYTES = 256 * 1024
+
+
+def _block_shape(value, depth, prefix, *, charge=True):
+    """Exact legacy expansion charge for a raw JSON subtree, without descriptors.
+
+    Packing changes storage granularity only. Keep the same 128-level limit,
+    string-only keys and 64-byte-per-value charge used by the graph decoder.
+    This walks a single bounded block, never retains another evidence tree.
+    """
+    pending = [(value, depth)]
+    total = 0
+    while pending:
+        item, level = pending.pop()
+        if level > 128:
+            raise ValueError(f"{prefix}_TOO_DEEP")
+        size = 64
+        if isinstance(item, dict):
+            if any(not isinstance(key, str) for key in item):
+                raise ValueError(f"INVALID_{prefix}_KEY")
+            if charge:
+                size += sum(len(canonical_json(key).encode()) for key in item)
+            pending.extend((child, level + 1) for child in item.values())
+        elif isinstance(item, (list, tuple)):
+            pending.extend((child, level + 1) for child in item)
+        elif charge:
+            size += len(canonical_json(item).encode())
+        total += size
+    return total
+
+
+def _json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("DUPLICATE_JSON_BLOCK_KEY")
+        result[key] = value
+    return result
+
+
+def _json_constant(value):
+    raise ValueError("NONFINITE_JSON_BLOCK_VALUE")
+
+
+def _bounded_json(value, limit):
+    """Stop at the block boundary; never stringify a universe-sized ancestor."""
+    encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    parts, size = [], 0
+    for part in encoder.iterencode(value):
+        size += len(part.encode())
+        if size > limit:
+            return None
+        parts.append(part)
+    return "".join(parts)
 
 
 def object_id(value, prefix="EVIDENCE"):
@@ -42,13 +98,16 @@ class EvidenceGraphWriter:
     counter_prefix = "evidence"
 
     def __init__(self, path, *, encoding_cache_bytes=8 * 1024 * 1024,
-                 batch_nodes=MAX_WRITE_BATCH_NODES, ordered_lookup=True):
+                 batch_nodes=MAX_WRITE_BATCH_NODES, ordered_lookup=True, workspace_root=None,
+                 workspace_lock_timeout=30, json_block_bytes=0):
         if type(encoding_cache_bytes) is not int or not 0 <= encoding_cache_bytes <= MAX_CACHE_BYTES:
             raise ValueError(f"INVALID_{self.error_prefix}_ENCODING_CACHE_BYTES")
         if type(batch_nodes) is not int or not 1 <= batch_nodes <= MAX_WRITE_BATCH_NODES:
             raise ValueError(f"INVALID_{self.error_prefix}_WRITE_BATCH_NODES")
         if type(ordered_lookup) is not bool:
             raise ValueError(f"INVALID_{self.error_prefix}_ORDERED_LOOKUP")
+        if type(json_block_bytes) is not int or not 0 <= json_block_bytes <= MAX_JSON_BLOCK_BYTES:
+            raise ValueError(f"INVALID_{self.error_prefix}_JSON_BLOCK_BYTES")
         self.path = Path(path)
         self.connection = None
         self._seen = OrderedDict()
@@ -58,11 +117,18 @@ class EvidenceGraphWriter:
         self._encoding = EncodingMemo(encoding_cache_bytes, self.counter_prefix)
         self.batch_nodes = batch_nodes
         self.ordered_lookup = ordered_lookup
+        self.workspace_root = workspace_root
+        self._workspace = None
+        self.workspace_lock_timeout = workspace_lock_timeout
+        self.json_block_bytes = json_block_bytes
 
     def __enter__(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(self.path, timeout=30)
+        from infrastructure.storage.local_workspace import LocalSQLiteWorkspace
+        self._workspace = LocalSQLiteWorkspace(self.path, root=self.workspace_root,
+                                                lock_timeout=self.workspace_lock_timeout)
+        self._workspace.__enter__()
         try:
+            self.connection = sqlite3.connect(self._workspace.path, timeout=30)
             self.connection.execute("PRAGMA cache_size=-32768")
             tables = {r[0] for r in self.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if tables - {"report_objects"}:
@@ -72,20 +138,27 @@ class EvidenceGraphWriter:
             self._batch_nodes = min(self.batch_nodes,
                                    self.connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
         except BaseException:
-            self.connection.close()
+            if self.connection is not None:
+                self.connection.close()
+            self._workspace.close()
             raise
         return self
 
     def __exit__(self, kind, error, traceback):
         try:
+            try:
+                if kind is None:
+                    self._flush()
+                    with measure_stage(self.counter_prefix + "_commit"):
+                        self.connection.commit()
+                else:
+                    self.connection.rollback()
+            finally:
+                self.connection.close()
             if kind is None:
-                self._flush()
-                with measure_stage(self.counter_prefix + "_commit"):
-                    self.connection.commit()
-            else:
-                self.connection.rollback()
+                self._workspace.publish()
         finally:
-            self.connection.close()
+            self._workspace.close()
             self._seen.clear()
             self._pending.clear()
             self._pending_bytes = 0
@@ -159,9 +232,46 @@ class EvidenceGraphWriter:
         self._pending_bytes = 0
 
     def _encode(self, value, depth=0):
+        if self.json_block_bytes:
+            return self._encode_blocks(value, depth)
         if self._encoding.capacity:
             return self._encode_cached(value, depth)[0]
         return self._encode_uncached(value, depth)
+
+    def _encode_blocks(self, value, depth):
+        """Opt-in bounded JSON leaves; original report hashes are unchanged.
+
+        Bounded JSON leaves avoid a SQL object and Python descriptor for
+        every financial field. Large ancestors retain the existing graph shape
+        so repeated blocks can still be shared. Mutable inputs are encoded on
+        every call; no identity/verdict cache can conceal a source edit.
+        """
+        if depth > 128:
+            raise ValueError(f"{self.error_prefix}_TOO_DEEP")
+        if not isinstance(value, (dict, list, tuple)):
+            return ["value", value]
+        if isinstance(value, dict) and any(not isinstance(key, str) for key in value):
+            raise ValueError(f"INVALID_{self.error_prefix}_KEY")
+        try:
+            text = _bounded_json(value, self.json_block_bytes)
+        except RecursionError as error:
+            raise ValueError(f"{self.error_prefix}_TOO_DEEP") from error
+        if text is not None:
+            _block_shape(value, depth, self.error_prefix, charge=False)
+            node = ["json", text]
+            count_work(self.counter_prefix + "_json_blocks")
+        elif isinstance(value, dict):
+            node = ["dict", [[key, self._encode_blocks(item, depth + 1)]
+                             for key, item in sorted(value.items())]]
+        else:
+            node = ["list", [self._encode_blocks(item, depth + 1) for item in value]]
+        count_work(self.counter_prefix + "_node_encodes")
+        encoded = canonical_json(node).encode()
+        if len(encoded) > MAX_NODE_BYTES:
+            raise ValueError(f"{self.error_prefix}_NODE_TOO_LARGE")
+        if len(encoded) <= 512:
+            return ["inline", node]
+        return self._retain_node(_sha(encoded), encoded)
 
     def _encode_cached(self, value, depth):
         if depth > 128:
@@ -284,6 +394,7 @@ class EvidenceGraphReader:
         self._bytes = 0
         self._connections = {}
         self._data_versions = {}
+        self._file_ids = {}
 
     def _remember(self, key, encoded):
         if key in self._cache or len(encoded) > self.cache_bytes:
@@ -328,8 +439,14 @@ class EvidenceGraphReader:
         while ids and used < limit:
             placeholders = ",".join("?" for _ in ids)
             cursor = connection.execute(
-                f"SELECT sha256, CASE WHEN length(body)<=? THEN body END "
-                f"FROM report_objects WHERE sha256 IN ({placeholders})",
+                # Resolve the covering SHA index first, then visit bounded body
+                # rows in physical order instead of seeking in hash order.
+                # LIMIT prevents subquery flattening; CROSS JOIN fixes that
+                # small ordered result as the outer loop, as for the writer.
+                f"SELECT stored.sha256, CASE WHEN length(stored.body)<=? THEN stored.body END "
+                f"FROM (SELECT rowid AS node_id FROM report_objects "
+                f"WHERE sha256 IN ({placeholders}) ORDER BY rowid LIMIT -1) AS selected "
+                f"CROSS JOIN report_objects AS stored ON stored.rowid=selected.node_id",
                 (min(limit - used, MAX_COMPRESSED_NODE_BYTES), *ids),
             )
             count_work(f"{self.counter_prefix}_read_batches")
@@ -368,6 +485,7 @@ class EvidenceGraphReader:
             connection.close()
         self._connections.clear()
         self._data_versions.clear()
+        self._file_ids.clear()
         self._cache.clear()
         self._bytes = 0
 
@@ -379,22 +497,51 @@ class EvidenceGraphReader:
             raise ValueError(f"INVALID_{self.error_prefix}_STORE")
         return path
 
+    def _resize_sqlite_caches(self):
+        """Share one bounded page-cache budget across this reader's handles.
+
+        This only changes private SQLite memory, never stored evidence. The
+        separate encoded-node cache and per-value expansion limits still apply.
+        Negative cache_size is KiB; round down to stay within the total budget.
+        """
+        if self._connections:
+            kib = SQLITE_READER_CACHE_BYTES // 1024 // len(self._connections)
+            for connection in self._connections.values():
+                connection.execute(f"PRAGMA cache_size=-{kib}")
+
     def check_store(self, store):
         """Check external commits once per root, not once per proof node."""
         path = self.validate_store(store)
-        if store in self._connections and not path.is_file():
+        stat = path.stat() if path.is_file() else None
+        file_id = (stat.st_dev, stat.st_ino) if stat is not None else None
+        # Staged publication replaces a closed DB atomically. An existing
+        # connection still points at the old inode and data_version cannot
+        # detect that rename. Reopen and invalidate cached bytes once per root;
+        # retaining old cached nodes could hide a corrupt replacement.
+        if store in self._connections and self._file_ids.get(store) != file_id:
             self._connections.pop(store).close()
             self._data_versions.pop(store, None)
+            self._file_ids.pop(store, None)
             self._cache.clear()
             self._bytes = 0
+            self._resize_sqlite_caches()
         if store not in self._connections and path.is_file():
-            if len(self._connections) >= 8:
+            if len(self._connections) >= MAX_READER_STORES:
                 oldest = next(iter(self._connections))
                 self._connections.pop(oldest).close()
                 self._data_versions.pop(oldest, None)
+                self._file_ids.pop(oldest, None)
                 self._cache.clear()
                 self._bytes = 0
+                self._resize_sqlite_caches()
             self._connections[store] = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+            opened = path.stat()
+            if (opened.st_dev, opened.st_ino) != file_id:
+                self._connections.pop(store).close()
+                self._resize_sqlite_caches()
+                raise ValueError(f"{self.error_prefix}_STORE_CHANGED_DURING_OPEN")
+            self._file_ids[store] = file_id
+            self._resize_sqlite_caches()
         connection = self._connections.get(store)
         if connection is not None:
             # A committed external edit must not be hidden by a warm node cache.
@@ -405,11 +552,17 @@ class EvidenceGraphReader:
             self._data_versions[store] = version
 
     def _node_bytes(self, store, sha):
-        path = self.validate_store(store)
         key = store, object_id(sha, self.error_prefix)
-        if store not in self._connections and path.is_file():
-            self.check_store(store)
-        connection = self._connections.get(store)
+        connection = self._connections.get(store) if isinstance(store, str) else None
+        if connection is None:
+            path = self.validate_store(store)
+            if path.is_file():
+                self.check_store(store)
+                connection = self._connections.get(store)
+        # A root resolve already checked confinement, inode and data_version.
+        # Reuse that read-only handle while restoring its bounded proof tree;
+        # resolving the same filesystem paths for every warm node adds no
+        # validation of the bytes served by the existing SQLite connection.
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
@@ -460,6 +613,20 @@ class EvidenceGraphReader:
         node = self._node(store, value) if kind == "ref" else value if kind == "inline" else None
         if not isinstance(node, list) or len(node) != 2:
             raise ValueError(f"INVALID_{self.error_prefix}_NODE")
+        if node[0] == "json":
+            if not isinstance(node[1], str) or len(node[1].encode()) > MAX_JSON_BLOCK_BYTES:
+                raise ValueError(f"INVALID_{self.error_prefix}_JSON_BLOCK")
+            try:
+                result = json.loads(node[1], object_pairs_hook=_json_object, parse_constant=_json_constant)
+                if not isinstance(result, (dict, list)):
+                    raise ValueError("JSON_BLOCK_CONTAINER_REQUIRED")
+                # The outer descriptor already contributed its 64-byte charge.
+                budget[0] += _block_shape(result, depth, self.error_prefix) - 64
+            except (ValueError, TypeError, RecursionError) as error:
+                raise ValueError(f"INVALID_{self.error_prefix}_JSON_BLOCK") from error
+            if self.max_value_bytes is not None and budget[0] > self.max_value_bytes:
+                raise ValueError(f"{self.error_prefix}_EXPANSION_TOO_LARGE")
+            return result
         if node[0] == "dict":
             result = {}
             for group in self._groups(node[1]):
@@ -506,5 +673,7 @@ class EvidenceGraphReader:
                 node = value
             if node[0] == "dict":
                 pending.extend(item[1] for item in node[1])
-            else:
+            elif node[0] == "list":
                 pending.extend(node[1])
+            elif node[0] != "json":
+                raise ValueError(f"INVALID_{self.error_prefix}_NODE")

@@ -53,13 +53,21 @@ FLOW_FIELDS = ("revenue", "cost_of_revenue", "operating_income", "net_income", "
                "cfo", "capex", "income_tax", "pretax_income", *CASH_AUDIT_FLOWS)
 
 
-def ixbrl_record(symbol: str, filing: FiledFinancials) -> dict:
+def ixbrl_record(symbol: str, filing: FiledFinancials, *, extra_fields=None, extra_instant_fields=()) -> dict:
     period = pd.Period(year=filing.fiscal_year, quarter=filing.quarter, freq="Q")
     end = period.end_time.date().isoformat()
     start = f"{filing.fiscal_year}-01-01"
     extra_mapping, taxonomy = taxonomy_mapping(filing.taxonomy_schema_refs)
     concepts = dict(FIELD_CONCEPTS, **{field: tuple(dict.fromkeys(
         (*FIELD_CONCEPTS.get(field, ()), *extra_mapping.get(field, ())))) for field in EXTENDED_FIELDS})
+    # Versioned adapters may add exact-context fields, never change the legacy
+    # aliases. The default remains byte-for-byte compatible with v6/R1.
+    extra_fields = extra_fields or {}
+    if set(extra_fields) & set(concepts):
+        raise ValueError("ADDITIONAL_FINANCIAL_MAPPING_CANNOT_OVERRIDE_NATIVE_FIELDS")
+    concepts.update(extra_fields)
+    instant_fields = INSTANT_FIELDS | frozenset(extra_instant_fields)
+    flow_fields = (*FLOW_FIELDS, *(field for field in extra_fields if field not in instant_fields))
     period_valid = filing.period_end is None or filing.period_end == end
 
     quarter_start = period.start_time.date().isoformat()
@@ -71,7 +79,7 @@ def ixbrl_record(symbol: str, filing: FiledFinancials) -> dict:
                   taxonomy_schema=taxonomy["schema_name"], taxonomy_mapping_version=taxonomy["mapping_version"])
 
     def resolve(field, *, flow_start=start, flow_end=end):
-        instant = field in INSTANT_FIELDS
+        instant = field in instant_fields
         unit = "iso4217:TWD/xbrli:shares" if field == "basic_eps" else "iso4217:TWD"
         candidates = [f for f in filing.facts if f.concept in concepts[field]]
         matching = [f for f in candidates if not f.dimensions and
@@ -88,7 +96,7 @@ def ixbrl_record(symbol: str, filing: FiledFinancials) -> dict:
             value, status = None, "UNKNOWN"
             if not period_valid:
                 category, reason = "INCOMPARABLE", "FILING_PERIOD_END_MISMATCH"
-            elif field in EXTENDED_FIELDS and taxonomy["status"] != "RESOLVED":
+            elif field in {*EXTENDED_FIELDS, *extra_fields} and taxonomy["status"] != "RESOLVED":
                 category, reason = "PENDING_VERIFICATION", taxonomy["reason"]
             elif not candidates:
                 category, reason = "MISSING_DATA", "CONCEPT_NOT_REPORTED"
@@ -120,7 +128,7 @@ def ixbrl_record(symbol: str, filing: FiledFinancials) -> dict:
     def amounts(flow_start, flow_end):
         values, evidence = {}, {}
         for field in concepts:
-            if field in INSTANT_FIELDS:
+            if field in instant_fields:
                 continue
             values[field], evidence[field] = resolve(field, flow_start=flow_start, flow_end=flow_end)
         def reported(field):
@@ -170,7 +178,7 @@ def ixbrl_record(symbol: str, filing: FiledFinancials) -> dict:
             evidence["cost_of_revenue"] = dict(evidence["cost_of_revenue"], status="UNKNOWN",
                 category="INCOMPARABLE" if failed else "PENDING_VERIFICATION",
                 reason="OPERATING_COST_RECONCILIATION_FAILED" if failed else "OPERATING_COST_RECONCILIATION_UNVERIFIED")
-        return {k: values[k] for k in FLOW_FIELDS}, {k: evidence[k] for k in FLOW_FIELDS}
+        return {k: values[k] for k in flow_fields}, {k: evidence[k] for k in flow_fields}
 
     values, evidence = amounts(start, end)
     quarters, quarter_evidence = amounts(quarter_start, end)
@@ -188,9 +196,9 @@ def ixbrl_record(symbol: str, filing: FiledFinancials) -> dict:
             field, flow_start=comparative_start, flow_end=comparative_end)
     year_end = f"{filing.fiscal_year - 1}-12-31"
     year_end_fields, year_end_evidence = {}, {}
-    for field in INSTANT_FIELDS:
+    for field in instant_fields:
         year_end_fields[field], year_end_evidence[field] = resolve(field, flow_end=year_end)
-    for field in INSTANT_FIELDS:
+    for field in instant_fields:
         values[field], evidence[field] = resolve(field)
     values["interest_bearing_debt"], debt_check = interest_bearing_debt(values, evidence)
     evidence["interest_bearing_debt"] = dict(origin, basis="INSTANT", instant=end, **debt_check)
@@ -227,8 +235,9 @@ def ixbrl_record(symbol: str, filing: FiledFinancials) -> dict:
         basis="INSTANT", inputs=[evidence["total_assets"], evidence["current_assets"]])
     def ledger(*, first=None, last, instant=False):
         grouped = {}
+        additive_extras = {name for field, names in extra_fields.items() if field not in instant_fields for name in names}
         for fact in filing.facts:
-            if (fact.dimensions or not fact.concept.startswith(("ifrs-full:", "tifrs-bsci-"))
+            if (fact.dimensions or not (fact.concept.startswith(("ifrs-full:", "tifrs-bsci-")) or fact.concept in additive_extras)
                     or "EarningsLossPerShare" in fact.concept or "EarningsPerShare" in fact.concept
                     or fact.unit != "iso4217:TWD"
                     or (fact.instant != last if instant else fact.start_date != first or fact.end_date != last)):

@@ -92,6 +92,11 @@ class PortfolioWeightAllocatorV2:
             "EARLY_BUY": self.config.early_buy_execution_factor,
             "BUY": self.config.buy_execution_factor,
         }.get(security.les_decision.upper(), 0.0)
+        from domain.les_v7.entry_policy_r9 import pae_admission, cap_for
+        admission = pae_admission(security)
+        if admission:
+            caps.append(cap_for(admission, security.les_decision.upper()))
+            execution_factor = 1.0  # R9 native cap is already signal-sized.
         return max(min(caps) * execution_factor, 0.0), ()
 
     def cash_capacity(self, request: PortfolioAllocationRequestV2) -> float:
@@ -274,7 +279,7 @@ class PortfolioWeightAllocatorV2:
     ) -> PortfolioSecurityV2:
         values = asdict(security)
         values["current_weight"] = weight
-        return PortfolioSecurityV2(**values)
+        return type(security)(**values)
 
 
 __all__ = ["PortfolioWeightAllocatorV2"]

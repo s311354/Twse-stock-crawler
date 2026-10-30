@@ -1,0 +1,18 @@
+{
+  "payload": {
+    "schema": "les-v7-training-dataset/v1",
+    "dataset_kind": "SYNTHETIC_TEST_ONLY",
+    "price_unit": "TWD",
+    "volume_unit": "SHARES",
+    "amount_unit": "TWD",
+    "source_evidence_ids": [
+      "EMPTY_SYNTHETIC_TEMPLATE_NO_MARKET_EVIDENCE"
+    ],
+    "universe_policy": "EMPTY_TEMPLATE_NO_SELECTION",
+    "universe": [],
+    "histories": [],
+    "events": [],
+    "calendars": {}
+  },
+  "sha256": "f27eeb89a517f268287f3a7cbe26bd2b092d56ba66f466f3a3cfec4f3b059f78"
+}

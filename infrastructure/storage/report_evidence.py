@@ -130,6 +130,7 @@ def iter_report_bundle(
     max_value_bytes: int = MAX_REPORT_BYTES, max_record_bytes: int = MAX_REPORT_BYTES,
     chunk_bytes: int = 64 * 1024,
     context: ReportBundleContext | None = None,
+    valuation_history_verifier_scope=None,
 ) -> Iterator[dict[str, Any]]:
     """Public read-only stream for CLI/BankEmulator, in bundle file order.
 
@@ -148,12 +149,19 @@ def iter_report_bundle(
         context.records = context.referenced_records = 0
         context.complete = False
     path = Path(path)
+    from infrastructure.storage.valuation_source_verification import (
+        valuation_history_verifier_scope as default_verifier_scope, verify_report_valuation_sources,
+    )
+    scope = valuation_history_verifier_scope or default_verifier_scope
     with ReportEvidenceReader(path.parent, cache_bytes=cache_bytes, batch_nodes=batch_nodes,
-                              batch_bytes=batch_bytes, max_value_bytes=max_value_bytes) as reader:
+                              batch_bytes=batch_bytes, max_value_bytes=max_value_bytes) as reader, scope() as verifier:
         records = iter_bundle_records(path, buckets=buckets, chunk_bytes=chunk_bytes,
                                       max_record_bytes=max_record_bytes, context=context)
         try:
-            yield from reader.iter_reports(records, require_reference=require_reference, context=context)
+            for report in reader.iter_reports(records, require_reference=require_reference, context=context):
+                verify_report_valuation_sources(report, verifier=verifier)
+                yield report
+                del report
             if context is not None:
                 context.complete = True
         finally:
@@ -179,16 +187,27 @@ def compact_report(report, ref):
 
 
 def load_report_bundle(path):
+    from infrastructure.storage.valuation_source_verification import (
+        valuation_history_verifier_scope, verify_report_valuation_sources,
+    )
     path = Path(path)
     with measure_stage("report_bundle_read"):
         payload = json.loads(path.read_bytes())
-        with ReportEvidenceReader(path.parent) as reader:
+        with ReportEvidenceReader(path.parent) as reader, valuation_history_verifier_scope() as verifier:
             for bucket in ("reports", "stale_reports"):
                 if bucket in payload:
-                    payload[bucket] = [reader.resolve(report) for report in payload[bucket]]
+                    resolved = []
+                    for value in payload[bucket]:
+                        report = reader.resolve(value)
+                        verify_report_valuation_sources(report, verifier=verifier)
+                        resolved.append(report)
+                    payload[bucket] = resolved
         return payload
 
 
 def resolve_csv_report(cell, directory):
+    from infrastructure.storage.valuation_source_verification import verify_report_valuation_sources
     with ReportEvidenceReader(directory) as reader:
-        return reader.resolve(json.loads(cell))
+        report = reader.resolve(json.loads(cell))
+        verify_report_valuation_sources(report)
+        return report

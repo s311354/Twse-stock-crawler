@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from importlib import import_module
+from threading import RLock
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -38,36 +39,43 @@ class StrategyRegistry:
 
     def __init__(self) -> None:
         self._strategies: dict[str, Strategy] = {}
+        self._lock = RLock()
 
     def register(self, strategy: Strategy, replace: bool = False) -> Strategy:
-        if not strategy.name:
-            raise ValueError("Strategy must define a non-empty name.")
-        if strategy.name in self._strategies and not replace:
-            raise ValueError("Strategy '{}' is already registered.".format(strategy.name))
-        self._strategies[strategy.name] = strategy
-        return strategy
+        with self._lock:
+            if not strategy.name:
+                raise ValueError("Strategy must define a non-empty name.")
+            if strategy.name in self._strategies and not replace:
+                raise ValueError("Strategy '{}' is already registered.".format(strategy.name))
+            self._strategies[strategy.name] = strategy
+            return strategy
 
     def get(self, name: str) -> Strategy:
-        try:
-            return self._strategies[name]
-        except KeyError as error:
-            raise KeyError("Unknown strategy '{}'. Available: {}".format(name, self.names())) from error
+        with self._lock:
+            try:
+                return self._strategies[name]
+            except KeyError as error:
+                raise KeyError("Unknown strategy '{}'. Available: {}".format(name, self.names())) from error
 
     def names(self) -> list[str]:
-        return sorted(self._strategies)
+        with self._lock:
+            return sorted(self._strategies)
 
     def all(self) -> list[Strategy]:
-        """Return all registered strategies."""
-        return [self._strategies[name] for name in self.names()]
+        """Return one coherent snapshot of all registered strategies."""
+        with self._lock:
+            return [self._strategies[name] for name in sorted(self._strategies)]
 
 
 strategy_registry = StrategyRegistry()
 _BUILTINS_LOADED: set[str] = set()
+_BUILTINS_LOCK = RLock()
 
 _BUILTIN_STRATEGIES = {
     "expected_return_exit": "domain.strategies.expected_return_exit.ExpectedReturnExitStrategy",
     "expected_return_exit_v2": "domain.strategies.expected_return_exit_v2.ExpectedReturnExitV2Strategy",
     "expected_return_exit_v3": "domain.strategies.expected_return_exit_v3.ExpectedReturnExitV3Strategy",
+    "expected_return_exit_v3_b1": "domain.strategies.expected_return_exit_b.ExpectedReturnExitBStrategy",
     "low_entry_score": "domain.strategies.low_entry_score.LowEntryScoreStrategy",
     "low_entry_score_v2": "domain.strategies.low_entry_score_v2.LowEntryScoreV2Strategy",
     "low_entry_score_v3": "domain.strategies.low_entry_score_v3.LowEntryScoreV3Strategy",
@@ -77,6 +85,7 @@ _BUILTIN_STRATEGIES = {
     "low_entry_score_v6": "domain.strategies.low_entry_score_v6.LowEntryScoreV6Strategy",
     "low_entry_score_v6_hybrid": "domain.strategies.low_entry_score_v6.LowEntryScoreV6HybridStrategy",
     "low_entry_score_v6_hybrid_legacy": "domain.strategies.low_entry_score_v6.LowEntryScoreV6HybridLegacyStrategy",
+    "low_entry_score_v7": "domain.strategies.low_entry_score_v7.LowEntryScoreV7Strategy",
     "portfolio_allocation_v1": "domain.strategies.portfolio_allocation_v1.PortfolioAllocationV1Strategy",
     "portfolio_allocation_v2": "domain.strategies.portfolio_allocation_v2.PortfolioAllocationV2Strategy",
 }
@@ -95,14 +104,16 @@ def load_builtin_strategies(name: str | None = None) -> None:
         strategy_path = _BUILTIN_STRATEGIES.get(strategy_name)
         if strategy_path is None:
             raise ValueError("Unknown builtin strategy: {}".format(strategy_name))
-        if strategy_name in _BUILTINS_LOADED:
-            continue
-
-        module_name, class_name = strategy_path.rsplit(".", 1)
-        module = import_module(module_name)
-        strategy_cls = getattr(module, class_name)
-        strategy_registry.register(strategy_cls(), replace=True)
-        _BUILTINS_LOADED.add(strategy_name)
+        # Import/construct/register exactly once. The lock is reentrant so
+        # built-in modules may import/register related strategies themselves.
+        with _BUILTINS_LOCK:
+            if strategy_name in _BUILTINS_LOADED:
+                continue
+            module_name, class_name = strategy_path.rsplit(".", 1)
+            module = import_module(module_name)
+            strategy_cls = getattr(module, class_name)
+            strategy_registry.register(strategy_cls(), replace=True)
+            _BUILTINS_LOADED.add(strategy_name)
 
 
 def register_strategy(strategy: Strategy, replace: bool = False) -> Strategy:

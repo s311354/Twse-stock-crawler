@@ -238,6 +238,51 @@ def test_native_net_cost_rr_no_fake_resistance_or_stop_shortening():
     assert p["net_reward_risk"] == pytest.approx(expected)
     far = strong(support=80.)
     assert evaluate(far)["plan"]["stop_price"] == trade_plan(far, config=CONFIG, setup="TREND_PULLBACK")["stop_price"]
+
+
+def correction_slot(result):
+    return next(c for c in result["score_evidence"]["conditions"]
+                if c["id"] == "relative_strength:correction_resilience")
+
+
+def test_no_qualifying_market_correction_is_observed_zero_not_unknown():
+    f = strong(market_ready=True, market_correction20=-.029,
+               downside_capture20=None, correction_support=None)
+    slot = correction_slot(evaluate(f))
+    assert slot["status"] == "OBSERVED"
+    assert slot["fraction"] == 0.
+    assert slot["earned_points"] == 0.
+    assert slot["available_weight"] == slot["weight"] == 4
+    assert slot["dependencies"] == ["market_ready", "market_correction20"]
+
+
+@pytest.mark.parametrize("changes", [
+    {"market_ready": False, "market_correction20": -.01},
+    {"market_ready": True, "market_correction20": None},
+])
+def test_missing_benchmark_history_or_correction_stays_unknown(changes):
+    slot = correction_slot(evaluate(strong(**changes)))
+    assert slot["status"] == "UNKNOWN"
+    assert slot["fraction"] is None
+    assert slot["earned_points"] == 0.
+    assert slot["available_weight"] == 0.
+
+
+def test_active_correction_with_failed_support_is_known_zero_without_capture():
+    slot = correction_slot(evaluate(strong(market_ready=True, market_correction20=-.03,
+        correction_support=95., low=90., downside_capture20=None)))
+    assert slot["status"] == "OBSERVED"
+    assert slot["fraction"] == 0.
+    assert slot["available_weight"] == slot["weight"] == 4
+
+
+def test_active_correction_requires_capture_only_after_support_holds():
+    unknown = correction_slot(evaluate(strong(market_ready=True, market_correction20=-.03,
+        correction_support=98., low=98., downside_capture20=None)))
+    observed = correction_slot(evaluate(strong(market_ready=True, market_correction20=-.03,
+        correction_support=98., low=98., downside_capture20=.2)))
+    assert unknown["status"] == "UNKNOWN" and unknown["fraction"] is None
+    assert observed["status"] == "OBSERVED" and observed["fraction"] == 1.
     missing = evaluate(strong(swing_high=None, hh20=None, hh60=None))
     assert missing["plan"]["target_price"] is missing["plan"]["net_reward_risk"] is None
     assert "NET_RR_UNAVAILABLE" in missing["reasons"]

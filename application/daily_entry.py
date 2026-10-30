@@ -1,17 +1,18 @@
-"""Compose independent v6 entry and valuation outputs, with explicit ownership."""
+"""Compose selected native entry and independent valuation, with explicit ownership."""
 from __future__ import annotations
 
 import pandas as pd
 
 from application.daily_valuation import DailyValuationProvider
 from application.low_entry_v6_daily import build_daily_v6
+from application.low_entry_v7_daily import build_daily_v7
 from application.strategy_execution import PreparedStrategyInputs
 from application.daily_performance import measure_stage
 from domain.numeric_history import metadata_free_frame
 
 
 class DailyEntryService:
-    """No v5 entry dependency; sidecar cannot overwrite v6's owned fields."""
+    """No v5 entry dependency; sidecar cannot overwrite native entry fields."""
 
     def __init__(self, *, valuation_provider=None, entry_evaluator=None, reuse_watch=True):
         self.valuation_provider = valuation_provider or DailyValuationProvider()
@@ -20,7 +21,12 @@ class DailyEntryService:
 
     def evaluate(self, prepared: PreparedStrategyInputs) -> pd.DataFrame:
         with measure_stage("les"):
-            if self.entry_evaluator is build_daily_v6:
+            models = {history.attrs.get("daily_entry_model", "v6") for history in prepared.histories}
+            if len(models) > 1: raise ValueError("MIXED_DAILY_ENTRY_MODELS")
+            if models == {"v7"} and self.entry_evaluator is build_daily_v6:
+                entry = build_daily_v7(prepared.histories, feature_frames=prepared.normalized_feature_frames,
+                                       evidence=prepared.evidence)
+            elif self.entry_evaluator is build_daily_v6:
                 entry = self.entry_evaluator(prepared.histories, feature_frames=prepared.normalized_feature_frames,
                                              watches=prepared.watches, reuse_watch=self.reuse_watch,
                                              evidence=prepared.evidence)

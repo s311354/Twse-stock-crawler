@@ -371,3 +371,26 @@ def test_http_client_posts_form_and_returns_raw_bytes() -> None:
     assert response.content == b"<html>MOPS</html>"
     assert session.calls[0]["data"] == {"co_id": "2330"}
     assert session.calls[0]["headers"] == {"Accept": "text/html"}
+
+
+def test_read_allowance_is_per_request_and_preserves_connect_timeout_and_budget():
+    session = FakeSession([requests_exceptions.ReadTimeout('SYNTHETIC stalled body'),
+        FakeResponse(content=b'{}'), FakeResponse(content=b'{}')])
+    client = TwseHttpClient(config=config(), session=session, sleeper=lambda _: None)
+    attempts = []
+    response = client.request_bytes('GET', 'https://example.test/actions', read_timeout_seconds=60,
+        before_attempt=lambda: attempts.append(len(attempts)))
+    assert response.attempts == 2 and len(attempts) == 2
+    assert [row['timeout'] for row in session.calls] == [(5., 60), (5., 60)]
+    assert all(row['verify'] is True and row['allow_redirects'] is False for row in session.calls)
+    client.request_bytes('GET', 'https://example.test/market')
+    assert session.calls[-1]['timeout'] == client.config.timeout_seconds == 5.
+
+
+@pytest.mark.parametrize('timeout', [0, -1, True, '60', float('inf'), float('nan'), 121])
+def test_invalid_read_allowance_fails_before_transport(timeout):
+    session = FakeSession([])
+    client = TwseHttpClient(config=config(), session=session)
+    with pytest.raises(ValueError, match='read_timeout_seconds'):
+        client.request_bytes('GET', 'https://example.test', read_timeout_seconds=timeout)
+    assert not session.calls

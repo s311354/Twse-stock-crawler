@@ -86,19 +86,26 @@ class PortfolioSecurityEvaluatorV2:
                 - security.business_uncertainty_penalty
             )
 
+        from domain.les_v7.entry_policy_r9 import pae_admission
+        admission = pae_admission(security)
+        quality_pass = (admission["quality"]["evidence_ready"] and admission["quality"]["small_cap"] > 0
+                        if admission else security.quality_status.upper() == "PASS")
+        valuation_pass = (admission["valuation"]["state"] in {"ALLOWED", "ALLOWED_WITH_WARNING"}
+                          if admission else security.valuation_gate.upper() == "PASS")
+        minimum_confidence = .65 if admission else self.config.minimum_quality_confidence
         reasons: list[str] = []
         if security.fundamental_hard_exit:
             reasons.append("FUNDAMENTAL_HARD_EXIT")
-        if security.quality_status.upper() != "PASS":
+        if not quality_pass:
             reasons.append("QUALITY_REJECT")
         if security.valuation_status.upper() != "COMPLETE":
             reasons.append("VALUATION_INCOMPLETE")
-        if security.valuation_gate.upper() != "PASS":
+        if not valuation_pass:
             reasons.append("VALUATION_FAIL")
         quality_confidence_pass = (
             security.quality_confidence is not None
             and normalized_confidence(security.quality_confidence)
-            >= self.config.minimum_quality_confidence
+            >= minimum_confidence
         )
         if not quality_confidence_pass:
             reasons.append("QUALITY_CONFIDENCE_LOW_OR_UNKNOWN")
@@ -109,16 +116,17 @@ class PortfolioSecurityEvaluatorV2:
 
         strategic = bool(
             not security.fundamental_hard_exit
-            and security.quality_status.upper() == "PASS"
+            and quality_pass
             and security.quality_score is not None
             and quality_confidence_pass
             and security.valuation_status.upper() == "COMPLETE"
-            and security.valuation_gate.upper() == "PASS"
+            and valuation_pass
             and cer is not None
             and cer >= required_return
         )
         executable = bool(
             strategic
+            and (not admission or admission.get("buy_allowed" if security.les_decision.upper() == "BUY" else "small_allowed") is True)
             and security.les_decision.upper()
             in {"BUY", "EARLY_BUY", "BUY_SMALL"}
             and security.risk_gate.upper() == "PASS"
@@ -160,6 +168,14 @@ class PortfolioSecurityEvaluatorV2:
         security: PortfolioSecurityV2,
     ) -> bool:
         """Apply LES hard gates while PAE remains non-binding."""
+        from domain.les_v7.entry_policy_r9 import pae_admission
+        admission = pae_admission(security)
+        if admission:
+            return bool(admission.get("buy_allowed" if security.les_decision.upper() == "BUY" else "small_allowed")
+                and security.les_decision.upper() in {"BUY", "BUY_SMALL"}
+                and not security.fundamental_hard_exit and security.risk_gate.upper() == "PASS"
+                and security.falling_knife_state.upper() == "CLEAR" and security.liquidity_status.upper() == "PASS"
+                and security.executable_shares > 0)
         return bool(
             not security.fundamental_hard_exit
             and security.quality_status.upper() == "PASS"

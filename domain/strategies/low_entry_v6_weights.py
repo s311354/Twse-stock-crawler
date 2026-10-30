@@ -75,7 +75,7 @@ def project_simplex(values: np.ndarray) -> np.ndarray:
 
 def objective_gradient(weights: np.ndarray, x: np.ndarray, y: np.ndarray,
                        contexts: np.ndarray, alpha: np.ndarray, *, delta: float,
-                       pooling: float, prior_strength: float) -> tuple[float, np.ndarray]:
+                       pooling: float, prior_strength: float, prior=None) -> tuple[float, np.ndarray]:
     residual = np.sum(x * weights[contexts], axis=1) - y
     absolute = np.abs(residual)
     loss = np.where(absolute <= delta, .5 * residual ** 2,
@@ -83,7 +83,7 @@ def objective_gradient(weights: np.ndarray, x: np.ndarray, y: np.ndarray,
     gradient = np.zeros((4, 6))
     np.add.at(gradient, contexts, (alpha * np.clip(residual, -delta, delta))[:, None] * x)
     differences = weights[:3] - weights[3]
-    deviation = weights[3] - np.asarray(PRIOR)
+    deviation = weights[3] - np.asarray(PRIOR if prior is None else prior)
     gradient[:3] += 2 * pooling * differences
     gradient[3] += -2 * pooling * differences.sum(axis=0) + 2 * prior_strength * deviation
     value = np.dot(alpha, loss) + pooling * np.sum(differences ** 2) + prior_strength * np.dot(deviation, deviation)
@@ -92,7 +92,7 @@ def objective_gradient(weights: np.ndarray, x: np.ndarray, y: np.ndarray,
 
 def fit_convex_weights(x: object, y: object, contexts: list[str], *, alpha: object = None,
                        delta: float = .1, pooling: float = 1., prior_strength: float = 1.,
-                       tolerance: float = 1e-8, max_iterations: int = 20000) -> dict:
+                       tolerance: float = 1e-8, max_iterations: int = 20000, prior=None) -> dict:
     """Minimize the SUM (not mean) weighted Huber + pooling + prior objective.
 
     All hyperparameters must be fixed before evaluating the holdout. No outcome
@@ -102,6 +102,10 @@ def fit_convex_weights(x: object, y: object, contexts: list[str], *, alpha: obje
     if (any(v is None for v in parameters) or delta <= 0 or pooling < 0 or prior_strength < 0
             or not 0 < tolerance <= 1e-3 or type(max_iterations) is not int or not 1 <= max_iterations <= 100000):
         raise ValueError("INVALID_CONVEX_PARAMETERS")
+    anchor = np.asarray(PRIOR if prior is None else prior, dtype=float)
+    if (anchor.shape != (6,) or not np.isfinite(anchor).all() or np.any(anchor < 0)
+            or abs(float(anchor.sum()) - 1.) > 1e-9):
+        raise ValueError("INVALID_CONVEX_PRIOR")
     x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
     if y.ndim != 1:
         raise ValueError("INVALID_CONVEX_OBSERVATIONS")
@@ -130,12 +134,12 @@ def fit_convex_weights(x: object, y: object, contexts: list[str], *, alpha: obje
     lipschitz = float(np.linalg.eigvalsh(hessian_bound)[-1])
     if not np.isfinite(lipschitz):
         raise ValueError("CONVEX_NUMERIC_OVERFLOW")
-    weights = np.tile(PRIOR, (4, 1))
+    weights = np.tile(anchor, (4, 1))
     initial = objective_gradient(weights, x, y, indices, a, delta=delta,
-                                 pooling=pooling, prior_strength=prior_strength)[0]
+                                 pooling=pooling, prior_strength=prior_strength, prior=anchor)[0]
     for iteration in range(max_iterations + 1):
         value, gradient = objective_gradient(weights, x, y, indices, a, delta=delta,
-                                             pooling=pooling, prior_strength=prior_strength)
+                                             pooling=pooling, prior_strength=prior_strength, prior=anchor)
         # For a convex differentiable objective on four simplexes, this bounds
         # f(w)-f(w*): max feasible descent of the first-order approximation.
         gap = max(0., float(np.sum(weights * gradient) - np.sum(gradient.min(axis=1))))

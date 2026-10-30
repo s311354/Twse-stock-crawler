@@ -213,7 +213,8 @@ def test_default_composition_runs_tpex_to_report_without_twse_stock_download(tmp
     from infrastructure.calendar.twse_calendar import TradingDayStatus
     from config.settings import AppSettings
 
-    monkeypatch.setattr(bootstrap, "TpexCsvRepository", lambda: TpexCsvRepository(tmp_path))
+    monkeypatch.setattr(bootstrap, "TpexCsvRepository",
+                        lambda **options: TpexCsvRepository(tmp_path, **options))
     monkeypatch.setattr(TwseClient, "get_daily_taiex_close", lambda *args: 20_000.)
     monkeypatch.setattr(TwseClient, "get_daily_stock_rows", Mock(side_effect=AssertionError("TWSE stocks must not be requested")))
     session = FakeSession([FakeResponse(payload("20260923")), FakeResponse(payload())])
@@ -222,7 +223,9 @@ def test_default_composition_runs_tpex_to_report_without_twse_stock_download(tmp
     calendar.trading_day_status.return_value = TradingDayStatus.OPEN
     settings = replace(AppSettings.from_env(mail_enabled=False, mops_enabled=False, validate_paths=False),
                        market_history_cache_path=tmp_path / "market.sqlite3",
-                       pae_persistence_path=tmp_path / "pae.sqlite3", pae_positions=())
+                       mops_cache_dir=tmp_path / "mops",
+                       pae_persistence_path=tmp_path / "pae.sqlite3", pae_positions=(),
+                       local_workspace_dir=tmp_path / "local-workspace")
     runtime = bootstrap.build_stock_analysis_runtime(
         settings=settings, http_client=TwseHttpClient(config=config(), session=session),
         market_calendar=calendar,

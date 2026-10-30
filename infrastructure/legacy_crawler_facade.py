@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import json
 import logging
 from collections.abc import Sequence
 from typing import Protocol
@@ -52,18 +53,43 @@ class LegacyCrawlerFacade:
         app_settings: object | None = None,
         analysis_dataset_builder: AnalysisDatasetBuilder | None = None,
     ) -> None:
-        self.csv_repository = csv_repository or CsvRepository()
+        self.csv_repository = csv_repository or CsvRepository(
+            workspace_root=getattr(app_settings, "local_workspace_dir", None))
         self.app_settings = app_settings
+        encoded_industry = getattr(app_settings, "industry_benchmarks_json", None)
+        self._industry_benchmarks = json.loads(encoded_industry) if encoded_industry is not None else {}
         stock_executor = None
         workers = getattr(app_settings, "daily_strategy_workers", 1)
-        if analysis_dataset_builder is None and type(workers) is int and workers > 1:
-            from infrastructure.daily_parallel import DailyProcessExecutor
-            stock_executor = DailyProcessExecutor(workers)
+        backend = getattr(app_settings, "daily_executor", "process")
+        if analysis_dataset_builder is None:
+            if backend == "thread":
+                from infrastructure.daily_threaded import DailyThreadExecutor
+                stock_executor = DailyThreadExecutor(workers)
+            elif backend == "process" and type(workers) is int and workers > 1:
+                from infrastructure.daily_parallel import DailyProcessExecutor
+                stock_executor = DailyProcessExecutor(workers)
+            elif backend == "serial" and workers != 1:
+                raise ValueError("DAILY_SERIAL_EXECUTOR_REQUIRES_ONE_WORKER")
+            elif backend not in {"serial", "process"}:
+                raise ValueError("DAILY_EXECUTOR_MUST_BE_SERIAL_PROCESS_OR_THREAD")
         self._analysis_dataset_builder = (
-            analysis_dataset_builder or AnalysisDatasetBuilder(stock_executor=stock_executor)
+            analysis_dataset_builder or AnalysisDatasetBuilder(stock_executor=stock_executor,
+                valuation_history_verifier_scope=self._valuation_history_verifier_scope)
         )
 
+    @staticmethod
+    def _valuation_history_verifier_scope():
+        from infrastructure.storage.valuation_source_verification import valuation_history_verifier_scope
+        return valuation_history_verifier_scope()
+
     def _market_history_input(self) -> MarketHistoryInput:
+        signal_dates = self.low_entry_v4_signal_dates_by_stock
+        native_daily = (getattr(self.app_settings, "daily_entry_model", "v6") == "v7"
+                        and getattr(self.app_settings, "les_v7_native_evidence", False)
+                        and not getattr(self, "replay_as_of", None))
+        decision_time = getattr(self, "les_v7_decision_time", None)
+        if native_daily and decision_time:
+            signal_dates = {str(symbol): decision_time for symbol in self.stocknumbers if symbol}
         return MarketHistoryInput(
             stock_count=self.stocklistsize,
             stock_numbers=self.stocknumbers,
@@ -86,13 +112,27 @@ class LegacyCrawlerFacade:
             fundamental_status_details=(
                 self.fundamental_status_detail_by_stock
             ),
-            signal_dates=self.low_entry_v4_signal_dates_by_stock,
+            signal_dates=signal_dates,
             account_equity=self.low_entry_v4_account_equity,
+            entry_model=getattr(self.app_settings, "daily_entry_model", "v6"),
+            les_v7_bundle_json=getattr(self.app_settings, "les_v7_bundle_json", None),
+            les_v7_research_metadata_json=getattr(self.app_settings, "les_v7_research_metadata_json", None),
+            les_v7_strategy_policy_json=getattr(self.app_settings, "les_v7_strategy_policy_json", None),
+            les_v7_diagnostics_only=getattr(self.app_settings, "les_v7_diagnostics_only", False),
+            les_v7_native_evidence=native_daily,
+            les_v7_rule_baseline=native_daily and getattr(self.app_settings, "les_v7_rule_baseline", False),
+            market_observed_at=getattr(self, "market_observed_at", None) if native_daily else None,
+            les_v7_source_repair=(native_daily and getattr(self.app_settings, "les_v7_source_repair", False)
+                and getattr(self.app_settings, "les_v7_rule_baseline", False)),
+            native_source_selections=getattr(self, "les_v7_source_selections", {}) if native_daily else {},
+            fundamental_capture_cutoffs=(dict(self.low_entry_v4_signal_dates_by_stock)
+                                         if native_daily and decision_time else {}),
             default_sector=str(getattr(self, "analysis_universe", "UNKNOWN")),
             market_source=getattr(self, "market_source", "TWSE"),
             replay_as_of=getattr(self, "replay_as_of", None),
             les_v6_portfolio=getattr(self, "les_v6_portfolio", {}),
             trading_restrictions=getattr(self, "trading_restrictions", {}),
+            industry_benchmarks=getattr(self, "_industry_benchmarks", {}),
             les_v6_research_context=getattr(self, "les_v6_research_context", {}),
             fallback_date=(
                 self.iso_scheduled_times[-1]
@@ -282,9 +322,23 @@ class LegacyCrawlerFacade:
         self.annual_fundamentals_by_stock[normalized_stock_no] = (
             annual_fundamentals.copy()
         )
-        self.fundamental_snapshots_by_stock[normalized_stock_no] = dict(
-            fundamental_snapshot
-        )
+        from application.daily_work import current_work
+        from infrastructure.snapshot_retention import SnapshotRetentionMap
+        work = current_work()
+        retention = getattr(work, "snapshot_retention", None)
+        if retention is None:
+            self.fundamental_snapshots_by_stock[normalized_stock_no] = dict(fundamental_snapshot)
+        else:
+            existing = self.fundamental_snapshots_by_stock
+            if not isinstance(existing, SnapshotRetentionMap) or existing.owner is not retention:
+                retained = retention.snapshots()
+                for symbol, snapshot in existing.items():
+                    retained.retain(symbol, snapshot,
+                        cutoff=self.low_entry_v4_signal_dates_by_stock.get(symbol),
+                        market=getattr(self, "market_source", "TWSE"))
+                self.fundamental_snapshots_by_stock = retained
+            self.fundamental_snapshots_by_stock.retain(normalized_stock_no, fundamental_snapshot,
+                cutoff=signal_date, market=getattr(self, "market_source", "TWSE"))
         self.fundamental_status_by_stock.pop(normalized_stock_no, None)
         self.fundamental_status_detail_by_stock.pop(
             normalized_stock_no,

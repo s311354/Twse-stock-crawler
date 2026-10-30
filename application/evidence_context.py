@@ -35,14 +35,26 @@ class ReadOnlyEvidence(dict):
     class mutation methods are outside the read-only consumer contract.
     """
 
-    __slots__ = ("_initialized", "__weakref__")
+    __slots__ = ("_initialized", "_json_native", "__weakref__")
 
     def __init__(self, values, memo=None):
         if getattr(self, "_initialized", False):
             raise TypeError("READ_ONLY_EVIDENCE")
         memo = {} if memo is None else memo
         dict.__init__(self, ((key, _freeze(value, memo)) for key, value in values.items()))
+        object.__setattr__(self, "_json_native", all(
+            type(key) is str and _json_native(value) for key, value in dict.items(self)))
         object.__setattr__(self, "_initialized", True)
+
+    @property
+    def json_native(self):
+        """True only for frozen JSON-native leaves; not an evidence verdict.
+
+        Native consumers can skip a second normalization traversal. Dates/time
+        remain valid immutable evidence but require an explicit JSON boundary.
+        Nonfinite floats keep the standard encoder's fail-closed behavior.
+        """
+        return self._json_native
 
     def _readonly(self, *args, **kwargs):
         raise TypeError("READ_ONLY_EVIDENCE")
@@ -55,6 +67,14 @@ class ReadOnlyEvidence(dict):
 
     def __deepcopy__(self, memo):
         return self
+
+
+def _json_native(value):
+    if isinstance(value, ReadOnlyEvidence):
+        return value.json_native
+    if type(value) is tuple:
+        return all(_json_native(item) for item in value)
+    return type(value) in (str, int, float, bool, type(None))
 
 
 def _freeze(value, memo):
@@ -230,7 +250,11 @@ class EvidenceContext:
         try:
             with measure_stage("evidence_context"):
                 memo = {}
-                snapshot = _freeze(market.fundamental_snapshots.get(symbol, {}), memo)
+                from application.snapshot_retention import materialize_history_snapshot
+                source = materialize_history_snapshot(market, symbol,
+                    cutoff=history.attrs.get(SIGNAL_DATE_ATTR))
+                snapshot = _freeze(source, memo)
+                del source
                 benchmark = _freeze(market.industry_benchmarks.get(
                     sector_code(snapshot.get("sector") or market.default_sector)), memo)
                 research = _freeze(market.les_v6_research_context.get(symbol, {}), memo)
